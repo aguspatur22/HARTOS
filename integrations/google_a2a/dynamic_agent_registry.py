@@ -360,57 +360,48 @@ class DynamicAgentExecutor:
         agent = self.discovery.get_agent_by_id(agent_id)
 
         if not agent:
-            return {
-                "role": "model",
-                "parts": [{
-                    "text": f"Error: Agent {agent_id} not found. Agent may not be trained yet."
-                }]
-            }
+            raise LookupError(
+                f"Agent {agent_id} not found. Agent may not be trained yet.")
 
-        try:
-            # Import execution functions
-            from hartos.create_recipe import recipe
-            from hartos.reuse_recipe import chat_agent
+        # The ONE in-process call to this node's own /chat
+        # (dispatch.local_chat_dispatch): /chat decides CREATE vs REUSE from
+        # the banked recipes, and the call yields to a human user and holds
+        # the local LLM semaphore.  This used to call chat_agent/recipe
+        # directly with arguments neither accepts (chat_agent(message,
+        # user_id=, prompt_id=), recipe(message=)); both signatures are
+        # (user_id, text, prompt_id, file_id, request_id), so every call
+        # raised TypeError, which was returned as the agent's answer
+        # (review of 3a32d8e4b, traced).
+        #
+        # A failure RAISES, so handle_message_send marks the task FAILED.
+        # Returning error text as a model part made it COMPLETED: peer_reuse
+        # then recorded the error as a successful remote outcome and the
+        # daemon skipped its local CREATE for the goal.
+        from core.constants import DEFAULT_USER_ID
+        from core.agent_tools import is_user_facing_error
+        from integrations.agent_engine.dispatch import local_chat_dispatch
 
-            logger.info(f"Executing task for agent {agent_id} (persona: {agent.persona})")
-
-            # Determine execution mode based on agent status
-            from core.constants import DEFAULT_USER_ID
-            if agent.status == "done" or agent.status == "completed":
-                # Use reuse mode (agent has trained recipe)
-                result = chat_agent(
-                    message,
-                    user_id=agent.metadata.get("user_id", DEFAULT_USER_ID),
-                    prompt_id=agent.prompt_id
-                )
-            else:
-                # Use create mode (agent still learning)
-                result = recipe(
-                    user_id=agent.metadata.get("user_id", DEFAULT_USER_ID),
-                    message=message,
-                    prompt_id=agent.prompt_id
-                )
-
-            return {
-                "role": "model",
-                "parts": [{
-                    "text": str(result),
-                    "metadata": {
-                        "agent_id": agent_id,
-                        "persona": agent.persona,
-                        "execution_mode": "reuse" if agent.status == "done" else "create"
-                    }
-                }]
-            }
-
-        except Exception as e:
-            logger.error(f"Agent {agent_id} execution failed: {e}")
-            return {
-                "role": "model",
-                "parts": [{
-                    "text": f"Error executing agent {agent_id}: {str(e)}"
-                }]
-            }
+        logger.info(f"Executing task for agent {agent_id} (persona: {agent.persona})")
+        status, text = local_chat_dispatch(
+            message,
+            agent.metadata.get("user_id", DEFAULT_USER_ID),
+            agent.prompt_id,
+            # A peer's request is not this node's human: it is background
+            # work, and the id says so to dispatch.is_genuine_user_request.
+            daemon_id=f"a2a_{context_id}")
+        if status != 'ok':
+            raise RuntimeError(
+                f"agent {agent_id} not run: local /chat {status} "
+                f"(deferred = this node's LLM is busy or a human has it)")
+        if not text or is_user_facing_error(text):
+            raise RuntimeError(f"agent {agent_id} turn failed: {text!r}")
+        return {
+            "role": "model",
+            "parts": [{
+                "text": str(text),
+                "metadata": {"agent_id": agent_id, "persona": agent.persona},
+            }]
+        }
 
 
 # Global instances
