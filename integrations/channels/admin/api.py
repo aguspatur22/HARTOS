@@ -18,7 +18,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import tempfile
 import time
 import uuid
 from datetime import datetime
@@ -135,10 +134,11 @@ class AdminAPI:
         self._load_config()
 
     def _config_path(self) -> str:
-        """Single source for the admin-config file location."""
-        return os.path.join(
-            os.path.dirname(__file__), "..", "..", "..",
-            "agent_data", "admin_config.json")
+        """Single source for the admin-config file location: the user's
+        agent_data dir.  It used to sit next to the package, which in the
+        installed app is under Program Files."""
+        from core.platform_paths import get_agent_data_dir
+        return os.path.join(get_agent_data_dir(), "admin_config.json")
 
     def _load_config(self) -> None:
         """Restore persisted admin state (channels + workflows + identity) so it
@@ -183,14 +183,19 @@ class AdminAPI:
         try:
             config_dir = os.path.dirname(config_path)
             os.makedirs(config_dir, exist_ok=True)
-            # Write to temp file first, then atomic rename to prevent corruption
-            fd, tmp_path = tempfile.mkstemp(dir=config_dir, suffix='.tmp')
+            # Write to a temp file first, then atomic rename to prevent
+            # corruption.  One fixed temp name, not tempfile.mkstemp: on
+            # Windows mkstemp retries a PermissionError up to 2**31 times
+            # whenever os.access calls the dir writable, and a consent grant
+            # that ran this spun for minutes holding the SQLite write lock.
+            tmp_path = config_path + '.tmp'
             try:
-                with os.fdopen(fd, 'w') as f:
+                with open(tmp_path, 'w', encoding='utf-8') as f:
                     json.dump(payload, f, indent=2, default=str)
                 os.replace(tmp_path, config_path)  # atomic rename
             except Exception:
-                os.unlink(tmp_path)
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
                 raise
             logger.info("Saved admin configuration to %s", config_path)
         except Exception as e:
