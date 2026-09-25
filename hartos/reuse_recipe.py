@@ -4101,11 +4101,29 @@ def _reuse_action_is_autonomous(user_prompt, action_id):
     writes and the prompt at L1296 instructs the model to honour.  Absent or
     unparseable -> False, so an unknown action is never auto-advanced.
     """
+    return _reuse_action_autonomy(user_prompt, action_id) == 'yes'
+
+
+def _reuse_action_autonomy(user_prompt, action_id):
+    """The action's ``can_perform_without_user_input``, lower-cased; '' when
+    absent or unreadable.  The one reader of that field for the two questions
+    asked of it: "may the walk advance on its own?" (only on an explicit
+    'yes') and "did the recipe say this action stops for the user?" (only on
+    an explicit 'no', see _reuse_action_declares_user_pause)."""
     try:
         action = user_tasks[user_prompt].actions[action_id - 1]
-        return str(action.get('can_perform_without_user_input', '')).lower() == 'yes'
+        return str(action.get('can_perform_without_user_input', '')).lower()
     except Exception:
-        return False
+        return ''
+
+
+def _reuse_action_declares_user_pause(user_prompt, action_id):
+    """True only when the recipe explicitly marks the action as needing the
+    user ('no').  A missing field is NOT a declared pause: reading it as one
+    silenced the incomplete report for every recipe without the field
+    (review of b6ac59c89: 52 of 1062 banked actions, 25 whole recipes,
+    including agent 88094979291 whose four actions all lack it)."""
+    return _reuse_action_autonomy(user_prompt, action_id) == 'no'
 
 
 # How far back to look for the StatusVerifier's verdict.  Bounded because
@@ -4824,7 +4842,7 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
                     _unfinished.append(
                         f"action {_at} gave up without a verified result")
                 elif (_state in ACTION_STATES_AWAITING_USER
-                        or not _reuse_action_is_autonomous(user_prompt, _at)):
+                        or _reuse_action_declares_user_pause(user_prompt, _at)):
                     # A PAUSE FOR THE USER, not a failure.  A REUSE turn may
                     # end mid-recipe on purpose: the REUSE-NODRIVER break stops
                     # at an action the recipe marks non-autonomous, and the

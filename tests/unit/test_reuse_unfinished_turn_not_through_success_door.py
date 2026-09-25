@@ -65,9 +65,11 @@ class _Task:
         # "not autonomous" (_reuse_action_is_autonomous), which is a different
         # scenario -- an action allowed to stop and ask the user.
         self.current_action = current_action
-        self.actions = [{'action': 'step %d' % i,
-                         'can_perform_without_user_input':
-                             'yes' if autonomous else 'no'}
+        # autonomous=None: the field is ABSENT, as on 52 of 1062 banked actions.
+        self.actions = [dict({'action': 'step %d' % i},
+                             **({} if autonomous is None else
+                                {'can_perform_without_user_input':
+                                 'yes' if autonomous else 'no'}))
                         for i in range(1, n_actions + 1)]
         self.evidence_vacuous_action = None
 
@@ -228,6 +230,18 @@ class TestAPauseForTheUserIsNotAFailure:
                                    _Task(1, autonomous=False),
                                    lh.ActionState.GAVE_UP)
         assert rec.messages and 'action 1 gave up' in rec.messages[0]
+
+    def test_an_action_with_no_autonomy_field_that_stopped_is_unfinished(
+            self, rr, lh, monkeypatch):
+        """Review of b6ac59c89, measured: a missing field is not a declared
+        pause.  Reading it as one silenced the incomplete report for 25 whole
+        recipes, among them agent 88094979291 (all four actions lack it)."""
+        _posted, _chat, rec = _run(rr, lh, monkeypatch,
+                                   _Task(2, autonomous=None),
+                                   lh.ActionState.IN_PROGRESS)
+        assert rec.messages, 'a stop with no declared pause was not reported'
+        assert 'action 2 did not finish' in rec.messages[0]
+        assert 'actions 3 to 4 were not reached' in rec.messages[0]
 
     def test_the_waiting_states_are_exactly_the_three_the_enum_names(self, lh):
         assert lh.ACTION_STATES_AWAITING_USER == frozenset({
