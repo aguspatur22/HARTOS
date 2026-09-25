@@ -49,6 +49,10 @@ SECRET_ALIAS_RE = re.compile(r'\{\{secret:([A-Z0-9_]+)\}\}')
 #: of "abc" in tool output would mangle ordinary text.
 MIN_MASKED_SECRET_LEN = 4
 
+#: Longest credential name: 'secret:' + the name is a consent scope, and
+#: UserConsent.scope holds 100 characters.
+MAX_CREDENTIAL_NAME_LEN = 90
+
 # ═══════════════════════════════════════════════════════════════════════
 # Pending credential request tracking
 # ═══════════════════════════════════════════════════════════════════════
@@ -184,11 +188,17 @@ class AIKeyVault:
 
     # ── Alias (the only form the model sees) ───────────────────────
 
+    def credential_name(self, key_name: str, channel_type: str = '') -> str:
+        """The one name a credential goes by: its vault/env key, its alias and
+        its consent scope.  Anything outside [A-Z0-9_] becomes '_' so the
+        alias always matches SECRET_ALIAS_RE."""
+        resolved = self._resolve_channel_key(channel_type, key_name) \
+            if channel_type else str(key_name).upper()
+        return re.sub(r'[^A-Z0-9_]', '_', resolved)[:MAX_CREDENTIAL_NAME_LEN]
+
     def alias_for(self, key_name: str, channel_type: str = '') -> str:
         """The {{secret:NAME}} alias the model uses for a stored credential."""
-        resolved = self._resolve_channel_key(channel_type, key_name) \
-            if channel_type else key_name.upper()
-        return '{{secret:' + resolved + '}}'
+        return '{{secret:' + self.credential_name(key_name, channel_type) + '}}'
 
     @classmethod
     def _map_strings(cls, value, fn):
@@ -206,9 +216,17 @@ class AIKeyVault:
 
         An alias with no stored value is left as written, so a missing
         credential shows up as the alias, never as an empty string.
+
+        A name that resolves is remembered for mask_secrets: the value may
+        live in a store this vault never wrote (Nunba's desktop vault exports
+        its keys to os.environ), and it has just been handed to a tool.
         """
         def _real(match):
-            return self.get_tool_key(match.group(1)) or match.group(0)
+            value = self.get_tool_key(match.group(1))
+            if not value:
+                return match.group(0)
+            self._stored.add(match.group(1))
+            return value
         return self._map_strings(value, lambda s: SECRET_ALIAS_RE.sub(_real, s))
 
     def mask_secrets(self, value):
@@ -335,6 +353,99 @@ def get_ai_key_vault() -> AIKeyVault:
             if _instance is None:
                 _instance = AIKeyVault.get_instance()
     return _instance
+
+
+# ── Asking the owner for a credential ──────────────────────────────
+
+def _parse_resource_request(text) -> dict:
+    """The tool's input: JSON {key_name, label, used_by, description,
+    channel_type}, or plain text describing what is needed."""
+    import json
+    try:
+        req = json.loads(text)
+    except (ValueError, TypeError):
+        req = None
+    if isinstance(req, dict):
+        return req
+    text = str(text or '')
+    return {'label': text[:100], 'description': text}
+
+
+def request_credential(resource_description, agent_id=None) -> str:
+    """What Request_Resource (both the LangChain tool and core.agent_tools
+    request_resource) does: get the agent a credential without the agent
+    ever seeing it.
+
+    A stored credential is answered with its {{secret:NAME}} alias.  A
+    missing one is asked for through ConsentService, like every other ask:
+    one 'credential' row per credential (scope 'secret:NAME') for the owner
+    of this computer, whose vault it goes into, and a consent.request the
+    consent card shows with a password field.  Accept stores the value and
+    grants the row.  The agent is told the alias either way; resolve_aliases
+    puts the value in where a tool runs.
+    """
+    req = _parse_resource_request(resource_description)
+    label = str(req.get('label') or req.get('key_name') or 'a credential')[:100]
+    used_by = str(req.get('used_by') or 'a tool')
+    vault = get_ai_key_vault()
+    name = vault.credential_name(req.get('key_name') or label,
+                                 req.get('channel_type') or '')
+    alias = '{{secret:' + name + '}}'
+    use = (f"use {alias} wherever the value is needed: it is filled in only "
+           f"when a tool runs, and you never see it. Do not ask for it in chat.")
+
+    if vault.get_tool_key(name):
+        return f"'{label}' is stored on this computer. To use it, {use}"
+
+    # The pending list behind /api/credentials/pending.
+    vault.add_pending_request(
+        key_name=name, resource_type=req.get('resource_type') or 'api_key',
+        label=label, description=str(req.get('description') or ''),
+        used_by=used_by)
+
+    # Whose vault the value goes into: this computer's owner, as for every
+    # other ask of this machine (vlm.safety, capability_setup).
+    owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+    if not owner:
+        logger.warning("credential %s not asked: HEVOLVE_OWNER_USER_ID is not set",
+                       name)
+        return (f"Could not ask for '{label}': nobody is signed in on this "
+                f"computer who could provide it.")
+
+    reason = ' '.join(filter(None, [
+        f"{label} is needed for {used_by}.",
+        str(req.get('description') or '').strip(),
+        f"It is kept encrypted on this computer; the agent only sees {alias}.",
+    ]))
+    try:
+        from integrations.social.consent_service import (
+            CREDENTIAL_SCOPE_PREFIX, ConsentService)
+        from integrations.social.models import db_session
+        from integrations.vlm.safety import _known_agent
+        agent = _known_agent(agent_id)
+        scope = CREDENTIAL_SCOPE_PREFIX + name
+        with db_session(commit=True) as db:
+            if ConsentService.check_or_request(db, owner, 'credential',
+                                               scope=scope, agent_id=agent,
+                                               reason=reason):
+                answer = 'allowed'
+            elif ConsentService.declined(db, owner, 'credential',
+                                         scope=scope, agent_id=agent):
+                answer = 'declined'
+            else:
+                answer = 'asked'
+    except Exception:
+        logger.exception("credential %s could not be asked for", name)
+        return (f"Could not ask for '{label}': the permission system is "
+                f"unavailable.")
+
+    if answer == 'declined':
+        return f"The owner of this computer said no to providing '{label}'."
+    if answer == 'allowed':
+        return (f"'{label}' was allowed before but is not stored on this "
+                f"computer now; the owner has to enter it again.")
+    return (f"Asked the owner of this computer for '{label}' on the consent "
+            f"card. Once they enter it, {use}")
 
 
 # ── Localhost enforcement ──────────────────────────────────────────

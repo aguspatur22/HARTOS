@@ -131,7 +131,18 @@ CONSENT_TYPES = frozenset({
                          # daemon paces, repair_backend_venv ->
                          # install_backend_full, the same function the
                          # "Set up TTS" UI calls).
+    'credential',        # An agent needs a password, key or token only the
+                         # owner can give (Request_Resource).  The card takes
+                         # the value in a password field; Accept stores it in
+                         # the device vault and grants this row.  The scope
+                         # names the ONE credential ('secret:SITE_PASSWORD'),
+                         # and the agent only ever gets its alias
+                         # {{secret:SITE_PASSWORD}} (hartos.ai_key_vault).
 })
+
+#: A credential ask's scope is this prefix + the credential's name, the same
+#: name its {{secret:NAME}} alias carries.
+CREDENTIAL_SCOPE_PREFIX = 'secret:'
 
 #: The capability an agent asks for, keyed by the ``action`` its ask carries,
 #: mapped to the consent type that records the answer.  ONE map, read by both

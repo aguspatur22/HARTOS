@@ -2901,65 +2901,8 @@ def build_core_tool_closures(ctx):
         resource_description: Annotated[str, "JSON or plain text describing the needed resource. JSON format: {\"resource_type\": \"api_key\", \"key_name\": \"GOOGLE_API_KEY\", \"label\": \"Google API Key\", \"used_by\": \"search tool\", \"description\": \"needed for web search\"}"],
     ) -> str:
         """Request an API key, credential, token, or config value that is not currently available."""
-        try:
-            try:
-                req = json.loads(resource_description)
-            except (ValueError, TypeError):
-                req = {
-                    'resource_type': 'api_key',
-                    'key_name': 'UNKNOWN',
-                    'label': resource_description[:100],
-                    'description': resource_description,
-                    'used_by': 'Agent tool',
-                }
-
-            key_name = req.get('key_name', 'UNKNOWN')
-            resource_type = req.get('resource_type', 'api_key')
-
-            # Check env vars first
-            env_val = os.environ.get(key_name)
-            if env_val:
-                return f"Resource '{key_name}' is already configured and available."
-
-            # Check vault
-            try:
-                from hartos.ai_key_vault import AIKeyVault
-                vault = AIKeyVault.get_instance()
-                val = vault.get_tool_key(key_name) if resource_type != 'channel_secret' else vault.get_channel_secret(req.get('channel_type', ''), key_name)
-                if val:
-                    os.environ[key_name] = val
-                    return f"Resource '{key_name}' loaded from vault and is now available."
-            except Exception:
-                pass
-
-            # Track as pending and request from user
-            try:
-                from hartos.ai_key_vault import AIKeyVault
-                AIKeyVault.get_instance().add_pending_request(
-                    key_name=key_name, resource_type=resource_type,
-                    channel_type=req.get('channel_type', ''),
-                    label=req.get('label', key_name),
-                    description=req.get('description', ''),
-                    used_by=req.get('used_by', 'Agent tool'),
-                )
-            except Exception:
-                pass
-
-            secret_request = json.dumps({
-                '__SECRET_REQUEST__': True, 'type': resource_type,
-                'key_name': key_name, 'label': req.get('label', key_name),
-                'description': req.get('description', f'{key_name} is required.'),
-                'used_by': req.get('used_by', 'Agent tool'),
-                'channel_type': req.get('channel_type', ''),
-            })
-            return (
-                f"I need the user to provide '{req.get('label', key_name)}'. "
-                f"Required for {req.get('used_by', 'a tool')}. "
-                f"{req.get('description', '')} "
-                f"RESOURCE_REQUEST:{secret_request}"
-            )
-        except Exception as e:
-            return f"Resource request failed: {e}"
+        from hartos.ai_key_vault import request_credential
+        return request_credential(resource_description, agent_id=prompt_id)
 
     tools.append((
         "request_resource",

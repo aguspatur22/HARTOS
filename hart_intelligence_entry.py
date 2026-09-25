@@ -4804,86 +4804,16 @@ def _handle_agentic_router_tool(input_text):
 
 
 def _handle_request_resource(input_text: str) -> str:
-    """Generic runtime resource request — agent calls this when ANY tool needs
-    a missing credential, API key, config value, or permission.
+    """Request_Resource: the agent needs a credential, API key or token.
 
-    The agent provides a JSON string like:
-      {"resource_type": "api_key", "key_name": "GOOGLE_API_KEY",
-       "label": "Google API Key", "used_by": "Google Search tool",
-       "description": "Required for web search"}
-
-    Handler checks the vault first. If the key exists, returns the value
-    (making it available to the agent without the user re-entering it).
-    If not, returns a structured resource_request that the backend injects
-    into the response JSON so the frontend presents a secure input screen.
+    hartos.ai_key_vault.request_credential does the work, for this tool and
+    for core.agent_tools request_resource alike: the owner is asked on the
+    consent card and the agent gets only the {{secret:NAME}} alias.
     """
-    import json as _json
-    try:
-        req = _json.loads(input_text)
-    except (ValueError, TypeError):
-        # Plain-text fallback: agent just described what it needs
-        req = {
-            'resource_type': 'api_key',
-            'key_name': 'UNKNOWN',
-            'label': input_text[:100],
-            'description': input_text,
-            'used_by': 'Agent tool',
-        }
-
-    key_name = req.get('key_name', 'UNKNOWN')
-    resource_type = req.get('resource_type', 'api_key')
-
-    # Check vault first (tool keys + env vars)
-    import os
-    env_val = os.environ.get(key_name)
-    if env_val:
-        return f"Resource '{key_name}' is already configured and available."
-
-    try:
-        from hartos.ai_key_vault import AIKeyVault
-        vault = AIKeyVault.get_instance()
-        if resource_type == 'channel_secret':
-            val = vault.get_channel_secret(
-                req.get('channel_type', ''), key_name)
-        else:
-            val = vault.get_tool_key(key_name)
-        if val:
-            os.environ[key_name] = val  # Make available for current session
-            return f"Resource '{key_name}' loaded from vault and is now available."
-    except Exception:
-        logging.getLogger(__name__).exception("_handle_request_resource: swallowed Exception")
-
-    # Key not found — return a structured request for the frontend
-    # The backend will detect __SECRET_REQUEST__ and inject it into the response
-    # Track as pending so /api/credentials/pending can list it
-    try:
-        from hartos.ai_key_vault import AIKeyVault
-        AIKeyVault.get_instance().add_pending_request(
-            key_name=key_name,
-            resource_type=resource_type,
-            channel_type=req.get('channel_type', ''),
-            label=req.get('label', key_name),
-            description=req.get('description', ''),
-            used_by=req.get('used_by', 'Agent tool'),
-        )
-    except Exception:
-        logging.getLogger(__name__).exception("_handle_request_resource: swallowed Exception")
-
-    secret_request = _json.dumps({
-        '__SECRET_REQUEST__': True,
-        'type': resource_type,
-        'key_name': key_name,
-        'label': req.get('label', key_name),
-        'description': req.get('description', f'{key_name} is required.'),
-        'used_by': req.get('used_by', 'Agent tool'),
-        'channel_type': req.get('channel_type', ''),
-    })
-    return (
-        f"I need the user to provide '{req.get('label', key_name)}'. "
-        f"This is required for {req.get('used_by', 'a tool')}. "
-        f"{req.get('description', '')} "
-        f"RESOURCE_REQUEST:{secret_request}"
-    )
+    from hartos.ai_key_vault import request_credential
+    from integrations.vlm.safety import _known_agent
+    return request_credential(
+        input_text, agent_id=_known_agent(thread_local_data.get_prompt_id()))
 
 
 # Module-level cache for the google-search tool list.  Process-wide
