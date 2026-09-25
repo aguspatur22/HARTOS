@@ -4502,6 +4502,8 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         _pipeline_timeout = 1800  # 30 minutes — CREATE is the learning phase, needs time
         # Per-run replay ledger for _remedy_replay_exceeded (see its docstring).
         _remedy_attempts = {}
+        # The verdict message [LAST-ACTION] has already settled (see there).
+        _spent_verdict = None
 
         while while_loop_iterations < max_iterations:
             # Hard timeout: don't let pipeline run forever
@@ -4672,6 +4674,15 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     f"[STALE-VERDICT] messages[-2] belongs to action "
                     f"{_stale_owner}; not crediting it to action "
                     f"{current_action_id}, which has not started")
+            elif (_spent_verdict is not None
+                    and len(group_chat.messages) >= 2
+                    and group_chat.messages[-2] is _spent_verdict):
+                # Already settled by [LAST-ACTION]; the branches below route
+                # the finished flow ([AUTO-ADVANCE] -> [FLOW-COMPLETE]).
+                _stale_verdict = True
+                current_app.logger.info(
+                    f"[SPENT-VERDICT] messages[-2] was already settled for "
+                    f"action {current_action_id}; completing the flow")
             if (not _stale_verdict and group_chat.messages
                     and group_chat.messages[-1]['name'] == 'ChatInstructor'
                     and _is_terminate(group_chat.messages[-1]['content'])):
@@ -4850,6 +4861,20 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                                             user_tasks[user_prompt].recipe = False
                                             current_app.logger.info(
                                                 f"[LAST-ACTION] action {json_action_id} is last in flow")
+                                            if (get_action_state(user_prompt, json_action_id)
+                                                    == ActionState.TERMINATED):
+                                                # Lifecycle over and recipe on disk: there is
+                                                # no fallback left to ask for.  Falling through
+                                                # hit the COMPLETION-GATE (COMPLETED only), which
+                                                # `continue`d without posting, so this verdict
+                                                # was re-read every lap to max_iterations and
+                                                # no flow recipe was saved (live 2026-09-25,
+                                                # prompts 91790350001 / 7700000611).  Mark it
+                                                # spent: next lap takes [AUTO-ADVANCE] ->
+                                                # [FLOW-COMPLETE], the canonical flow finish.
+                                                user_tasks[user_prompt].fallback = False
+                                                _spent_verdict = group_chat.messages[-2]
+                                                continue
                                     if json_action_id < len(user_tasks[user_prompt].actions) and os.path.exists(_recipe_file):
                                         continue
 

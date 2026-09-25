@@ -434,6 +434,38 @@ def test_a_whole_flow_runs_in_order_with_no_phantom_completion(create_env):
         f'the flow recipe was never written; replies {replies!r}')
 
 
+def test_a_finished_last_action_saves_the_flow_recipe_in_one_turn(create_env,
+                                                                    caplog):
+    """The last action's verdict is settled once, then the flow completes.
+
+    Live 2026-09-25 (livetest_create_recipe_verify_01, prompt 91790350001,
+    and livetest_agent_to_agent_verify_r1): the termination hook moved the
+    last action COMPLETED -> TERMINATED before the verdict pickup, whose
+    [ALREADY DONE] -> [LAST-ACTION] path then fell into the COMPLETION-GATE.
+    The gate only accepts COMPLETED, so it `continue`d without posting
+    anything, the same verdict was re-read on the next lap, and the loop ran
+    [LAST-ACTION] -> [COMPLETION-GATE] ~300 times in ~3 s to max_iterations.
+    No flow recipe was written and /chat answered 'Review Mode' after 448 s.
+
+    One turn must finish the flow: the reply is the success string the /chat
+    handler maps to a created agent, the flow recipe is on disk, and the
+    loop never reaches its iteration cap.
+    """
+    env = create_env
+    with caplog.at_level('INFO'):
+        replies = _run(env, turns=1)
+    log = '\n'.join(r.getMessage() for r in caplog.records)
+    assert 'reaching max iterations' not in log, (
+        f'the create loop drained max_iterations; '
+        f'{log.count("[COMPLETION-GATE]")} COMPLETION-GATE laps; '
+        f'replies {replies!r}')
+    assert (env.prompts / f'{PROMPT_ID}_0_recipe.json').exists(), (
+        f'the flow recipe was never written; replies {replies!r}')
+    assert replies == ['Agent Created Successfully'], replies
+    for n in (1, 2, 3):
+        assert env.lh.get_action_state(UP, n).value == 'terminated', n
+
+
 def test_a_mislabelled_verdict_leaves_other_actions_alone(create_env):
     """A verdict naming another action settles the posted one; it never
     rewrites the other action's text (#106, settled_action_id)."""
