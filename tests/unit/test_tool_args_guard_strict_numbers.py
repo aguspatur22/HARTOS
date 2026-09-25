@@ -12,7 +12,11 @@ llama_server_8080 logs).
 These tests feed the exact live payload, NaN, Infinity and an inf held in an
 already-parsed dict through the guard and ``validate_messages``, then check
 the outgoing text with a strict reader written here (not the helper's own):
-no NaN/Infinity literals, no number that overflows a double.
+no NaN/Infinity literals, no number that overflows a double, no lone UTF-16
+surrogate escape.  The last was measured by the independent review of
+bb809af28: llama.cpp :8080 answered 500 "invalid string: surrogate
+U+D800..U+DBFF must be followed by U+DC00..U+DFFF" for a prior tool_call whose
+arguments were {"v": "\\ud800"}, which the guard had passed unchanged.
 """
 import json
 import math
@@ -36,8 +40,24 @@ def _strict_loads(text):
             raise ValueError(f'number overflow {token!r}')
         return value
 
-    return json.loads(text, parse_constant=refuse, parse_float=finite,
-                      parse_int=lambda t: (finite(t), int(t))[1])
+    def no_lone_surrogate(value):
+        # nlohmann: "surrogate U+D800..U+DBFF must be followed by U+DC00..U+DFFF".
+        # json.loads joins an escaped PAIR into one character, so a surrogate
+        # left in a parsed string was a lone one, and utf-8 refuses it.
+        if isinstance(value, str):
+            value.encode('utf-8')
+        elif isinstance(value, list):
+            for v in value:
+                no_lone_surrogate(v)
+        elif isinstance(value, dict):
+            for k, v in value.items():
+                no_lone_surrogate(k)
+                no_lone_surrogate(v)
+        return value
+
+    return no_lone_surrogate(json.loads(
+        text, parse_constant=refuse, parse_float=finite,
+        parse_int=lambda t: (finite(t), int(t))[1]))
 
 
 def _call(args):
@@ -106,6 +126,41 @@ class StrictNumbers(unittest.TestCase):
                 for tc in (m.get('tool_calls') or [])]
         self.assertEqual(len(sent), 1)
         self.assertEqual(_strict_loads(sent[0])['value'], '620e51403072992921')
+
+
+class LoneSurrogates(unittest.TestCase):
+    """A lone surrogate escape is valid to json.loads and fatal to llama.cpp."""
+
+    def test_lone_high_surrogate_value_becomes_replacement_char(self):
+        out = _out_args(ensure_tool_call_arguments_json(
+            _call('{"v": "a\\ud800b", "k": 1}')))
+        self.assertEqual(_strict_loads(out), {'v': 'a\ufffdb', 'k': 1})
+
+    def test_lone_low_surrogate_in_a_key_becomes_replacement_char(self):
+        out = _out_args(ensure_tool_call_arguments_json(_call('{"\\udc00x": 1}')))
+        self.assertEqual(_strict_loads(out), {'\ufffdx': 1})
+
+    def test_lone_surrogate_inside_a_nested_list_is_replaced(self):
+        out = _out_args(ensure_tool_call_arguments_json(
+            _call('{"a": ["ok", {"b": "\\udbff"}]}')))
+        self.assertEqual(_strict_loads(out), {'a': ['ok', {'b': '\ufffd'}]})
+
+    def test_lone_surrogate_in_a_dict_argument_is_replaced(self):
+        out = _out_args(ensure_tool_call_arguments_json(_call({'v': '\ud800'})))
+        self.assertEqual(_strict_loads(out), {'v': '\ufffd'})
+
+    def test_escaped_surrogate_pair_is_left_byte_identical(self):
+        text = '{"e": "\\ud83d\\ude00"}'  # a valid pair: one emoji
+        out = _out_args(ensure_tool_call_arguments_json(_call(text)))
+        self.assertEqual(out, text)
+
+    def test_raw_surrogate_pair_characters_are_not_replaced(self):
+        # Two raw (unescaped) surrogate characters that form a pair: json.loads
+        # keeps them as two characters, and the request encoder (json.dumps,
+        # ensure_ascii) sends them as a valid escaped pair.  Not lone.
+        text = '{"e": "\ud83d\ude00"}'
+        out = _out_args(ensure_tool_call_arguments_json(_call(text)))
+        self.assertEqual(out, text)
 
 
 if __name__ == '__main__':

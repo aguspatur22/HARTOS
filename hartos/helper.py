@@ -994,22 +994,54 @@ def retrieve_json(json_message):
 # refuses all of these ("out_of_range.406 number overflow").  Live 2026-09-25:
 # a banked step's unquoted hex user id passed the TOOL-ARGS-GUARD for that
 # reason and llama.cpp answered 500 on every later request of the chat.
+# The same holds for a lone UTF-16 surrogate escape ("\ud800" with no low
+# half): json.loads keeps it as a character, nlohmann answers 500 "invalid
+# string: surrogate U+D800..U+DBFF must be followed by U+DC00..U+DFFF"
+# (measured on :8080 by the review of bb809af28).  json.loads joins an
+# escaped PAIR into one character, so what this pattern finds after a parse
+# is lone; the lookarounds leave a pair of raw surrogate characters alone.
+_LONE_SURROGATE = re.compile(
+    r'[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]')
+
+
 def _wire_json_loads(text, on_refused):
-    """json.loads where every token a strict parser refuses goes to on_refused."""
+    """json.loads where every token a strict parser refuses goes to on_refused:
+    a non-finite number or NaN/Infinity constant as its text, a lone
+    surrogate as its one character."""
     def number(parse):
         def hook(token):
             return parse(token) if math.isfinite(float(token)) else on_refused(token)
         return hook
-    return json.loads(text, parse_float=number(float), parse_int=number(int),
-                      parse_constant=on_refused)
+
+    def strings(value):
+        if isinstance(value, str):
+            return _LONE_SURROGATE.sub(lambda m: on_refused(m.group()), value)
+        if isinstance(value, list):
+            return [strings(v) for v in value]
+        if isinstance(value, dict):
+            return {strings(k): strings(v) for k, v in value.items()}
+        return value
+
+    return strings(json.loads(text, parse_float=number(float),
+                              parse_int=number(int), parse_constant=on_refused))
 
 
 def _refuse_token(token):
     raise ValueError(f"not valid for a strict JSON parser: {token!r}")
 
 
+def _keep_refused_token(token):
+    """A refused number or constant keeps its text; a lone surrogate, which
+    has no text a strict parser accepts, becomes U+FFFD."""
+    return '\ufffd' if _LONE_SURROGATE.fullmatch(token) else token
+
+
 def is_wire_json(text):
-    """True when ``text`` is JSON that llama.cpp's strict parser accepts."""
+    """True when ``text`` parses as JSON and holds none of the tokens that
+    Python's ``json.loads`` accepts but llama.cpp's parser (nlohmann) refuses:
+    NaN / Infinity / -Infinity, a number that overflows a double, a lone
+    UTF-16 surrogate.  It is not a full nlohmann conformance check: it covers
+    the laxities of json.loads that are known to reach the wire."""
     try:
         _wire_json_loads(text, _refuse_token)
         return True
@@ -1020,8 +1052,9 @@ def is_wire_json(text):
 def load_wire_json(text):
     """Parse ``text``, keeping each token a strict parser refuses as its own
     string: an unquoted id ``620e51403072992921`` comes back as
-    ``"620e51403072992921"``, never ``inf``.  Raises like ``json.loads``."""
-    return _wire_json_loads(text, str)
+    ``"620e51403072992921"``, never ``inf``; a lone surrogate becomes U+FFFD.
+    Raises like ``json.loads``."""
+    return _wire_json_loads(text, _keep_refused_token)
 
 
 def ensure_tool_call_arguments_json(messages):
@@ -1047,10 +1080,11 @@ def ensure_tool_call_arguments_json(messages):
 
     Coercion per malformed call: keep it if it is already JSON a STRICT
     parser accepts (``is_wire_json`` -- Python's ``json.loads`` alone is not
-    that test: it reads an overflowing number as inf and accepts NaN, both of
-    which llama.cpp refuses with a 500); else parse it, or its ``repair_json``
-    repair, with ``load_wire_json``, which keeps each refused number as its
-    own string, and keep the result only if it is a dict; else fall back to
+    that test: it reads an overflowing number as inf and accepts NaN and a
+    lone surrogate escape, all of which llama.cpp refuses with a 500); else
+    parse it, or its ``repair_json`` repair, with ``load_wire_json``, which
+    keeps each refused number as its own string and turns a lone surrogate
+    into U+FFFD, and keep the result only if it is a dict; else fall back to
     ``"{}"`` — a well-formed empty-args call.  The executor then reports a
     missing argument and the model re-steers, which is strictly better than
     a 500 that aborts the entire turn.
@@ -1091,10 +1125,7 @@ def ensure_tool_call_arguments_json(messages):
             # overflowing number into Infinity, losing the token.
             for candidate in (lambda: args, lambda: repair_json(args)):
                 try:
-                    text = candidate()
-                    obj = load_wire_json(
-                        json.dumps(text) if isinstance(text, (dict, list))
-                        else text)
+                    obj = load_wire_json(candidate())
                 except Exception:
                     continue
                 if isinstance(obj, dict):
