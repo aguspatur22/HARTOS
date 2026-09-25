@@ -5929,6 +5929,18 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
             #    banked "no-op" and REUSE had no code to replay.
             _FAILED_REPLY_PREFIXES = ('Error:', 'Tool execution failed:')
             from autogen.code_utils import extract_code, UNKNOWN
+            # autogen's code-execution reply runs the newest fenced block among
+            # the replier's last `last_n_messages` messages, so the ran code is
+            # looked for in exactly that span, read from the live agent that
+            # posted the exitcode (the Executor, or the Assistant, which has
+            # code execution too).  'auto' or an unknown sender: the whole
+            # window, as before.
+            reach = {}
+            for ag in (getattr(group_chat, 'agents', None) or []):
+                cfg = getattr(ag, '_code_execution_config', None)
+                n = cfg.get('last_n_messages') if isinstance(cfg, dict) else None
+                if isinstance(n, int) and not isinstance(n, bool):
+                    reach[getattr(ag, 'name', None)] = n
             window = [m for m in msgs[start:end] if isinstance(m, dict)]
             failed_ids = set()
             for m in window:
@@ -5955,7 +5967,9 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
                     continue
                 # The code that ran is the newest earlier message holding a
                 # fenced block -- the one the Executor scanned.
-                for prev in reversed(window[:k]):
+                scan_n = reach.get(m.get('name'))
+                lo = 0 if scan_n is None else max(0, k - scan_n)
+                for prev in reversed(window[lo:k]):
                     blocks = [(lang, code) for lang, code
                               in extract_code(prev.get('content') or '')
                               if lang != UNKNOWN]

@@ -61,8 +61,8 @@ def _load_bank_fn(tmp_path):
 def banked(tmp_path):
     fn, ns = _load_bank_fn(tmp_path)
 
-    def run(messages, action_id=2, user_prompt='u_test'):
-        gc = SimpleNamespace(messages=messages)
+    def run(messages, action_id=2, user_prompt='u_test', agents=None):
+        gc = SimpleNamespace(messages=messages, agents=agents or [])
         ok = fn(user_prompt, '999', 0, action_id, gc)
         path = tmp_path / f'999_0_{action_id}.json'
         data = json.load(open(path)) if path.exists() else None
@@ -348,3 +348,65 @@ class TestTraceBankingRecordsWhatSucceeded:
         banked_code = data['recipe'][0]['generalized_functions']
         assert 'print(1)' in banked_code
         assert key not in banked_code
+
+    def test_a_retry_banks_the_code_that_ran_clean_not_the_failed_attempt(
+            self, banked):
+        """Review of the CR3 fix: the Assistant's first block exits 1, its
+        corrected block exits 0.  Only the corrected block did the work."""
+        first = "```python\nimport hashlib\nprint(hashlib.md5(b'x'))\n```"
+        fixed = "```python\nimport hashlib\nprint(hashlib.sha256(b'x'))\n```"
+        ok, data, _ = banked(
+            [{'content': 'Execute Action 2: compute a hash'}]
+            + _code_run(code=first, exitcode=1)
+            + _code_run(code=fixed, exitcode=0))
+        assert ok is True
+        code = [s['generalized_functions'] for s in data['recipe']]
+        assert len(code) == 1, data['recipe']
+        assert 'sha256' in code[0] and 'md5' not in code[0], code
+
+
+def _executor(last_n, name='Executor'):
+    return SimpleNamespace(name=name, _code_execution_config={
+        'last_n_messages': last_n, 'work_dir': '.', 'use_docker': False})
+
+
+class TestTraceBankingReadsTheExecutorsReach:
+    """autogen's Executor runs the newest fenced block among its last
+    ``last_n_messages`` messages (conversable_agent's code-execution reply).
+    A block further back did not run, whatever the exit code says."""
+
+    _TRACE = [
+        {'content': 'Execute Action 2: compute\n```python\nprint(42)\n```'},
+        {'content': 'Working on it.', 'name': 'Assistant'},
+        {'content': 'Still thinking.', 'name': 'Assistant'},
+        {'content': 'exitcode: 0 (execution succeeded)\nCode output: \n',
+         'role': 'user', 'name': 'Executor'},
+    ]
+
+    def test_a_block_beyond_the_executors_reach_is_not_banked(self, banked):
+        ok, data, _ = banked(list(self._TRACE), agents=[_executor(2)])
+        assert ok is True
+        assert data['recipe'][0]['generalized_functions'] == '', data['recipe']
+        assert 'no-op' in data['recipe'][0]['steps']
+
+    def test_a_block_within_reach_is_banked(self, banked):
+        ok, data, _ = banked(list(self._TRACE), agents=[_executor(3)])
+        assert ok is True
+        assert 'print(42)' in data['recipe'][0]['generalized_functions']
+
+    def test_the_reach_is_the_one_of_the_agent_that_ran_it(self, banked):
+        """The Assistant has code execution too (instantiate_assistant_agent);
+        when it posts the exitcode, its own reach applies, not the
+        Executor's."""
+        trace = list(self._TRACE)
+        trace[-1] = dict(trace[-1], name='Assistant')
+        ok, data, _ = banked(trace, agents=[_executor(5),
+                                            _executor(2, name='Assistant')])
+        assert ok is True
+        assert data['recipe'][0]['generalized_functions'] == '', data['recipe']
+
+    def test_auto_or_no_executor_scans_the_whole_window(self, banked):
+        for agents in ([], [_executor('auto')]):
+            ok, data, _ = banked(list(self._TRACE), agents=agents)
+            assert ok is True
+            assert 'print(42)' in data['recipe'][0]['generalized_functions']
