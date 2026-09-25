@@ -326,6 +326,41 @@ class UserService:
         return db.query(User).filter(User.id == user_id).first()
 
     @staticmethod
+    def person_to_notify(db: Session, user_id: str) -> Optional[str]:
+        """The PERSON a notification about ``user_id`` should reach, or None.
+
+        ``users`` holds agents and system identities beside people
+        (core.constants.NON_PERSON_USER_TYPES).  Nobody signs in as one, so a
+        notification written to one sits unread and its push reaches no
+        subscriber.  Measured 2026-09-25: 3003 goal_contribution rows
+        addressed to hevolve_system_agent (user_type 'agent'), none read.
+
+        - a person (human, guest, or a NULL legacy type): that user;
+        - an agent or system account: the person who owns it (owner_id),
+          if that owner is a person;
+        - an agent or system account with no human owner: None;
+        - an id with no local users row: returned unchanged, because a goal
+          submitted on another node names a requester this node never saw.
+        """
+        from core.constants import NON_PERSON_USER_TYPES
+        user = UserService.get_by_id(db, user_id)
+        if user is None:
+            return user_id
+        if user.user_type not in NON_PERSON_USER_TYPES:
+            return user.id
+        if not user.owner_id:
+            return None
+        # One hop only, so an ownership cycle cannot loop.  An owner that is
+        # itself an agent is not a person (live: analysis.local.sage is owned
+        # by hevolve_system_agent).
+        owner = UserService.get_by_id(db, user.owner_id)
+        if owner is None:
+            return user.owner_id
+        if owner.user_type in NON_PERSON_USER_TYPES:
+            return None
+        return owner.id
+
+    @staticmethod
     def get_by_username(db: Session, username: str) -> Optional[User]:
         return db.query(User).filter(User.username == username).first()
 
