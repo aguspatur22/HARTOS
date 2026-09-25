@@ -187,7 +187,8 @@ def is_action_error_reply(reply) -> bool:
     return '"action_id"' in text and re.search(r'"status"\s*:\s*"error"', text) is not None
 
 
-def register_dual(helper, executor, func, name: str, description: str):
+def register_dual(helper, executor, func, name: str, description: str,
+                  *, attach: bool = False):
     """Register a single tool on both the LLM-calling and executing agents.
 
     AutoGen's tool pattern pairs ``helper.register_for_llm`` with
@@ -197,11 +198,33 @@ def register_dual(helper, executor, func, name: str, description: str):
     helper; batches that already have a ``(name, desc, func)`` list
     should use :func:`register_core_tools` instead.
 
+    ``attach=True`` is for a tool handed to the model to call NOW —
+    ``request_tools`` itself and everything the on-demand paths attach
+    (discover_and_attach, attach_for_names, attach_for_tags).  Such a tool
+    ALSO goes on the executor's schema when the executor is a proposing
+    seat, i.e. already carries an LLM tool schema of its own
+    (``register_core_tools(..., executor_proposes=True)`` makes the main
+    leg's Assistant one).  Without it the schema went to the Helper only,
+    and the Helper speaks only on an ``@Helper`` mention the tool-bearing
+    Assistant never writes: measured live 2026-09-25, request_tools
+    answered "Attached and ready to call NOW" for share_context_with_agents
+    while the Assistant still carried none of it, and an autonomous CREATE
+    told the user "delegate_to_specialist isn't available in my current
+    toolset".  An executor with no schema (the time / visual legs, a
+    UserProxy) is left exactly as before.
+
+    Construction-time registration keeps the default: the proposer's
+    always-on schema is the budgeted MAIN_LEG_CORE_TOOLS set, and the rest
+    is reached through ``request_tools`` (see defer_helper_schema).
+
     Returns ``func`` unchanged so the call can be inlined after a
     closure definition without shadowing the name.
     """
+    proposes = attach and bool(helper_tool_names(executor))
     helper.register_for_llm(name=name, description=description)(func)
     executor.register_for_execution(name=name)(func)
+    if proposes:
+        executor.register_for_llm(name=name, description=description)(func)
     return func
 
 
@@ -745,7 +768,8 @@ def discover_and_attach(need, helper, executor, registry, attached_names,
                 startable.append(fn)
                 continue
             register_dual(helper, executor, func, fn,
-                          ep.get('description', f'{tool_name} {ep_name}'))
+                          ep.get('description', f'{tool_name} {ep_name}'),
+                          attach=True)
             attached_names.add(fn)
             attached.append(fn)
     # Core closures: SAME selector (the keyword/stem matcher above), same
@@ -763,7 +787,8 @@ def discover_and_attach(need, helper, executor, registry, attached_names,
         if not any(w in hay_core or (len(w) >= 4 and w[:4] in core_stems)
                    for w in words):
             continue
-        register_dual(helper, executor, _c_func, _c_name, _c_desc)
+        register_dual(helper, executor, _c_func, _c_name, _c_desc,
+                      attach=True)
         attached_names.add(_c_name)
         attached.append(_c_name)
 
@@ -811,7 +836,8 @@ def discover_and_attach(need, helper, executor, registry, attached_names,
         if not any(w in hay_x or (len(w) >= 4 and w[:4] in x_stems)
                    for w in words):
             continue
-        register_dual(helper, executor, _x_func, _x_name, _x_desc)
+        register_dual(helper, executor, _x_func, _x_name, _x_desc,
+                      attach=True)
         attached_names.add(_x_name)
         attached.append(_x_name)
 
@@ -838,6 +864,43 @@ def discover_and_attach(need, helper, executor, registry, attached_names,
             "in earning mode, payment approval. Do not tell the user this is "
             "impossible; offer these routes.")
     return '  '.join(parts)
+
+
+REQUEST_TOOLS_DESCRIPTION = (
+    "Discover and attach additional tools by describing the capability you "
+    "need, e.g. 'text to speech' or 'crawl a webpage'. Call this FIRST "
+    "whenever your current tools lack a capability - never tell the user "
+    "something is unavailable without trying this. If it finds no match, "
+    "call it once more with different wording.")
+
+
+def register_request_tools(helper, executor, registry, attached_names):
+    """Register the never-say-unavailable escape on a helper/executor pair.
+
+    ONE definition for both legs.  create_recipe.create_agents and
+    reuse_recipe.create_agents_for_user each carried an identical inline
+    ``request_tools`` closure registered with ``register_dual(helper,
+    assistant, ...)``, i.e. on the Helper's schema only, so the escape the
+    prompts tell the model to "call FIRST" was invisible to the Assistant --
+    the seat that speaks (register_core_tools' docstring had already measured
+    "request_tools x101 -- the never-say-unavailable escape hatch, itself
+    unreachable").  Registered with ``attach=True`` it lands on every seat
+    that proposes, and what it attaches does too (discover_and_attach).
+
+    ``core_tools`` is read from ``executor._hart_core_tools`` at CALL time,
+    as both inline copies did: the legs stash the full closure list there
+    (reuse adds execute_windows_or_android_command to it after
+    construction), and it is the list attach_for_names reads.
+
+    Returns the registered function.
+    """
+    def request_tools(need: str) -> str:
+        return discover_and_attach(need, helper, executor, registry,
+                                   attached_names,
+                                   core_tools=getattr(
+                                       executor, '_hart_core_tools', None))
+    return register_dual(helper, executor, request_tools, 'request_tools',
+                         REQUEST_TOOLS_DESCRIPTION, attach=True)
 
 
 def attach_for_tags(cap_tags, helper, executor, registry, attached_names):
@@ -868,7 +931,8 @@ def attach_for_tags(cap_tags, helper, executor, registry, attached_names):
             if func is None:
                 continue
             register_dual(helper, executor, func, fn,
-                          ep.get('description', f'{tool_name} {ep_name}'))
+                          ep.get('description', f'{tool_name} {ep_name}'),
+                          attach=True)
             attached_names.add(fn)
             n += 1
     return n
@@ -960,7 +1024,8 @@ def attach_for_names(names, helper, executor, registry, attached_names,
             if func is None:
                 continue
             register_dual(helper, executor, func, fn,
-                          ep.get('description', f'{tool_name} {ep_name}'))
+                          ep.get('description', f'{tool_name} {ep_name}'),
+                          attach=True)
             attached_names.add(fn)
             n += 1
 
@@ -970,7 +1035,8 @@ def attach_for_names(names, helper, executor, registry, attached_names,
     for core_name, core_desc, core_func in (core_tools or []):
         if core_name not in want or core_name in attached_names:
             continue
-        register_dual(helper, executor, core_func, core_name, core_desc)
+        register_dual(helper, executor, core_func, core_name, core_desc,
+                      attach=True)
         attached_names.add(core_name)
         n += 1
     return n

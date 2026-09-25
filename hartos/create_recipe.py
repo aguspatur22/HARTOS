@@ -1818,19 +1818,11 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         # or newly-needed tools mid-conversation (owner req 2026-08-31).
         _attached_names = set(svc_tools)
 
-        def request_tools(need: str) -> str:
-            from core.agent_tools import discover_and_attach
-            return discover_and_attach(need, helper, assistant,
-                                       service_tool_registry, _attached_names,
-                                       core_tools=getattr(
-                                           assistant, '_hart_core_tools', None))
-        register_dual(helper, assistant, request_tools, 'request_tools',
-                      "Discover and attach additional tools by describing the "
-                      "capability you need, e.g. 'text to speech' or 'crawl a "
-                      "webpage'. Call this FIRST whenever your current tools "
-                      "lack a capability - never tell the user something is "
-                      "unavailable without trying this. If it finds no "
-                      "match, call it once more with different wording.")
+        # ONE registration for both legs, on the Helper AND on the proposing
+        # Assistant -- see core.agent_tools.register_request_tools.
+        from core.agent_tools import register_request_tools
+        register_request_tools(helper, assistant, service_tool_registry,
+                               _attached_names)
 
         for tool_name, tool_func in svc_tools.items():
             tool_def = next((d for d in svc_defs if d['name'] == tool_name), None)
