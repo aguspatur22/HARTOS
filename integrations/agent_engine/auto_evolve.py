@@ -143,6 +143,11 @@ class EvolveSession:
     failed: int = 0
     experiments: List[Dict] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+    # Who started the cycle: the admin's id from the API, 'system' from the
+    # agent daemon.  _emit_event addresses every auto_evolve.* event to this
+    # id.  Deliberately NOT in to_dict(): the status endpoint is open to any
+    # authenticated user, and the initiator is not theirs to see.
+    user_id: str = 'system'
 
     def to_dict(self) -> Dict:
         return {
@@ -198,7 +203,7 @@ class AutoEvolveOrchestrator:
                     'session': self._active_session.to_dict(),
                 }
 
-        session = EvolveSession()
+        session = EvolveSession(user_id=user_id or 'system')
         session.started_at = time.time()
         session.status = 'selecting'
 
@@ -334,7 +339,7 @@ class AutoEvolveOrchestrator:
             else:
                 return session.to_dict()
 
-        self._emit_event('auto_evolve.completed', payload)
+        self._emit_event('auto_evolve.completed', session, payload)
         return payload
 
     def _execute_cycle(self, session: EvolveSession,
@@ -350,7 +355,7 @@ class AutoEvolveOrchestrator:
         if not candidates:
             session.status = 'completed'
             session.errors.append('No eligible experiments found')
-            self._emit_event('auto_evolve.no_candidates', session.to_dict())
+            self._emit_event('auto_evolve.no_candidates', session)
             return
 
         # Phase 2: FILTER through constitutional gate
@@ -365,7 +370,7 @@ class AutoEvolveOrchestrator:
             session.status = 'completed'
             session.errors.append(
                 f'No experiments met approval threshold ({min_approval_score})')
-            self._emit_event('auto_evolve.none_approved', session.to_dict())
+            self._emit_event('auto_evolve.none_approved', session)
             return
 
         # Phase 4: SELECT top-N
@@ -373,7 +378,7 @@ class AutoEvolveOrchestrator:
 
         # Phase 5: DISPATCH to type-aware iteration (parallel per PRODUCT_MAP §10)
         session.status = 'dispatching'
-        self._emit_event('auto_evolve.dispatching', {
+        self._emit_event('auto_evolve.dispatching', session, {
             'count': len(winners),
             'experiments': [w['id'] for w in winners],
         })
@@ -381,7 +386,7 @@ class AutoEvolveOrchestrator:
         self._dispatch_winners_parallel(session, winners, user_id)
 
         session.status = 'running' if session.dispatched > 0 else 'failed'
-        self._emit_event('auto_evolve.started', session.to_dict())
+        self._emit_event('auto_evolve.started', session)
 
         logger.info(f"[{session.session_id}] Auto-evolve dispatched "
                      f"{session.dispatched}/{len(winners)} experiments")
@@ -733,11 +738,22 @@ class AutoEvolveOrchestrator:
                 db.commit()
             return result
 
-    def _emit_event(self, topic: str, data: Dict):
-        """Emit progress event via EventBus."""
+    def _emit_event(self, topic: str, session: EvolveSession,
+                    data: Optional[Dict] = None):
+        """Emit a progress event via EventBus, addressed to the initiator.
+
+        The payload defaults to the session snapshot.  Every event is stamped
+        with the cycle initiator's user_id here, in one place: the EventBus
+        P3a guard refuses an SSE broadcast that names no user (live, every
+        cycle: "SSE broadcast refused ... topic='auto_evolve.none_approved'"),
+        and these topics are not public -- the status they carry is behind
+        auth -- so they route to the person who started the cycle.
+        """
+        payload = dict(data) if data is not None else session.to_dict()
+        payload['user_id'] = session.user_id
         try:
             from core.platform.events import emit_event
-            emit_event(topic, data)
+            emit_event(topic, payload)
         except Exception:
             pass
 
