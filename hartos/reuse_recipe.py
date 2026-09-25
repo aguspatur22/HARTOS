@@ -511,7 +511,7 @@ class Action:
 # Updated subscribe_and_return function
 
 
-from core.config_cache import get_db_url
+from core.config_cache import get_db_url, is_bundled
 database_url = get_db_url() or 'https://mailer.hertzai.com'
 
 
@@ -605,7 +605,25 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
     except Exception as e:
         _ctx_safe_log('error', f"Error scheduling tracking reset: {e}")
 
-    # Send the message to the user
+    # On the desktop the user's chat is the local topic; the cloud host below
+    # is unreachable there (Nunba gui_app.log 2026-09-26: WinError 10061,
+    # the agent's question never arrived).  One publisher for CREATE and
+    # REUSE: core.peer_link.crossbar_publish.publish_agent_message.
+    if is_bundled():
+        from core.peer_link.crossbar_publish import publish_agent_message
+        if publish_agent_message(text=response, user_id=user_id,
+                                 request_id=intermediate_request_id,
+                                 prompt_id=prompt_id, inp=inp):
+            _ctx_safe_log(
+                'info',
+                f'Message published locally with request_id: {intermediate_request_id}')
+            return f'Message sent successfully to user with request_id: {original_request_id}'
+        _ctx_safe_log(
+            'error',
+            f'Local publish to user failed for request_id: {intermediate_request_id}')
+        return f'Failed to send message to user with request_id: {original_request_id}'
+
+    # Standalone central HARTOS: forward to the chatbot_pipeline backend.
     url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
     body = json.dumps({'user_id': user_id, 'message': response, 'inp': inp, 'request_id': intermediate_request_id, 'Agent_status': 'Reuse Mode'})
     headers = {'Content-Type': 'application/json'}

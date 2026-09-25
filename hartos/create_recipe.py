@@ -502,7 +502,7 @@ except Exception as e:
     tool_logger.error(f"Failed to register expert agents: {e}")
     expert_agents = {}
 
-from core.config_cache import get_db_url
+from core.config_cache import get_db_url, is_bundled
 database_url = get_db_url() or 'https://mailer.hertzai.com'
 
 
@@ -516,11 +516,13 @@ def send_message_to_user1(user_id, response, inp, prompt_id):
 
     Deployment-mode-aware (2026-06-09):
 
-    - **Bundled** (sys.frozen — Nunba desktop / installer / embedded):
-      Emit directly to the canonical local chat topic
+    - **Bundled** (core.config_cache.is_bundled — Nunba desktop /
+      installer / embedded): core.peer_link.crossbar_publish.
+      publish_agent_message emits to the local chat topic
       com.hertzai.hevolve.chat.{user_id} with the schema chat-stream
       subscribers actually parse (text, request_id, prompt_id, bot_type,
-      options, page_image_url).  No cloud round-trip.  Subscribers
+      options, page_image_url).  No cloud round-trip.  REUSE's
+      send_message_to_user1 uses the same publisher.  Subscribers
       (Web SPA Demopage.js, Android RN AutobahnConnectionManager, Nunba
       Python adapter) render the message; downstream TTS/video happen
       via the local chat fan-out (no need to re-trigger here).
@@ -539,45 +541,18 @@ def send_message_to_user1(user_id, response, inp, prompt_id):
 
     Always fire-and-forget — callers don't read the return value.
     """
-    import sys as _sys
     user_prompt = f'{user_id}_{prompt_id}'
     try:
         request_id = f'{request_id_list[user_prompt]}-intermediate'
     except (KeyError, NameError):
         request_id = f'{user_prompt}-intermediate'
 
-    _bundled = bool(getattr(_sys, 'frozen', False))
-
-    if _bundled:
+    if is_bundled():
         # Bundled (Nunba install) — local chat topic, on-device.
-        text = str(response or '')
-        if not text:
-            return
-        chat_payload = {
-            'text': [text],
-            'request_id': request_id,
-            'prompt_id': prompt_id,
-            'bot_type': 'Custom GPT',
-            'options': [],
-            'newoptions': [],
-            'page_image_url': '',
-            'analogy_image_url': '',
-            'probe': False,
-            'inp': inp,
-        }
-        try:
-            # Canonical worker-safe publisher is the module-level publish_async
-            # (create_recipe.py:109, routes via safe_hartos_attr). The previous
-            # `from core.message_bus import publish_async` raised
-            # ModuleNotFoundError every call (no such module) → bundled mode
-            # silently dropped every intermediate chat message.
-            publish_async(f'com.hertzai.hevolve.chat.{user_id}', chat_payload)
-        except Exception as _e:
-            try:
-                current_app.logger.debug(
-                    f'send_message_to_user1: local publish failed ({_e})')
-            except Exception:
-                pass
+        from core.peer_link.crossbar_publish import publish_agent_message
+        publish_agent_message(text=response, user_id=user_id,
+                              request_id=request_id, prompt_id=prompt_id,
+                              inp=inp)
         return
 
     # Standalone central HARTOS — canonical Kong gateway.
