@@ -28,6 +28,7 @@ if _ROOT not in sys.path:
 
 UID = '10'
 AGENT = '88659566083'
+SCOPE = 'display:1'
 
 
 @pytest.fixture
@@ -78,15 +79,18 @@ def effects(monkeypatch, dbfile):
     import integrations.social.consent_service as cs
 
     path, _ = dbfile
-    seen = {'emit': [], 'copilot': [], 'feed': []}
+    seen = {'emit': [], 'copilot': [], 'feed': [], 'order': []}
 
     def _emit(topic, data, msg_id=None):
+        seen['order'].append('emit')
         seen['emit'].append((topic, dict(data)))
 
     def _copilot(consent_type, granted):
+        seen['order'].append('copilot')
         seen['copilot'].append((consent_type, granted))
 
     def _feed(consent_type, granted):
+        seen['order'].append('feed')
         seen['feed'].append((consent_type, granted, _other_writer(path)))
 
     monkeypatch.setattr(cs, '_emit', _emit)
@@ -123,11 +127,12 @@ def test_a_promoted_per_agent_ask_also_starts_its_feed_after_commit(dbfile, effe
     _, factory = dbfile
     db = factory()
     try:
-        ConsentService.request_consent(db, UID, 'screen_capture', agent_id=AGENT)
+        ConsentService.request_consent(db, UID, 'screen_capture',
+                                       scope=SCOPE, agent_id=AGENT)
         db.commit()
         effects['emit'].clear()
         row = ConsentService.grant_consent(db, UID, 'screen_capture',
-                                           agent_id=AGENT)
+                                           scope=SCOPE, agent_id=AGENT)
         db.commit()
     finally:
         db.close()
@@ -137,8 +142,49 @@ def test_a_promoted_per_agent_ask_also_starts_its_feed_after_commit(dbfile, effe
     _, _, (wrote, visible) = effects['feed'][0]
     assert wrote == 'ok', f'another writer was locked out: {wrote}'
     assert visible == 1
-    assert [t for t, _ in effects['emit']] == ['consent.granted']
+    # The whole payload: a surface dismisses the card for THIS agent's ask
+    # by matching agent_id and scope, so neither may be lost or widened.
+    assert effects['emit'] == [('consent.granted', {
+        'user_id': UID, 'consent_type': 'screen_capture',
+        'scope': SCOPE, 'agent_id': AGENT})]
     assert effects['copilot'] == [('screen_capture', True)]
+
+
+def test_a_new_per_agent_grant_names_its_agent_and_scope(dbfile, effects):
+    """The insert branch (no ask on file) carries the same payload."""
+    from integrations.social.consent_service import ConsentService
+
+    _, factory = dbfile
+    db = factory()
+    try:
+        ConsentService.grant_consent(db, UID, 'screen_capture',
+                                     scope=SCOPE, agent_id=AGENT)
+        db.commit()
+    finally:
+        db.close()
+
+    assert effects['emit'] == [('consent.granted', {
+        'user_id': UID, 'consent_type': 'screen_capture',
+        'scope': SCOPE, 'agent_id': AGENT})]
+    assert [(t, g) for t, g, _ in effects['feed']] == [('screen_capture', True)]
+
+
+def test_the_broadcast_leaves_before_the_feed_starts(dbfile, effects):
+    """The feed start is the effect that hung live (it never returned), so
+    it runs last: every surface hears consent.granted and the copilot
+    switch is set before it, and a feed that never returns cannot hold
+    them back."""
+    from integrations.social.consent_service import ConsentService
+
+    _, factory = dbfile
+    db = factory()
+    try:
+        ConsentService.grant_consent(db, UID, 'screen_capture')
+        db.commit()
+    finally:
+        db.close()
+
+    assert effects['order'] == ['emit', 'copilot', 'feed']
 
 
 def test_a_rolled_back_grant_turns_nothing_on(dbfile, effects):

@@ -236,6 +236,72 @@ def db_session(commit=True):
     return _session_cm()
 
 
+#: Where a session keeps the effects waiting for its commit (after_commit).
+_AFTER_COMMIT_KEY = 'hevolve.after_commit'
+
+
+def _run_after_commit(session) -> None:
+    """after_commit: run what the committed transaction queued, in order.
+    One failing effect is logged and the rest still run; nothing raises out
+    of the caller's commit, which has already succeeded.  The queue is
+    emptied by _drop_uncommitted, which SQLAlchemy calls right after this
+    one when the outer transaction ends, so each effect runs once."""
+    for effect in list(session.info.get(_AFTER_COMMIT_KEY) or ()):
+        try:
+            effect()
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning(
+                "effect after commit failed", exc_info=True)
+
+
+def _drop_uncommitted(session, transaction) -> None:
+    """after_transaction_end: empty the queue when the OUTERMOST transaction
+    ends.  After a commit its effects have just run (_run_after_commit);
+    after a rollback, or a close without a commit, the rows never reached
+    disk, so nothing may act on them, and a later commit of the same session
+    must not run them either.  A savepoint ending is not the outer
+    transaction ending, so what was queued stays queued."""
+    if transaction.parent is not None:
+        return
+    pending = session.info.get(_AFTER_COMMIT_KEY)
+    if pending:
+        pending.clear()
+
+
+def after_commit(db, effect) -> None:
+    """Run ``effect()`` once ``db``'s transaction has committed; never if it
+    rolls back or the session closes without committing.
+
+    For work that must follow a durable row and must not run inside its
+    transaction: a live push, a broadcast, starting a feed.  Two reasons.
+    A push for a row that then rolls back announces something that does not
+    exist.  And on SQLite a flushed row holds the one write lock until the
+    transaction ends, so slow work run between the flush and the commit
+    locks every other writer out (busy_timeout 3 s, then 'database is
+    locked').  Measured live 2026-09-25: a consent grant whose feed start
+    never returned left the database unwritable for about 41 minutes.
+
+    Effects run in the order they were queued, each once.  The session's own
+    commit is the one place that knows the row is durable, so a caller that
+    commits (a request session, a db_session block) gets this unchanged.
+
+    Not on after_rollback: measured on SQLAlchemy 2.0.16, that also fires
+    when a savepoint rolls back, which leaves the outer transaction alive;
+    and a close without a commit fires only after_transaction_end.  So the
+    queue is dropped on after_transaction_end of the outermost transaction.
+    A bare ``event.listen(db, 'after_commit', fn, once=True)`` gets this
+    wrong: the listener outlives a rollback and fires on the session's next,
+    unrelated commit.
+    """
+    pending = db.info.get(_AFTER_COMMIT_KEY)
+    if pending is None:
+        pending = db.info[_AFTER_COMMIT_KEY] = []
+        event.listen(db, 'after_commit', _run_after_commit)
+        event.listen(db, 'after_transaction_end', _drop_uncommitted)
+    pending.append(effect)
+
+
 def init_db():
     engine = get_engine()
     Base.metadata.create_all(engine)

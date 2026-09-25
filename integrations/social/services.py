@@ -11,13 +11,13 @@ from typing import Optional, List, Tuple
 
 logger = logging.getLogger('hevolve_social')
 
-from sqlalchemy import desc, asc, func, event
+from sqlalchemy import desc, asc, func
 from sqlalchemy.orm import Session, joinedload
 
 from .models import (
     User, Post, Comment, Vote, Follow, Community, CommunityMembership,
     Notification, Report, TaskRequest, RecipeShare, AgentSkillBadge,
-    _uuid,
+    _uuid, after_commit,
 )
 from .auth import hash_password, verify_password, generate_api_token, generate_jwt
 
@@ -1167,6 +1167,14 @@ class CommunityService:
 
 # ─── Notification Service ───
 
+def _push_read(user_id: str, ids: list) -> None:
+    """Fan a read or dismissed state out to the user's other devices (the
+    'notification.read' event every client filters on).  Queued with
+    models.after_commit, so it only leaves for a change that committed."""
+    from .realtime import on_notification_read
+    on_notification_read(user_id, ids)
+
+
 class NotificationService:
 
     @staticmethod
@@ -1179,17 +1187,14 @@ class NotificationService:
         )
         db.add(notif)
         db.flush()
-        # Push to SSE + WAMP in real-time AFTER commit (fire-and-forget)
-        # Defer notification to after_commit to ensure data consistency
+        # Push to SSE + WAMP once the row has committed, never for a row
+        # that rolls back (models.after_commit; a failed push is logged there).
         notif_dict = notif.to_dict()
-        _uid = user_id
-        def _push_after_commit(session):
-            try:
-                from .realtime import on_notification
-                on_notification(_uid, notif_dict)
-            except Exception:
-                pass
-        event.listen(db, 'after_commit', _push_after_commit, once=True)
+
+        def _push():
+            from .realtime import on_notification
+            on_notification(user_id, notif_dict)
+        after_commit(db, _push)
         return notif
 
     @staticmethod
@@ -1222,13 +1227,7 @@ class NotificationService:
         # ('notification.read') is what clients filter on.
         _ids = list(notification_ids or [])
         if _ids:
-            def _push_read_after_commit(_session):
-                try:
-                    from .realtime import on_notification_read
-                    on_notification_read(user_id, _ids)
-                except Exception:
-                    pass
-            event.listen(db, 'after_commit', _push_read_after_commit, once=True)
+            after_commit(db, lambda: _push_read(user_id, _ids))
 
     @staticmethod
     def mark_all_read(db: Session, user_id: str):
@@ -1250,13 +1249,7 @@ class NotificationService:
         }, synchronize_session=False)
         db.flush()
         if ids_to_flip:
-            def _push_read_all_after_commit(_session):
-                try:
-                    from .realtime import on_notification_read
-                    on_notification_read(user_id, ids_to_flip)
-                except Exception:
-                    pass
-            event.listen(db, 'after_commit', _push_read_all_after_commit, once=True)
+            after_commit(db, lambda: _push_read(user_id, ids_to_flip))
 
     @staticmethod
     def mark_dismissed(db: Session, notification_ids: List[str], user_id: str):
@@ -1275,13 +1268,7 @@ class NotificationService:
         }, synchronize_session=False)
         db.flush()
         _ids = list(notification_ids)
-        def _push_dismissed_after_commit(_session):
-            try:
-                from .realtime import on_notification_read
-                on_notification_read(user_id, _ids)
-            except Exception:
-                pass
-        event.listen(db, 'after_commit', _push_dismissed_after_commit, once=True)
+        after_commit(db, lambda: _push_read(user_id, _ids))
 
 
 # ─── Report Service ───
