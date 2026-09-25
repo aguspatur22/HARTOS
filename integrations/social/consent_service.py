@@ -421,6 +421,82 @@ def _embodied_feed_from_consent(consent_type: str, granted: bool) -> None:
                         feed, consent_type, e)
 
 
+#: Where a session keeps the grant effects waiting for its commit.
+_AFTER_COMMIT_KEY = 'hevolve.consent.after_commit'
+
+
+def _run_after_commit(session) -> None:
+    """after_commit: run what the committed transaction queued.  One failing
+    effect is logged and the rest still run; nothing raises out of the
+    caller's commit, which has already succeeded.  The queue is emptied by
+    _drop_uncommitted, which SQLAlchemy calls right after this one when the
+    outer transaction ends, so each effect runs once."""
+    for effect in list(session.info.get(_AFTER_COMMIT_KEY) or ()):
+        try:
+            effect()
+        except Exception:
+            _logger.warning("consent effect after commit failed", exc_info=True)
+
+
+def _drop_uncommitted(session, transaction) -> None:
+    """after_transaction_end: empty the queue when the OUTERMOST transaction
+    ends.  After a commit its effects have just run (_run_after_commit);
+    after a rollback, or a close without a commit, the row never reached
+    disk, so nothing may act on it, and a later commit of the same session
+    must not run it either.  A savepoint ending is not the outer transaction
+    ending, so its grant stays queued."""
+    if transaction.parent is not None:
+        return
+    pending = session.info.get(_AFTER_COMMIT_KEY)
+    if pending:
+        pending.clear()
+
+
+def _after_commit(db, effect) -> None:
+    """Run ``effect`` once ``db``'s transaction has committed.
+
+    SQLite has one write lock, and a flushed row holds it until the
+    transaction ends.  A grant's effects (the WAMP/SSE broadcast, the copilot
+    switch file, the admin config save and the VisionService start) used to
+    run between the flush and the caller's commit, so while they ran every
+    other writer in the process waited on busy_timeout (3 s) and then failed
+    with 'database is locked'.  Measured live 2026-09-25: a screen-capture
+    Allow whose feed start never returned left the database unwritable for
+    about 41 minutes and the grant itself never committed.
+
+    The session's own commit is the one place that knows the row is durable,
+    so every caller (the consent API's request session, db_session blocks,
+    the admin request session) gets this without changing.  The queue is
+    dropped when the outer transaction ends uncommitted (_drop_uncommitted).
+    Not on after_rollback: measured on SQLAlchemy 2.0.16, that also fires when
+    a savepoint rolls back, which leaves the outer transaction and its grant
+    alive; and a close without a commit fires only after_transaction_end.
+    """
+    from sqlalchemy import event
+    pending = db.info.get(_AFTER_COMMIT_KEY)
+    if pending is None:
+        pending = db.info[_AFTER_COMMIT_KEY] = []
+        event.listen(db, 'after_commit', _run_after_commit)
+        event.listen(db, 'after_transaction_end', _drop_uncommitted)
+    pending.append(effect)
+
+
+def _announce_grant(db, user_id: str, consent_type: str, scope: str,
+                    agent_id) -> None:
+    """Queue a grant's effects for after its commit (_after_commit): tell
+    every surface, then act on the copilot switch and the camera/screen
+    feed.  One place for both grant branches, so they cannot drift."""
+    data = {
+        'user_id': user_id,
+        'consent_type': consent_type,
+        'scope': scope,
+        'agent_id': agent_id,
+    }
+    _after_commit(db, lambda: _emit('consent.granted', data))
+    _after_commit(db, lambda: _copilot_switch_from_consent(consent_type, True))
+    _after_commit(db, lambda: _embodied_feed_from_consent(consent_type, True))
+
+
 def _named(db, data: dict, agent_id) -> dict:
     """``data`` with 'agent_name' added when the agent has one: the ask and
     the notices then share one shape, and an unnamed agent carries no key."""
@@ -714,14 +790,7 @@ class ConsentService:
                    action=f'consent.granted:{consent_type}',
                    detail={'scope': scope, 'agent_id': agent_id,
                            'promoted_pending_ask': True})
-            _emit('consent.granted', {
-                'user_id': user_id,
-                'consent_type': consent_type,
-                'scope': scope,
-                'agent_id': agent_id,
-            })
-            _copilot_switch_from_consent(consent_type, True)
-            _embodied_feed_from_consent(consent_type, True)
+            _announce_grant(db, user_id, consent_type, scope, agent_id)
             return _pending
 
         consent = UserConsent(
@@ -742,14 +811,9 @@ class ConsentService:
         _audit('consent', actor_id=user_id,
                action=f'consent.granted:{consent_type}',
                detail={'scope': scope, 'agent_id': agent_id})
-        _emit('consent.granted', {
-            'user_id': user_id,
-            'consent_type': consent_type,
-            'scope': scope,
-            'agent_id': agent_id,
-        })
-        _copilot_switch_from_consent(consent_type, True)
-        _embodied_feed_from_consent(consent_type, True)
+        # The broadcast and the feed wait for the commit (_after_commit): run
+        # here they held SQLite's write lock for as long as they took.
+        _announce_grant(db, user_id, consent_type, scope, agent_id)
 
         # Up-sync the now-public agents (gap #4): agents are almost always
         # created BEFORE the owner grants public_exposure, so the
@@ -843,7 +907,11 @@ class ConsentService:
         # 3. No record at all → auto-grant + emit one-time notice.
         ConsentService.grant_consent(db, user_id, consent_type,
                                      scope=scope, agent_id=agent_id)
-        _emit('consent.auto_granted', _named(db, {
+        # After the commit, like the grant's own consent.granted (and after
+        # it): a notice of a grant that rolled back would offer to revoke a
+        # consent that does not exist.  The name is looked up now, while the
+        # session can still query.
+        notice = _named(db, {
             'user_id': user_id,
             'consent_type': consent_type,
             'scope': scope,
@@ -853,7 +921,8 @@ class ConsentService:
                 f"could be served.  Tap to review or revoke in settings."
             ),
             'revoke_action': 'consent.revoke',
-        }, agent_id))
+        }, agent_id)
+        _after_commit(db, lambda: _emit('consent.auto_granted', notice))
         return True
 
     @staticmethod

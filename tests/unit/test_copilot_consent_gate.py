@@ -107,6 +107,9 @@ def test_the_grant_unparks_by_itself_on_the_next_tick():
         goal = _goal(db)
         assert _escalation_model_config(db, goal) == (None, True)
         ConsentService.grant_consent(db, OWNER, cc.COPILOT_CONSENT_TYPE)
+        # the switch flips once the grant is on disk, as the consent API's
+        # request session commits it
+        db.commit()
         assert cc.copilot_enabled() is True
         cfg, parked = _escalation_model_config(db, goal)
         assert parked is False
