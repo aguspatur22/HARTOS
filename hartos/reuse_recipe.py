@@ -6795,7 +6795,8 @@ def _reuse_seed_message(user_prompt, message):
     # signal that cannot show its own failure is not a signal: live on
     # 2026-09-05 the command reached the wire 6x for Trading and 0x for Auto
     # Research on the SAME code path, and the log could not say why.
-    # DISPATCH FIRST, the user's words after it.  This message is action 1's
+    # DISPATCH MARKER FIRST, then the user's words, then the steps (see the
+    # last paragraph below for why the steps go last).  This message is action 1's
     # dispatch, and lifecycle_hooks.dispatch_action_id -- the one parser every
     # window reader uses -- honours only a LEADING marker (text after a marker
     # can quote an earlier one, so a mid-message marker says nothing).  The
