@@ -365,48 +365,20 @@ class TestTraceBankingRecordsWhatSucceeded:
         assert 'sha256' in code[0] and 'md5' not in code[0], code
 
 
-def _executor(last_n, name='Executor'):
-    return SimpleNamespace(name=name, _code_execution_config={
-        'last_n_messages': last_n, 'work_dir': '.', 'use_docker': False})
+class TestTraceBankingIsNotBoundedByLastNMessages:
+    """Review of ff929cd08, probed with the real autogen Executor
+    (last_n_messages=2 plus CREATE's transform chain): ToolMessageHandler
+    merges consecutive user turns, so the block in the dispatch, three group
+    messages back, DID run.  Bounding the scan by group-message count banked
+    a false no-op for it."""
 
-
-class TestTraceBankingReadsTheExecutorsReach:
-    """autogen's Executor runs the newest fenced block among its last
-    ``last_n_messages`` messages (conversable_agent's code-execution reply).
-    A block further back did not run, whatever the exit code says."""
-
-    _TRACE = [
-        {'content': 'Execute Action 2: compute\n```python\nprint(42)\n```'},
-        {'content': 'Working on it.', 'name': 'Assistant'},
-        {'content': 'Still thinking.', 'name': 'Assistant'},
-        {'content': 'exitcode: 0 (execution succeeded)\nCode output: \n',
-         'role': 'user', 'name': 'Executor'},
-    ]
-
-    def test_a_block_beyond_the_executors_reach_is_not_banked(self, banked):
-        ok, data, _ = banked(list(self._TRACE), agents=[_executor(2)])
+    def test_a_block_three_group_messages_back_that_ran_is_banked(self, banked):
+        ok, data, _ = banked([
+            {'content': 'Execute Action 2: compute\n```python\nprint(42)\n```'},
+            {'content': 'Working on it.', 'name': 'Assistant'},
+            {'content': 'Still thinking.', 'name': 'Assistant'},
+            {'content': 'exitcode: 0 (execution succeeded)\nCode output: \n42\n',
+             'role': 'user', 'name': 'Executor'},
+        ])
         assert ok is True
-        assert data['recipe'][0]['generalized_functions'] == '', data['recipe']
-        assert 'no-op' in data['recipe'][0]['steps']
-
-    def test_a_block_within_reach_is_banked(self, banked):
-        ok, data, _ = banked(list(self._TRACE), agents=[_executor(3)])
-        assert ok is True
-        assert 'print(42)' in data['recipe'][0]['generalized_functions']
-
-    def test_the_reach_is_the_one_of_the_agent_that_ran_it(self, banked):
-        """The Assistant has code execution too (instantiate_assistant_agent);
-        when it posts the exitcode, its own reach applies, not the
-        Executor's."""
-        trace = list(self._TRACE)
-        trace[-1] = dict(trace[-1], name='Assistant')
-        ok, data, _ = banked(trace, agents=[_executor(5),
-                                            _executor(2, name='Assistant')])
-        assert ok is True
-        assert data['recipe'][0]['generalized_functions'] == '', data['recipe']
-
-    def test_auto_or_no_executor_scans_the_whole_window(self, banked):
-        for agents in ([], [_executor('auto')]):
-            ok, data, _ = banked(list(self._TRACE), agents=agents)
-            assert ok is True
-            assert 'print(42)' in data['recipe'][0]['generalized_functions']
+        assert 'print(42)' in data['recipe'][0]['generalized_functions'], data
