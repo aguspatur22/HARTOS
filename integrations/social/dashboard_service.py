@@ -51,7 +51,7 @@ class DashboardService:
         # 4. Trained agents (social users with user_type='agent')
         agents.extend(DashboardService._get_trained_agents(db))
 
-        # 5. Expert agents (static registry)
+        # 5. Expert agents registered for A2A delegation
         agents.extend(DashboardService._get_expert_agents())
 
         # Compute priority, sort descending
@@ -324,27 +324,51 @@ class DashboardService:
 
     @staticmethod
     def _get_expert_agents() -> List[Dict]:
-        """Load from ExpertAgentRegistry if available."""
-        result = []
+        """Expert agents the A2A skill registry can delegate to.
+
+        An expert is listed iff it is in the ExpertAgentRegistry catalog
+        (identity + display name) AND registered in the internal_comm
+        ``skill_registry`` singleton (``register_all_experts``): that
+        registration is what makes it discoverable by
+        ``a2a_context.delegate_task``, so only registered experts are
+        'available'.  Other skill-registry entries (assistant, helper,
+        marketing_<uid>, ...) are not experts and are not listed here.
+
+        ``skill_registry.agents`` maps agent_id -> {skill_name: AgentSkill}.
+        """
         try:
-            from integrations.internal_comm.internal_agent_communication import (
-                AgentSkillRegistry)
-            registry = AgentSkillRegistry.get_instance()
-            for agent_id, agent_info in registry._agents.items():
-                result.append({
-                    'id': f'expert_{agent_id}',
-                    'type': 'expert_agent',
-                    'name': agent_info.get('name', agent_id),
-                    'status': 'available',
-                    'current_task': None,
-                    'skills': list(agent_info.get('skills', {}).keys()),
-                    'last_active': None,
-                    'metrics': {
-                        'accuracy': agent_info.get('accuracy', 0),
-                    },
-                })
-        except Exception:
-            pass
+            from integrations.expert_agents.registry import ExpertAgentRegistry
+            from integrations.internal_comm import internal_agent_communication as _iac
+        except ImportError:
+            logger.warning("expert agents unavailable for the dashboard",
+                           exc_info=True)
+            return []
+
+        catalog = ExpertAgentRegistry().agents
+        registry = _iac.skill_registry
+        # Snapshot under the registry's own lock: register_agent mutates
+        # these dicts from request threads while the dashboard reads.
+        with registry.lock:
+            registered = [(agent_id, list(skills.values()))
+                          for agent_id, skills in registry.agents.items()
+                          if agent_id in catalog]
+
+        result = []
+        for agent_id, skills in registered:
+            accuracy = (sum(s.proficiency for s in skills) / len(skills)
+                        if skills else 0)
+            result.append({
+                'id': f'expert_{agent_id}',
+                'type': 'expert_agent',
+                'name': catalog[agent_id].name,
+                'status': 'available',
+                'current_task': None,
+                'skills': [s.name for s in skills],
+                'last_active': None,
+                'metrics': {
+                    'accuracy': round(accuracy, 3),
+                },
+            })
         return result
 
     # ───────────────────────────────────────────────────────────────
