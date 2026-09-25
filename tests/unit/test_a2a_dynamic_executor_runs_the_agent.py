@@ -206,3 +206,30 @@ def test_the_turn_runs_off_the_views_event_loop(node, calls, monkeypatch):
     r = _post(node, _LOCAL)
     assert r.get_json()['result']['state'] == 'completed', r.get_json()
     assert r.get_json()['result']['content']['parts'][0]['text'] == 'bridged'
+
+
+def test_the_callers_flask_g_does_not_reach_the_inner_turn(
+        node, calls, monkeypatch):
+    """Review of 05641511d, probed: asyncio.to_thread copied the jsonrpc
+    request's context, so the outer gate's g.auth_source / g.jwt_payload
+    were visible to the inner /chat.  The turn must start clean."""
+    from flask import g, has_app_context
+    seen = {}
+
+    def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None, **kw):
+        seen['app_context'] = has_app_context()
+        if has_app_context():
+            seen['auth_source'] = getattr(g, 'auth_source', None)
+        return 'ok', 'done'
+    monkeypatch.setattr(dispatch, 'local_chat_dispatch', local_chat_dispatch)
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
+    monkeypatch.setenv('HEVOLVE_API_KEY', 'livetest-key')
+
+    import integrations.social.auth as social_auth
+    monkeypatch.setattr(social_auth, 'decode_jwt',
+                        lambda tok: {'user_id': 'livetest_remote_caller'})
+    r = node.post(f'/a2a/{_AGENT.agent_id}/jsonrpc', json=_SEND,
+                  environ_base=_REMOTE,
+                  headers={'Authorization': 'Bearer livetest'})
+    assert r.get_json()['result']['state'] == 'completed', r.get_json()
+    assert seen.get('app_context') is False, seen

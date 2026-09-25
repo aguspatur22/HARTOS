@@ -388,15 +388,24 @@ class DynamicAgentExecutor:
         # run_until_complete in the long-term memory tools, asyncio.run in
         # google_search's fallback: "This event loop is already running",
         # measured in the review of 309bcd032).
+        #
+        # run_in_executor, NOT asyncio.to_thread: to_thread copies this
+        # request's context into the worker, so the jsonrpc request's flask
+        # `g` (auth_source, jwt_payload, a phone's device identity) leaked
+        # into the inner /chat and could make the turn run as the caller
+        # instead of the agent's owner (review of 05641511d, probed).
+        # run_in_executor starts the call in a fresh context.
         import asyncio
-        status, text = await asyncio.to_thread(
-            local_chat_dispatch,
-            message,
-            agent.metadata.get("user_id", DEFAULT_USER_ID),
-            agent.prompt_id,
-            # A peer's request is not this node's human: it is background
-            # work, and the id says so to dispatch.is_genuine_user_request.
-            daemon_id=f"a2a_{context_id}")
+        import functools
+        status, text = await asyncio.get_running_loop().run_in_executor(
+            None, functools.partial(
+                local_chat_dispatch,
+                message,
+                agent.metadata.get("user_id", DEFAULT_USER_ID),
+                agent.prompt_id,
+                # A peer's request is not this node's human: it is background
+                # work, and the id says so to dispatch.is_genuine_user_request.
+                daemon_id=f"a2a_{context_id}"))
         if status != 'ok':
             raise RuntimeError(
                 f"agent {agent_id} not run: local /chat {status} "
