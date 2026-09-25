@@ -842,6 +842,25 @@ def ensure_user_turn(messages: list) -> bool:
     return True
 
 
+def _task_turn(messages: list):
+    """The newest turn of the speaker who opened the conversation's user side.
+
+    ``None`` when the first role='user' message carries no ``name`` -- a body
+    whose speakers cannot be told apart has no task turn separate from the
+    newest user turn.  NEWEST of that speaker, not its first message: a
+    carried-over history can open with an earlier request from the same user,
+    and that one is stale.
+    """
+    opener = next((m for m in messages
+                   if isinstance(m, dict) and m.get('role') == 'user'), None)
+    speaker = opener.get('name') if opener is not None else None
+    if not speaker:
+        return None
+    return next((m for m in reversed(messages)
+                 if isinstance(m, dict) and m.get('role') == 'user'
+                 and m.get('name') == speaker), None)
+
+
 def _trim_to_budget(body: dict) -> tuple:
     """Return ``(trimmed_body, n_dropped, n_truncated_chars, est_before,
     est_after, budget)``.
@@ -850,8 +869,9 @@ def _trim_to_budget(body: dict) -> tuple:
       1. budget = per_slot - max_tokens - safety
       2. If under budget → return unchanged.
       3. Left-drop non-system messages (preserve index 0 if role=system)
-         until the remaining set fits.  Always keep at least the system
-         message + the most-recent user/assistant message.
+         until the remaining set fits.  Always keep the system message,
+         the most-recent message, the newest role='user' message and the
+         task turn (:func:`_task_turn`, the initiator's newest turn).
       4. If even [system, last_message] is over budget, left-truncate
          the last message's content character-by-character until it
          fits, prefixed with ``WIRE_TRIM_MARKER`` so the LLM sees the
@@ -974,14 +994,30 @@ def _trim_to_budget(body: dict) -> tuple:
     # because the user's task instruction is the OLDEST non-system message.
     anchor = next((m for m in reversed(messages)
                    if isinstance(m, dict) and m.get('role') == 'user'), None)
+    # The newest user message is not always the USER's.  In an autogen group
+    # chat every other agent's message reaches a seat as role='user' with its
+    # speaker in `name`, so from the second Assistant call on the newest user
+    # turn is the StatusVerifier's verdict and the user's own text is the
+    # oldest droppable message.  Measured 2026-09-25 21:17:36 (source
+    # autogen.reuse, request livetest_reuse_verify_1790351226, post-trim wire
+    # body): [system, assistant, tool, user/StatusVerifier] -- the user's
+    # "Summarize: ..." dropped, the Assistant asked for the text again, and
+    # the turn ended with no summary.  So also protect the newest turn of the
+    # speaker who OPENED the user side (the initiator whose task it is).
+    # Unnamed bodies (langchain / raw SDK) have no speakers to tell apart and
+    # keep the single newest-user anchor, unchanged.
+    task = _task_turn(messages)
+    protected = [m for m in (anchor, task) if m is not None]
+    start = 1 if has_system else 0
     n_dropped = 0
-    floor = 2 if has_system else 1
-    while len(messages) > floor:
-        drop_idx = 1 if has_system else 0
-        if messages[drop_idx] is anchor:
-            if len(messages) <= floor + 1:
-                break  # only system + anchor + newest remain
-            drop_idx += 1
+    while True:
+        # Leftmost message that is not the system prompt, not protected and
+        # not the newest message -- the same "keep system + newest" floor.
+        drop_idx = next((i for i in range(start, len(messages) - 1)
+                         if not any(messages[i] is p for p in protected)),
+                        None)
+        if drop_idx is None:
+            break
         messages.pop(drop_idx)
         n_dropped += 1
         if count_tokens_for_messages(messages, model) <= budget:
@@ -1017,23 +1053,27 @@ def _trim_to_budget(body: dict) -> tuple:
     # mid-list behind assistant/tool replies.  Measured 2026-08-30 19:35-19:46
     # on the installed build: system+anchor ~5597 tok against budget 3840 —
     # every trim ended in the STILL-over error below and llama-server rejected
-    # the turn, 95x in 11 minutes.  Same policy, same helper, applied to the
-    # anchor.
-    if (count_tokens_for_messages(messages, model) > budget
-            and anchor is not None and anchor in messages
-            and messages[-1] is not anchor):
-        a_idx = messages.index(anchor)
-        others = messages[:a_idx] + messages[a_idx + 1:]
+    # the turn, 95x in 11 minutes.  Same policy, same helper, applied to each
+    # protected message (the newest-user anchor first, then the task turn):
+    # protecting a message from the drop must never make the trim unable to
+    # fit it.
+    for p in protected:
+        if count_tokens_for_messages(messages, model) <= budget:
+            break
+        p_idx = next((i for i, m in enumerate(messages) if m is p), None)
+        if p_idx is None or p_idx == len(messages) - 1:
+            continue  # gone, or already handled as the last message above
+        others = messages[:p_idx] + messages[p_idx + 1:]
         overhead_tokens = (count_tokens_for_messages(others, model)
                            + _TOKENS_PER_MSG
                            + marker_tokens)
-        room_for_anchor = max(64, budget - overhead_tokens)
-        target_chars = int(room_for_anchor * 3.5)
-        new_anchor, n_cut = _truncate_msg_content(
-            anchor, target_chars, WIRE_TRIM_MARKER, _content_to_text)
+        room_for_p = max(64, budget - overhead_tokens)
+        target_chars = int(room_for_p * 3.5)
+        new_p, n_cut = _truncate_msg_content(
+            p, target_chars, WIRE_TRIM_MARKER, _content_to_text)
         if n_cut:
             n_truncated_chars += n_cut
-            messages[a_idx] = new_anchor
+            messages[p_idx] = new_p
 
     # LAST resort: the SYSTEM message itself.  autogen.reuse builds its
     # system prompt as persona boilerplate + the whole serialized recipe —
