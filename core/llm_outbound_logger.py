@@ -1061,13 +1061,23 @@ def _trim_to_budget(body: dict) -> tuple:
     # newest message is often the anchor itself.  Room uses the same
     # chars/token ratio the fallback uses (3.5): conservative with tiktoken,
     # and cutting from the left means over-cutting only shrinks the payload.
+    #
+    # UNPROTECTED BEFORE PROTECTED.  When the newest message is neither the
+    # anchor nor the task (a large tool result), it is cut before any
+    # protected message, whatever the sizes: size alone put a 15k task ahead
+    # of a 10.5k tool result and cut the user's request to 523 chars with its
+    # head gone (review of 9ddc8b92d, probed; the 09-25 failure mode).
+    # Largest-first decides only among the protected.
     candidates = []
     for m in protected + messages[-1:]:
         if not any(m is c for c in candidates):
             candidates.append(m)
-    for p in sorted(candidates,
-                    key=lambda m: count_tokens_for_messages([m], model),
-                    reverse=True):
+
+    def _cut_order(m):
+        is_protected = any(m is p for p in protected)
+        return (is_protected, -count_tokens_for_messages([m], model))
+
+    for p in sorted(candidates, key=_cut_order):
         if count_tokens_for_messages(messages, model) <= budget:
             break
         p_idx = next((i for i, m in enumerate(messages) if m is p), None)

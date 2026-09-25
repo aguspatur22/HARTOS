@@ -219,3 +219,26 @@ def test_an_unprotected_oversized_newest_message_is_still_truncated(
     assert out[-1]['content'].startswith(WIRE_TRIM_MARKER)
     assert out[-1]['content'].endswith('TAIL')
     assert est_after <= budget
+
+
+def test_an_unprotected_tool_result_is_cut_before_the_users_task(monkeypatch):
+    """Review of 9ddc8b92d, probed: [system, User task 15k, assistant, tool
+    result 10.5k].  Largest-first alone cut the protected task (15018 -> 523
+    chars, its head gone) and left the unprotected tool result whole.  An
+    unprotected newest message is cut first; the task stays whole when that
+    is enough."""
+    sys_m = _sys()
+    # The task is the LARGER of the two (15k vs 10.5k chars, the probed
+    # shape), so size alone would pick it.
+    task = _task('TASKHEAD ' + 'task ' * 3000 + ' TASKTAIL')
+    result = {'role': 'tool', 'tool_call_id': 'c1',
+              'content': 'RESHEAD ' + 'row ' * 2600 + ' RESTAIL'}
+    msgs = [sys_m, task, _bulk('assistant', 'a1'), result]
+    keep = [sys_m, task, {'role': 'tool', 'tool_call_id': 'c1',
+                          'content': 'row ' * 100}]
+    out, est_after, budget = _trim_so_that_only(keep, msgs, monkeypatch)
+    kept_task = [m for m in out if m.get('name') == 'User']
+    assert kept_task and kept_task[0]['content'] == task['content'], (
+        "the user's task was cut while an unprotected tool result was not")
+    assert out[-1]['content'].startswith(WIRE_TRIM_MARKER)
+    assert est_after <= budget
