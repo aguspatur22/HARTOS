@@ -133,6 +133,30 @@ def _session_suffix() -> str:
     return ""
 
 
+def credential_vault():
+    """The credential vault, or None when it cannot load.
+
+    Tools receive {{secret:NAME}} aliases from the model; the vault puts the
+    real value in for the call and turns any value in the result back into
+    its alias, so a credential never reaches the model, logs or chat.
+    Imported lazily for the same reason as hartos.threadlocal above.
+    """
+    try:
+        from hartos.ai_key_vault import get_ai_key_vault
+        return get_ai_key_vault()
+    except Exception:
+        _emit_logger.warning(
+            "[tool_logging] credential vault unavailable; aliases are passed "
+            "to the tool unresolved", exc_info=True)
+        return None
+
+
+def _mask(text: str) -> str:
+    """``text`` with every stored credential value replaced by its alias."""
+    vault = credential_vault()
+    return vault.mask_secrets(text) if vault is not None else text
+
+
 def _error_envelope(func_name: str, exc: BaseException) -> str:
     """Structured JSON error returned to the LLM on tool failure.
 
@@ -230,8 +254,8 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
             f"{_session_suffix()}")
         tool_logger.exception("Exception details:")
         if plain_errors:
-            return f"Tool '{tool_name}' encountered an error: {str(e)[:200]}"
-        envelope = _error_envelope(tool_name, e)
+            return _mask(f"Tool '{tool_name}' encountered an error: {str(e)[:200]}")
+        envelope = _mask(_error_envelope(tool_name, e))
         tool_logger.info(f"Returning error response: {envelope}")
         return envelope
 
@@ -244,6 +268,10 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
                 f"Arguments: {args}, Keyword Arguments: {kwargs}")
             _emit_tool_call_stage(tool_name)
             _t0 = time.perf_counter()
+            vault = credential_vault()
+            if vault is not None:
+                args = vault.resolve_aliases(args)
+                kwargs = vault.resolve_aliases(kwargs)
             try:
                 result = await func(*args, **kwargs)
                 if not isinstance(result, str):
@@ -251,6 +279,8 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
                         f"Tool function {tool_name} returned "
                         f"non-string type: {type(result)}")
                     result = str(result)
+                if vault is not None:
+                    result = vault.mask_secrets(result)
                 tool_logger.info(
                     f"TOOL EXECUTION SUCCESS: {tool_name} "
                     f"latency_ms={round((time.perf_counter() - _t0) * 1000, 1)}"
@@ -274,6 +304,10 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
             f"Arguments: {args}, Keyword Arguments: {kwargs}")
         _emit_tool_call_stage(tool_name)
         _t0 = time.perf_counter()
+        vault = credential_vault()
+        if vault is not None:
+            args = vault.resolve_aliases(args)
+            kwargs = vault.resolve_aliases(kwargs)
         try:
             result = func(*args, **kwargs)
             # If the sync function accidentally returned a coroutine,
@@ -290,6 +324,8 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
                     f"Tool function {tool_name} returned "
                     f"non-string type: {type(result)}")
                 result = str(result)
+            if vault is not None:
+                result = vault.mask_secrets(result)
             tool_logger.info(
                 f"TOOL EXECUTION SUCCESS: {tool_name} "
                 f"latency_ms={round((time.perf_counter() - _t0) * 1000, 1)}"
@@ -357,4 +393,4 @@ def timed_stage(name: str, logger=None, warn_over_ms: float | None = None,
             _log.info(_line)
 
 
-__all__ = ['log_tool_execution', 'timed_stage', 'tool_logger']
+__all__ = ['credential_vault', 'log_tool_execution', 'timed_stage', 'tool_logger']

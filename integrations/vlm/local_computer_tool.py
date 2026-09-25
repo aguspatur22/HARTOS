@@ -411,10 +411,18 @@ def execute_action(action: dict, tier: str, *,
         except Exception as e:
             logger.debug(f"verify pre-screenshot skipped: {e}")
 
+    # Credentials cross into the real value only here: the guards and the
+    # audit record above saw the {{secret:NAME}} alias, the keystrokes get
+    # the value, and the result is masked back before the model reads it.
+    from core.tool_logging import credential_vault
+    vault = credential_vault()
+    _run = vault.resolve_aliases(action) if vault is not None else action
     if tier == 'inprocess':
-        result = _execute_inprocess(action)
+        result = _execute_inprocess(_run)
     else:
-        result = _execute_http(action)
+        result = _execute_http(_run)
+    if vault is not None:
+        result = vault.mask_secrets(result)
 
     if _mismatch:
         result['window_mismatch'] = _mismatch

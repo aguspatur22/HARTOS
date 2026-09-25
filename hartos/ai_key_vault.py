@@ -29,6 +29,7 @@ Usage:
 
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -37,6 +38,16 @@ from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional
 
 logger = logging.getLogger('hevolve_security')
+
+#: How a stored credential appears to the model: {{secret:NAME}}.  The model
+#: only ever sees and writes this alias; resolve_aliases puts the real value
+#: in where a tool runs and mask_secrets turns it back into the alias on the
+#: way out, so the value never enters the model's context, logs or chat.
+SECRET_ALIAS_RE = re.compile(r'\{\{secret:([A-Z0-9_]+)\}\}')
+
+#: A stored value shorter than this is not masked: masking every occurrence
+#: of "abc" in tool output would mangle ordinary text.
+MIN_MASKED_SECRET_LEN = 4
 
 # ═══════════════════════════════════════════════════════════════════════
 # Pending credential request tracking
@@ -70,6 +81,10 @@ class AIKeyVault:
         self._pending: Dict[str, PendingCredentialRequest] = {}
         self._lock = threading.Lock()
         self._sm = None  # Lazy — loaded on first use
+        # Names stored through store_credential this process.  With no
+        # HEVOLVE_MASTER_KEY the value lives only in os.environ, so the
+        # vault cache alone cannot say which env vars are user credentials.
+        self._stored: set = set()
 
     @classmethod
     def get_instance(cls) -> 'AIKeyVault':
@@ -148,6 +163,7 @@ class AIKeyVault:
 
             # Inject into current process
             os.environ[resolved] = value
+            self._stored.add(resolved)
 
             # Clear pending request
             self._pending.pop(resolved, None)
@@ -165,6 +181,55 @@ class AIKeyVault:
 
         logger.info(f"Credential stored: {resolved}")
         return resolved
+
+    # ── Alias (the only form the model sees) ───────────────────────
+
+    def alias_for(self, key_name: str, channel_type: str = '') -> str:
+        """The {{secret:NAME}} alias the model uses for a stored credential."""
+        resolved = self._resolve_channel_key(channel_type, key_name) \
+            if channel_type else key_name.upper()
+        return '{{secret:' + resolved + '}}'
+
+    @classmethod
+    def _map_strings(cls, value, fn):
+        """Apply ``fn`` to every string inside lists, tuples and dicts."""
+        if isinstance(value, str):
+            return fn(value)
+        if isinstance(value, dict):
+            return {k: cls._map_strings(v, fn) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return type(value)(cls._map_strings(v, fn) for v in value)
+        return value
+
+    def resolve_aliases(self, value):
+        """Replace every known alias in ``value`` with the real credential.
+
+        An alias with no stored value is left as written, so a missing
+        credential shows up as the alias, never as an empty string.
+        """
+        def _real(match):
+            return self.get_tool_key(match.group(1)) or match.group(0)
+        return self._map_strings(value, lambda s: SECRET_ALIAS_RE.sub(_real, s))
+
+    def mask_secrets(self, value):
+        """Replace every stored credential value in ``value`` with its alias.
+
+        Exact-value matching, longest value first so a credential that
+        contains another is masked whole.
+        """
+        names = set(self._stored) | set(self._secrets_manager()._cache)
+        pairs = []
+        for name in names:
+            real = self.get_tool_key(name)
+            if real and len(real) >= MIN_MASKED_SECRET_LEN:
+                pairs.append((real, '{{secret:' + name + '}}'))
+        pairs.sort(key=lambda p: -len(p[0]))
+
+        def _mask(text):
+            for real, alias in pairs:
+                text = text.replace(real, alias)
+            return text
+        return self._map_strings(value, _mask) if pairs else value
 
     # ── Boot Preload ───────────────────────────────────────────────
 
