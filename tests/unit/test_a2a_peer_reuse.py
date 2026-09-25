@@ -507,10 +507,11 @@ class TestRecipeExportTraversalGate:
 
 
 class TestJsonRpcRouteUnauthenticated:
-    """The jsonrpc route carries NO auth: any caller can drive a
-    registered agent's executor. Pin the routing gates (unknown agent,
-    unknown method), document the unauthenticated execution path, and
-    guard the error handler against its own crash on malformed input."""
+    """Routing gates of the jsonrpc route (unknown agent, unknown method),
+    the admission of message/send (as /chat, and only for an agent this
+    node shares; the no-auth surface this class once documented is closed,
+    see tests/unit/test_a2a_dynamic_executor_runs_the_agent.py), and the
+    error handler's own crash guard on malformed input."""
 
     def _server_with_agent(self):
         app, server = _bare_a2a_app()
@@ -574,10 +575,14 @@ class TestJsonRpcRouteUnauthenticated:
         assert status == 400
         assert body['error']['code'] == -32601
 
-    def test_message_send_executes_agent_unauthenticated(self):
-        # No token, no signature: the untrusted 'text' part drives the
-        # registered executor and the completed envelope is returned.
-        # This documents the current (auth-free) execution surface.
+    def test_message_send_runs_a_shared_agent_for_an_authorized_caller(
+            self, monkeypatch):
+        # This test used to document the auth-free execution surface.  That
+        # surface is closed (review of 309bcd032): message/send is admitted
+        # as /chat is and only for an agent this node exports.  The default
+        # test tier (flat, no key, local caller) is what /chat admits.
+        import integrations.google_a2a.peer_reuse as _pr
+        monkeypatch.setattr(_pr, 'export_allowed', lambda pid: True)
         app, view, calls = self._server_with_agent()
         status, body = self._run(
             app, view, 'agentX_0',
@@ -592,11 +597,26 @@ class TestJsonRpcRouteUnauthenticated:
         assert calls == [('attacker input', result['contextId'])]
         assert body['id'] == '7'
 
-    def test_message_send_reads_a2a_kind_text_parts(self):
+    def test_message_send_refuses_an_agent_this_node_does_not_share(
+            self, monkeypatch):
+        import integrations.google_a2a.peer_reuse as _pr
+        monkeypatch.setattr(_pr, 'export_allowed', lambda pid: False)
+        app, view, calls = self._server_with_agent()
+        status, body = self._run(
+            app, view, 'agentX_0',
+            json_body={'method': 'message/send', 'id': '7', 'params': {
+                'message': {'parts': [{'kind': 'text', 'text': 'x'}]}}})
+        assert status == 403
+        assert body['error']['code'] == -32001
+        assert calls == []
+
+    def test_message_send_reads_a2a_kind_text_parts(self, monkeypatch):
         # A2A 0.2.x spells a part's discriminator 'kind'; the local
         # clients (peer_reuse, hart CLI) still send the legacy 'type'.
         # Both must reach the executor; a 'kind' part must not arrive
         # as an empty prompt.
+        import integrations.google_a2a.peer_reuse as _pr
+        monkeypatch.setattr(_pr, 'export_allowed', lambda pid: True)
         app, view, calls = self._server_with_agent()
         status, body = self._run(
             app, view, 'agentX_0',

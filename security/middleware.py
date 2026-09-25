@@ -423,8 +423,14 @@ def _apply_api_auth(app: Flask, register: bool = True):
         except Exception:
             return os.environ.get('HEVOLVE_API_KEY', '')
 
-    def check_api_auth():
-        path = request.path
+    def check_api_auth(as_path=None):
+        # ``as_path``: judge THIS request as if it had been sent to that path.
+        # For a route under an exempt prefix that nonetheless does what a
+        # gated path does: A2A message/send runs a /chat turn, so it is
+        # admitted exactly as /chat would be, by this one gate rather than a
+        # copy of it (review of 309bcd032: the exempt /a2a/ prefix let an
+        # unauthenticated caller on another machine run a /chat turn).
+        path = as_path or request.path
         # Bundled desktop.  This machine's own callers (the SPA, the tray,
         # in-process test clients) are trusted, as they always were.  But the
         # socket is Nunba's app on 0.0.0.0, the address the desktop advertises

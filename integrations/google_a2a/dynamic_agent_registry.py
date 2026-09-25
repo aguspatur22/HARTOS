@@ -382,7 +382,15 @@ class DynamicAgentExecutor:
         from integrations.agent_engine.dispatch import local_chat_dispatch
 
         logger.info(f"Executing task for agent {agent_id} (persona: {agent.persona})")
-        status, text = local_chat_dispatch(
+        # On a thread of its own: this coroutine runs inside run_async's
+        # event loop, and a /chat turn run on that thread breaks every
+        # sync->async bridge under it (get_or_create_event_loop().
+        # run_until_complete in the long-term memory tools, asyncio.run in
+        # google_search's fallback: "This event loop is already running",
+        # measured in the review of 309bcd032).
+        import asyncio
+        status, text = await asyncio.to_thread(
+            local_chat_dispatch,
             message,
             agent.metadata.get("user_id", DEFAULT_USER_ID),
             agent.prompt_id,

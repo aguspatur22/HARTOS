@@ -293,6 +293,38 @@ class A2AProtocolServer:
 
         logger.info(f"Registered A2A agent: {agent_id} ({name})")
 
+    def _message_send_refusal(self, agent_id):
+        """(http_code, message) when this request may not RUN the agent,
+        else None.  Called inside the jsonrpc view's request.
+
+        message/send runs a /chat turn as the agent's owner (autonomous, with
+        its tools), so it is admitted exactly as /chat is: the one API gate,
+        security.middleware's check_api_auth, asked about '/chat'.  /a2a/ is
+        an exempt prefix for the peer protocol's discovery half (cards,
+        directory, recipe pull), and that exemption let an unauthenticated
+        caller on another machine run a turn (review of 309bcd032, measured
+        with NUNBA_BUNDLED=1 and on central: POST /chat 401, POST
+        /a2a/<id>/jsonrpc 200 with the dispatch called).  And, like the
+        recipe pull, only an agent this node would export may be run
+        (peer_reuse.export_allowed).  Fail closed on any error."""
+        try:
+            from security.middleware import _apply_api_auth
+            refused = _apply_api_auth(self.app, register=False)(as_path='/chat')
+        except Exception as e:
+            logger.warning(f'A2A message/send auth check failed: {e}')
+            return 503, 'authorization unavailable'
+        if refused is not None:
+            return 401, 'authentication required to run an agent'
+        try:
+            from .peer_reuse import export_allowed
+            prompt_id = agent_id.rsplit('_', 1)[0] if '_' in agent_id else agent_id
+            if not export_allowed(prompt_id):
+                return 403, 'agent not shared with peers'
+        except Exception as e:
+            logger.warning(f'A2A message/send export gate failed: {e}')
+            return 503, 'authorization unavailable'
+        return None
+
     def setup_routes(self):
         """Setup Flask routes for A2A protocol"""
 
@@ -411,6 +443,12 @@ class A2AProtocolServer:
 
                 # Route to appropriate handler
                 if method == "message/send":
+                    refused = self._message_send_refusal(agent_id)
+                    if refused is not None:
+                        code, message = refused
+                        return jsonify({"jsonrpc": "2.0", "error": {
+                            "code": -32001, "message": message},
+                            "id": rpc_id}), code
                     result = run_async(handler.handle_message_send(params))
                 elif method == "message/get":
                     result = run_async(handler.handle_message_get(params))
