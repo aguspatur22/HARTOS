@@ -34,6 +34,7 @@ transform_messages = lazy_module(
 transforms = lazy_module(
     "autogen.agentchat.contrib.capabilities.transforms")
 import json
+import math
 from flask import current_app
 from typing import List, Dict, Tuple, Annotated, Set, FrozenSet, Any
 import pickle
@@ -986,6 +987,43 @@ def retrieve_json(json_message):
         return json_obj
 
 
+# ─── Wire-strict JSON ────────────────────────────────────────────────────
+# Python's json.loads is laxer than llama.cpp's parser (nlohmann): it reads
+# NaN / Infinity / -Infinity, and turns a number too big for a double into
+# inf (json.loads('{"v":620e51403072992921}') == {'v': inf}).  nlohmann
+# refuses all of these ("out_of_range.406 number overflow").  Live 2026-09-25:
+# a banked step's unquoted hex user id passed the TOOL-ARGS-GUARD for that
+# reason and llama.cpp answered 500 on every later request of the chat.
+def _wire_json_loads(text, on_refused):
+    """json.loads where every token a strict parser refuses goes to on_refused."""
+    def number(parse):
+        def hook(token):
+            return parse(token) if math.isfinite(float(token)) else on_refused(token)
+        return hook
+    return json.loads(text, parse_float=number(float), parse_int=number(int),
+                      parse_constant=on_refused)
+
+
+def _refuse_token(token):
+    raise ValueError(f"not valid for a strict JSON parser: {token!r}")
+
+
+def is_wire_json(text):
+    """True when ``text`` is JSON that llama.cpp's strict parser accepts."""
+    try:
+        _wire_json_loads(text, _refuse_token)
+        return True
+    except Exception:
+        return False
+
+
+def load_wire_json(text):
+    """Parse ``text``, keeping each token a strict parser refuses as its own
+    string: an unquoted id ``620e51403072992921`` comes back as
+    ``"620e51403072992921"``, never ``inf``.  Raises like ``json.loads``."""
+    return _wire_json_loads(text, str)
+
+
 def ensure_tool_call_arguments_json(messages):
     """Coerce every tool_call / function_call ``arguments`` field to a valid
     JSON-object string, in place, and return the same list.
@@ -1007,11 +1045,15 @@ def ensure_tool_call_arguments_json(messages):
     the OpenAI/autogen contract ("arguments is a JSON string") rather than any
     engine-specific error text — so it stays engine-neutral.
 
-    Coercion per malformed call: keep it if ``json.loads`` already succeeds;
-    else ``repair_json`` and keep the repaired text only if it parses to a
-    dict; else fall back to ``"{}"`` — a well-formed empty-args call.  The
-    executor then reports a missing argument and the model re-steers, which is
-    strictly better than a 500 that aborts the entire turn.
+    Coercion per malformed call: keep it if it is already JSON a STRICT
+    parser accepts (``is_wire_json`` -- Python's ``json.loads`` alone is not
+    that test: it reads an overflowing number as inf and accepts NaN, both of
+    which llama.cpp refuses with a 500); else parse it, or its ``repair_json``
+    repair, with ``load_wire_json``, which keeps each refused number as its
+    own string, and keep the result only if it is a dict; else fall back to
+    ``"{}"`` — a well-formed empty-args call.  The executor then reports a
+    missing argument and the model re-steers, which is strictly better than
+    a 500 that aborts the entire turn.
     """
     if not messages:
         return messages
@@ -1029,29 +1071,35 @@ def ensure_tool_call_arguments_json(messages):
             args = fn.get('arguments')
             if isinstance(args, dict):
                 # Some code paths store the arguments as an object already —
-                # the wire wants a string, so serialize (never a 500 risk).
-                fn['arguments'] = json.dumps(args)
-                continue
+                # the wire wants a string, so serialize.  A float inf / nan in
+                # it serializes as Infinity / NaN, so it is checked below
+                # like any other string.
+                args = json.dumps(args)
+                if is_wire_json(args):
+                    fn['arguments'] = args
+                    continue
             if args is None:
                 fn['arguments'] = '{}'
                 coerced += 1
                 continue
             if not isinstance(args, str):
                 args = str(args)
-            try:
-                json.loads(args)
-                continue  # already valid JSON — leave untouched
-            except Exception:
-                pass
+            if is_wire_json(args):
+                continue  # already strict JSON — leave untouched
             fixed = '{}'
-            try:
-                repaired = repair_json(args)
-                obj = (repaired if isinstance(repaired, (dict, list))
-                       else json.loads(repaired))
+            # The original text first: repair_json itself turns an
+            # overflowing number into Infinity, losing the token.
+            for candidate in (lambda: args, lambda: repair_json(args)):
+                try:
+                    text = candidate()
+                    obj = load_wire_json(
+                        json.dumps(text) if isinstance(text, (dict, list))
+                        else text)
+                except Exception:
+                    continue
                 if isinstance(obj, dict):
                     fixed = json.dumps(obj)
-            except Exception:
-                fixed = '{}'
+                    break
             fn['arguments'] = fixed
             coerced += 1
     if coerced:
