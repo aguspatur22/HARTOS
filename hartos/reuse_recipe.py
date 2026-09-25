@@ -4618,9 +4618,18 @@ _REUSE_SYNTHESIS_STEER = (
 # deserves.  Asks for the SAME message2userfinal key, so the existing
 # extractor unwraps it unchanged (a different shape would produce an answer
 # nobody reads — #797/D31).
+#
+# THE SLOT CARRIES WHAT IS UNFINISHED, not only unrun tool names.  An action
+# can be unfinished with nothing outstanding for the tool gate: a PROSE action
+# that GAVE UP (measured live 2026-09-24 21:17:52, agent 88094979291 --
+# "Action 1: in_progress -> gave_up", then 74 ms later its promise was
+# recovered as the answer), or a turn that stopped mid-recipe.  The caller
+# fills {unrun} with per-action clauses ("these tools did not run for action
+# 1: X", "action 1 gave up ...", "actions 2 to 4 were not reached"), so every
+# clause keeps the per-action scope the evidence has.
 _REUSE_SYNTHESIS_STEER_INCOMPLETE = (
-    "Do NOT run any tool again and do NOT emit another status object. These "
-    "tools did not run for the action just attempted: {unrun}. Write the "
+    "Do NOT run any tool again and do NOT emit another status object. Not "
+    "every action this request needed was done: {unrun}. Write the "
     "ANSWER "
     "for the user now, in your own words: report what WAS actually done, "
     "using only the real tool results present in this conversation, and say "
@@ -4786,9 +4795,55 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
             user_prompt, _reuse_current_action_id(user_prompt), group_chat)
     except Exception:
         _unrun = ['<unknown>']
-    if _unrun:
+
+    # WHAT THE LIFECYCLE RECORDED decides it too.  The tool predicate above
+    # answers "did this action's NAMED tools run", and returns [] for a prose
+    # action that names none -- so on its own it let a GAVE_UP action, or a
+    # turn that stopped mid-recipe, out through the success doors below.
+    # Measured live 2026-09-24 21:17:52 (agent 88094979291): "Action 1:
+    # in_progress -> gave_up", then 74 ms later "[SYNTHESIS] the action
+    # already wrote the answer -- recovered 175 chars": a promise with no
+    # bullets, actions 2..4 never reached, and nothing said so.
+    #
+    # The pointer is the record: _advance_reuse_action is its only writer and
+    # moves it past the last action only after that action's evidence-backed
+    # TERMINATED; every GAVE_UP there returns BEFORE the pointer moves.  So a
+    # pointer still inside the recipe means the turn is unfinished, and the
+    # lifecycle state says whether that action gave up or just stopped.
+    #
+    # No task for the session means no lifecycle fact to add; the tool
+    # predicate still decides.  get_agent_response subscripts
+    # user_tasks[user_prompt] on every loop pass before reaching this call,
+    # so that case is unreachable from the pipeline.  Unreadable state is
+    # treated as unfinished, the same rule the tool predicate's sentinel
+    # follows.
+    _unfinished = []
+    try:
+        _task = user_tasks.get(user_prompt)
+        if _task is not None:
+            _at = int(_task.current_action)
+            _total = len(_task.actions)
+            if 1 <= _at <= _total:
+                if get_action_state(user_prompt, _at) == ActionState.GAVE_UP:
+                    _unfinished.append(
+                        f"action {_at} gave up without a verified result")
+                else:
+                    _unfinished.append(f"action {_at} did not finish")
+                if _at < _total:
+                    _unfinished.append(
+                        f"actions {_at + 1} to {_total} were not reached")
+    except Exception:
+        _unfinished = ['the state of the actions could not be read']
+
+    if _unrun or _unfinished:
+        _clauses = []
+        if _unrun:
+            _clauses.append(
+                f"these tools did not run for action "
+                f"{_reuse_current_action_id(user_prompt) or '(unknown)'}: "
+                + ', '.join(str(t) for t in _unrun))
         _steer = _REUSE_SYNTHESIS_STEER_INCOMPLETE.format(
-            unrun=', '.join(str(t) for t in _unrun))
+            unrun='; '.join(_clauses + _unfinished))
     else:
         # EVERY TOOL RAN AND EVERY RESULT WAS EMPTY.  Then the honest answer
         # is fully determined and the model is not needed for it — asking is
@@ -4865,7 +4920,8 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
         _steer = _REUSE_SYNTHESIS_STEER
     _say('info', f"[SYNTHESIS] reply would be raw control JSON — asking for "
                  f"the user-facing answer (session: {user_prompt}, "
-                 f"{_before} msgs, unrun={_unrun or 'none'})")
+                 f"{_before} msgs, unrun={_unrun or 'none'}, "
+                 f"unfinished={_unfinished or 'none'})")
     try:
         chat_instructor.initiate_chat(
             recipient=manager, message=_steer,
