@@ -1297,7 +1297,15 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
         ActionState.IN_PROGRESS: [ActionState.STATUS_VERIFICATION_REQUESTED, ActionState.IN_PROGRESS, ActionState.ERROR, ActionState.PENDING],
         ActionState.STATUS_VERIFICATION_REQUESTED: [ActionState.COMPLETED, ActionState.PENDING, ActionState.ERROR, ActionState.STATUS_VERIFICATION_REQUESTED],
         ActionState.COMPLETED: [ActionState.FALLBACK_REQUESTED, ActionState.RECIPE_REQUESTED, ActionState.TERMINATED, ActionState.COMPLETED],  # Allow direct recipe request (autonomous) or termination
-        ActionState.PENDING: [ActionState.COMPLETED, ActionState.ERROR, ActionState.PENDING],
+        # PENDING -> IN_PROGRESS is the resume edge.  PENDING is a wait (the
+        # user's input via mark_action_waiting_for_user, or a 'pending'
+        # verdict); once it is answered the action runs again.  Without this
+        # edge the ledger resumed (resume_from_user_input: BLOCKED ->
+        # IN_PROGRESS) while create_recipe's [EXECUTE-PENDING] request for
+        # IN_PROGRESS was refused and the action ran reading PENDING --
+        # measured 21:23:20 "cannot go from pending to in_progress" right
+        # after "Latest User message: Yes, proceed".
+        ActionState.PENDING: [ActionState.COMPLETED, ActionState.ERROR, ActionState.PENDING, ActionState.IN_PROGRESS],
         # FIX: Allow ERROR to reach TERMINATED via FALLBACK_REQUESTED/RECIPE_REQUESTED or directly
         ActionState.ERROR: [ActionState.IN_PROGRESS, ActionState.PENDING, ActionState.ERROR, ActionState.FALLBACK_REQUESTED, ActionState.RECIPE_REQUESTED, ActionState.TERMINATED],
         ActionState.FALLBACK_REQUESTED: [ActionState.FALLBACK_RECEIVED, ActionState.FALLBACK_REQUESTED],
