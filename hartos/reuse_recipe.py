@@ -349,7 +349,7 @@ from hartos.lifecycle_hooks import (
     sync_action_state_to_ledger, register_ledger_for_session,
     ActionState, safe_set_state, force_state_through_valid_path, get_action_state,
     clear_action_states, settled_action_id, commit_verified_action_completion,
-    dispatch_action_id,
+    dispatch_action_id, ACTION_STATES_AWAITING_USER,
 )
 from hartos.cultural_wisdom import get_cultural_prompt
 
@@ -4820,12 +4820,26 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
             _at = int(_task.current_action)
             _total = len(_task.actions)
             if 1 <= _at <= _total:
-                if get_action_state(user_prompt, _at) == ActionState.GAVE_UP:
+                _state = get_action_state(user_prompt, _at)
+                if _state == ActionState.GAVE_UP:
                     _unfinished.append(
                         f"action {_at} gave up without a verified result")
+                elif (_state in ACTION_STATES_AWAITING_USER
+                        or not _reuse_action_is_autonomous(user_prompt, _at)):
+                    # A PAUSE FOR THE USER, not a failure.  A REUSE turn may
+                    # end mid-recipe on purpose: the REUSE-NODRIVER break stops
+                    # at an action the recipe marks non-autonomous, and the
+                    # pointer carries over to the user's next /chat turn; the
+                    # waiting states say the same thing explicitly.  That
+                    # turn's tail is the agent's QUESTION to the user, and it
+                    # must reach them.  Measured on 784a8143c (review probe):
+                    # action 1 of 4 non-autonomous, the Assistant asking "Please
+                    # paste the text...", and the incomplete steer replaced the
+                    # question with a failure report.
+                    pass
                 else:
                     _unfinished.append(f"action {_at} did not finish")
-                if _at < _total:
+                if _unfinished and _at < _total:
                     _unfinished.append(
                         f"actions {_at + 1} to {_total} were not reached")
     except Exception:

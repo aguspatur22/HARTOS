@@ -546,6 +546,18 @@ class ActionState(Enum):
     GAVE_UP = "gave_up"                            # 16. Force-abandoned terminal (stalled/unverified work): an HONEST failure (ledger FAILED), NOT a verified success like TERMINATED. Re-openable (→ASSIGNED/RECIPE_REQUESTED) so a hive peer can retry (#139).
 
 
+#: The states that mean "this action is waiting for the USER", straight from
+#: the enum's own definitions above: PENDING is what mark_action_waiting_for_
+#: user projects (the ledger's input_required block), FALLBACK_REQUESTED is a
+#: fallback asked of the user, PREVIEW_PENDING is a destructive action awaiting
+#: the user's approval.  An action in one of these has paused, not failed; a
+#: reader that needs "is this a pause for the user?" asks this set rather than
+#: spelling its own.
+ACTION_STATES_AWAITING_USER = frozenset({
+    ActionState.PENDING, ActionState.FALLBACK_REQUESTED,
+    ActionState.PREVIEW_PENDING})
+
+
 # ── No-progress stall guard for the CREATE loop ───────────────────────────
 # create_recipe.get_response_group's main loop can spin to its 300-iteration
 # cap (~25 min of wasted compute, observed live) when an action sits in a

@@ -60,9 +60,15 @@ def _history():
 class _Task:
     """The pipeline's per-session task: an action list and a pointer."""
 
-    def __init__(self, current_action, n_actions=4):
+    def __init__(self, current_action, n_actions=4, autonomous=True):
+        # autonomy is DECLARED, as the recipe author writes it: absent reads as
+        # "not autonomous" (_reuse_action_is_autonomous), which is a different
+        # scenario -- an action allowed to stop and ask the user.
         self.current_action = current_action
-        self.actions = [{'action': 'step %d' % i} for i in range(1, n_actions + 1)]
+        self.actions = [{'action': 'step %d' % i,
+                         'can_perform_without_user_input':
+                             'yes' if autonomous else 'no'}
+                        for i in range(1, n_actions + 1)]
         self.evidence_vacuous_action = None
 
     def get_action(self, i):
@@ -185,6 +191,48 @@ class TestAnUnfinishedActionIsNotTheWholeAnswer:
                                    outstanding=['google_search'])
         assert 'google_search' in rec.messages[0]
         assert 'action 1 gave up' in rec.messages[0]
+
+
+class TestAPauseForTheUserIsNotAFailure:
+    """Review of 784a8143c, measured with a probe on both commits: a REUSE turn
+    may END mid-recipe on purpose -- the REUSE-NODRIVER break stops the turn at
+    an action with can_perform_without_user_input='no', and the pointer carries
+    over to the user's next /chat turn.  That turn's tail is the agent's
+    question to the user; reporting it as "action 1 did not finish" replaces
+    the question with a failure report.  Same for the states that mean
+    "waiting for the user" (lifecycle_hooks.ACTION_STATES_AWAITING_USER)."""
+
+    def test_a_non_autonomous_action_asking_the_user_keeps_its_question(
+            self, rr, lh, monkeypatch):
+        posted, chat, rec = _run(rr, lh, monkeypatch,
+                                 _Task(1, autonomous=False),
+                                 lh.ActionState.IN_PROGRESS)
+        assert rec.messages == [] and posted is False, (
+            'a turn paused for the user was steered into a failure report: '
+            f'{rec.messages!r}')
+        assert chat.messages[-1].get('content') == PROMISE
+
+    @pytest.mark.parametrize('state', ['PENDING', 'FALLBACK_REQUESTED',
+                                       'PREVIEW_PENDING'])
+    def test_a_state_waiting_for_the_user_is_not_unfinished(
+            self, rr, lh, monkeypatch, state):
+        _posted, chat, rec = _run(rr, lh, monkeypatch, _Task(2),
+                                  getattr(lh.ActionState, state))
+        assert rec.messages == [], f'{state} was reported as a failure'
+        assert chat.messages[-1].get('content') == PROMISE
+
+    def test_a_non_autonomous_action_that_gave_up_is_still_unfinished(
+            self, rr, lh, monkeypatch):
+        """A give-up is a failure whoever was meant to drive the action."""
+        _posted, _chat, rec = _run(rr, lh, monkeypatch,
+                                   _Task(1, autonomous=False),
+                                   lh.ActionState.GAVE_UP)
+        assert rec.messages and 'action 1 gave up' in rec.messages[0]
+
+    def test_the_waiting_states_are_exactly_the_three_the_enum_names(self, lh):
+        assert lh.ACTION_STATES_AWAITING_USER == frozenset({
+            lh.ActionState.PENDING, lh.ActionState.FALLBACK_REQUESTED,
+            lh.ActionState.PREVIEW_PENDING})
 
 
 class TestAFinishedTurnStillUsesTheSuccessDoor:
