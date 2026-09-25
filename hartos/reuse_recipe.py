@@ -3659,7 +3659,11 @@ def _reuse_is_pipeline_text(content):
 
       _build_reuse_action_message   the dispatch alone — actions 2..N
       _reuse_seed_message           ``f"{message}\\n\\n{dispatch}"`` — the
-                                    opening turn puts the USER'S WORDS first
+                                    opening turn put the USER'S WORDS first
+                                    until 2026-09-25; it now leads with the
+                                    dispatch (lifecycle_hooks.dispatch_action_id
+                                    reads only a leading marker), but a model
+                                    echo can still carry it anywhere
 
     Measured live 2026-09-10 10:05:25 (agent 88094979291): the second shape
     reached the user verbatim, all 904 characters of it —
@@ -6768,9 +6772,18 @@ def _reuse_seed_message(user_prompt, message):
     # signal that cannot show its own failure is not a signal: live on
     # 2026-09-05 the command reached the wire 6x for Trading and 0x for Auto
     # Research on the SAME code path, and the log could not say why.
+    # DISPATCH FIRST, the user's words after it.  This message is action 1's
+    # dispatch, and lifecycle_hooks.dispatch_action_id -- the one parser every
+    # window reader uses -- honours only a LEADING marker (text after a marker
+    # can quote an earlier one, so a mid-message marker says nothing).  The
+    # first cut put the user's words first; the marker then sat mid-message,
+    # the seed was no dispatch, action 1 had no window, and every receipt
+    # search came back empty: live 2026-09-25, 42 "[REUSE-VERIFY] ... no
+    # canonical receipt" lines across 14 sessions, all action 1, 0 advances.
+    # Same shape as CREATE's [EXECUTE-PENDING] dispatch (marker, then text).
     try:
         current_action_id = user_tasks[user_prompt].current_action
-        seeded = f"{message}\n\n{_build_reuse_action_message(user_prompt, current_action_id)}"
+        seeded = f"{_build_reuse_action_message(user_prompt, current_action_id)}\n\n{message}"
         current_app.logger.info(
             f"[REUSE-SEED] seeded action {current_action_id} "
             f"(+{len(seeded) - len(message)} chars)")

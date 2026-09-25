@@ -1906,7 +1906,10 @@ def lifecycle_hook_track_recipe_completion(user_prompt: str, json_obj: dict, use
 # that text can quote an earlier one ("... ,Latest User message: Properly
 # Execute Action 6: ...", the Failure=True retry text), so a marker later in a
 # message says nothing about which action it posts.  Colon-delimited, so
-# action 2 never matches action 20.
+# action 2 never matches action 20.  Every producer therefore puts its marker
+# FIRST, including reuse_recipe._reuse_seed_message (action 1: dispatch, then
+# the user's words); a seed built user-words-first was invisible here and no
+# REUSE action 1 could commit (2026-09-25).
 _DISPATCH_MARKER = re.compile(
     r'\s*(?:'
     r'(?:\[retry:[^\]]*\]\s*)?(?:Properly\s+)?Execute Action '
