@@ -246,6 +246,7 @@ from hartos.lifecycle_hooks import (
     debug_lifecycle_status,
     ActionState,
     get_action_state, safe_set_state, force_state_through_valid_path, is_terminal_state,
+    autonomy_needs_user,
     lifecycle_hook_track_status_verification_request,
     lifecycle_hook_track_fallback_request,
     lifecycle_hook_track_recipe_request,
@@ -2533,7 +2534,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                         f"(can_perform_without_user_input={_gate_value!r}); "
                                         f"OUTER loop will break and return control to user."
                                     )
-                                elif _gate_value.startswith('no'):
+                                elif autonomy_needs_user(_gate_value):
                                     current_app.logger.info(
                                         f"[USER-INPUT-GATE] NOT flagging action {current_action_id}: "
                                         f"verdict said {_gate_value!r} but the action is already "
@@ -4147,7 +4148,7 @@ def _should_block_on_user_input(user_prompt, action_id, gate_value) -> bool:
     re-listed here — a fourth copy of that tuple is the drift this codebase keeps
     paying for.
     """
-    if not (gate_value or '').strip().lower().startswith('no'):
+    if not autonomy_needs_user(gate_value):
         return False
     try:
         if is_terminal_state(get_action_state(user_prompt, action_id)):
