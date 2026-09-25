@@ -9681,6 +9681,13 @@ def chat():
             prompt, _redacted_count = redact_secrets(prompt)
         except ImportError:
             logging.getLogger(__name__).debug("chat: swallowed ImportError")
+    # The prompt as the two gates above left it.  Later branches rewrite
+    # `prompt` for one consumer (gather_info gets the cloud record or the
+    # wrap-up instruction appended) and then restore the turn's text; they
+    # restore THIS, never data['prompt'], which would undo both gates.
+    # Measured in the review of 8c9abe070: the gather path re-read the raw
+    # body, so a user's 'sk-...' reached gather_info's LLM and the mirror.
+    _guarded_prompt = prompt
 
     # BUDGET GATE: estimate and log LLM cost before execution
     if prompt:
@@ -10163,7 +10170,7 @@ def chat():
             with _user_lock:
                 review_agents[_ak] = False
                 _touch_agent_timestamp(_ak)
-            prompt = data.get('prompt', None)
+            prompt = _guarded_prompt
             # The words the user sent this turn, for _chat_reply's user_prompt:
             # it records the user side (conversation mirror, SimpleMem, the
             # MemoryGraph) only when given one, and every gather exit below
@@ -10715,7 +10722,9 @@ def chat():
     thread_local_data.set_global_intent(global_intent=req_tool)
     thread_local_data.set_prompt_id(prompt_id)
 
-    prompt = data.get('prompt', None)
+    # The guarded text again: the create branch above may have rewritten
+    # `prompt` for gather_info (see _guarded_prompt).
+    prompt = _guarded_prompt
     if probe:
         prompt = ''
 

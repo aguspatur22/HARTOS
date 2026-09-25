@@ -89,7 +89,8 @@ class _Inline:
     RLock = threading.RLock
 
 
-def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None):
+def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
+           redact=None, user_text=None, create_agent=True, extra_ns=None):
     """POST one /chat create_agent turn through the real handler.
 
     Returns (response_json, chat_messages_stub, memory_stub, gather_calls).
@@ -138,6 +139,7 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None):
         'get_memory': lambda user_id=None: memory,
         '_get_or_create_graph': lambda *a, **k: graph,
     }
+    ns.update(extra_ns or {})
     exec(compile(_lift({'chat', '_chat_reply', '_config_is_buildable',
                         '_EMPTY_BUILD_REPLY'}), _SRC, 'exec'), ns)
 
@@ -154,7 +156,7 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None):
         'security.hive_guardrails': MagicMock(GuardrailEnforcer=MagicMock(
             before_dispatch=lambda p: (True, '', p))),
         'security.secret_redactor': MagicMock(
-            redact_secrets=lambda p: (p, 0)),
+            redact_secrets=redact or (lambda p: (p, 0))),
         'security.prompt_guard': MagicMock(
             check_prompt_injection=lambda p: (True, '')),
         'core.recipe_sync': MagicMock(pull_recipe=lambda *a: False),
@@ -166,8 +168,9 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None):
         'langchain_classic.schema': MagicMock(),
         'langchain_classic.schema.messages': MagicMock(),
     }
-    body = {'user_id': USER_ID, 'prompt_id': PROMPT_ID, 'prompt': USER_TEXT,
-            'create_agent': True, 'request_id': 'rq-gather-1',
+    body = {'user_id': USER_ID, 'prompt_id': PROMPT_ID,
+            'prompt': USER_TEXT if user_text is None else user_text,
+            'create_agent': create_agent, 'request_id': 'rq-gather-1',
             'media_mode': 'text', 'preferred_lang': 'en'}
     with patch.dict(sys.modules, stubs), patch.dict(
             os.environ, {'HEVOLVE_API_KEY': '', 'HEVOLVE_NODE_TIER': 'flat',
@@ -241,3 +244,51 @@ def test_forced_completion_turn_records_the_users_words(tmp_path):
     assert gather_calls[0].startswith('Please finalize'), gather_calls
     user_rows = [t for r, t in _rows(persist) if r == 'user']
     assert user_rows == [USER_TEXT], user_rows
+
+
+def test_the_recorded_and_gathered_text_is_the_redacted_text(tmp_path):
+    """Review of 8c9abe070, measured: the gather path re-read the raw request
+    body after /chat's guardrail and redact_secrets pass, so a key the user
+    typed reached gather_info's LLM and the conversation mirror, whose
+    publish leg goes to peers.  Both must get what the gates left."""
+    secret = 'agent using key sk-SECRET to summarise news'
+
+    def redact(p):
+        return p.replace('sk-SECRET', '[REDACTED:key]'), 1
+
+    _, persist, memory, gather_calls = _drive(
+        tmp_path, '{"status": "pending", "question": "Name?"}',
+        redact=redact, user_text=secret)
+    user_rows = [t for r, t in _rows(persist) if r == 'user']
+    assert user_rows == ['agent using key [REDACTED:key] to summarise news'], (
+        user_rows)
+    assert gather_calls and all('sk-SECRET' not in c for c in gather_calls), (
+        gather_calls)
+    assert 'sk-SECRET' not in str(memory.save_context.call_args)
+
+
+def test_the_final_answer_path_gets_the_redacted_text_too(tmp_path):
+    """Same re-read on the non-create path (the get_ans call): it restored
+    data['prompt'], so the main LLM answer saw the raw key as well."""
+    seen = []
+
+    class _Reached(Exception):
+        """What get_ans received is the whole claim; the reply tail after it
+        is not under test, so the stub stops the route there."""
+
+    def get_ans(casual_conv, req_tool, user_id=None, query=None, **kw):
+        seen.append(query)
+        raise _Reached()
+
+    def redact(p):
+        return p.replace('sk-SECRET', '[REDACTED:key]'), 1
+
+    # A system agent's turn is the one chat() sends straight to get_ans.
+    (tmp_path / f'{PROMPT_ID}.json').write_text(json.dumps({
+        'is_system_agent': True, 'name': 'livetest_system',
+        'flows': [{'system_prompt': 'You are helpful.'}]}))
+    with pytest.raises(_Reached):
+        _drive(tmp_path, 'unused', redact=redact, user_text='check sk-SECRET',
+               create_agent=False, extra_ns={'get_ans': get_ans,
+                                             'publish_async': MagicMock()})
+    assert seen == ['check [REDACTED:key]'], seen
