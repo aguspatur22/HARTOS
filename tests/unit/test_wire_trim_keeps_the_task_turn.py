@@ -180,3 +180,42 @@ def test_an_oversized_task_turn_is_truncated_not_left_over_budget(monkeypatch):
     assert kept[0]['content'].endswith('TAIL 83 cyclists')
     assert _VERDICT in [m.get('content') for m in out]
     assert est_after <= budget
+
+
+def test_an_anchor_that_is_the_newest_message_is_kept_whole(monkeypatch):
+    """Review of 520c95e28, probed: in the StatusVerifier seat the anchor
+    (the Assistant's result) is messages[-1].  It was cut first, in a
+    separate step sized against the still-full task, and floored while the
+    task was cut anyway.  The newest message is now in the largest-first
+    pass: cutting only the larger task must leave the result whole."""
+    sys_m = _sys()
+    task = _task('TASKHEAD ' + 'task ' * 3000 + ' TASKTAIL')
+    anchor = {'role': 'user', 'name': 'Assistant',
+              'content': 'RESULTHEAD ' + 'result ' * 400 + ' RESULTTAIL'}
+    msgs = [sys_m, task, _bulk('assistant', 'a1'), anchor]
+    keep = [sys_m, _task('task ' * 200), anchor]
+    out, est_after, budget = _trim_so_that_only(keep, msgs, monkeypatch)
+    kept_anchor = [m for m in out if m.get('name') == 'Assistant']
+    kept_task = [m for m in out if m.get('name') == 'User']
+    assert kept_anchor and kept_anchor[0]['content'] == anchor['content'], (
+        'the newest message was cut although cutting the larger task fits')
+    assert kept_task and kept_task[0]['content'].startswith(WIRE_TRIM_MARKER)
+    assert est_after <= budget
+
+
+def test_an_unprotected_oversized_newest_message_is_still_truncated(
+        monkeypatch):
+    """The step the pass replaced existed for this: a newest message that is
+    alone too big (an assistant reply, protected by nothing) is cut, not
+    left over budget."""
+    sys_m = _sys()
+    newest = {'role': 'assistant',
+              'content': 'HEAD ' + 'word ' * 3000 + ' TAIL'}
+    msgs = [sys_m, _bulk('assistant', 'a0'), {'role': 'user', 'content': 'q'},
+            newest]
+    out, est_after, budget = _trim_so_that_only(
+        [sys_m, {'role': 'user', 'content': 'q'},
+         {'role': 'assistant', 'content': 'word ' * 100}], msgs, monkeypatch)
+    assert out[-1]['content'].startswith(WIRE_TRIM_MARKER)
+    assert out[-1]['content'].endswith('TAIL')
+    assert est_after <= budget

@@ -1031,21 +1031,6 @@ def _trim_to_budget(body: dict) -> tuple:
     marker_tokens = count_tokens_for_text(WIRE_TRIM_MARKER, model)
 
     n_truncated_chars = 0
-    if count_tokens_for_messages(messages, model) > budget and messages:
-        overhead_tokens = (count_tokens_for_messages(messages[:-1], model)
-                           + _TOKENS_PER_MSG
-                           + marker_tokens)
-        room_for_last = max(64, budget - overhead_tokens)
-        # Use the same chars/token ratio the fallback uses (3.5).  When
-        # tiktoken is available this is conservative; when it's the
-        # active path, it's exact.  Either way we're cutting from the
-        # left so over-cutting just means a slightly smaller payload.
-        target_chars = int(room_for_last * 3.5)
-        new_last, n_cut = _truncate_msg_content(
-            messages[-1], target_chars, WIRE_TRIM_MARKER, _content_to_text)
-        if n_cut:
-            n_truncated_chars += n_cut
-            messages[-1] = new_last
 
     # The anchor (newest user message) is drop-protected, so when IT is the
     # oversized component the step above never touches it: it only truncates
@@ -1066,14 +1051,28 @@ def _trim_to_budget(body: dict) -> tuple:
     # the user's 15k-char input was what needed cutting.  Shrinking the larger
     # message first means the smaller one is only cut when the larger alone
     # cannot make room.
-    for p in sorted(protected,
+    #
+    # The NEWEST message is in the same pass.  It used to be cut first, in a
+    # separate step sized against the others at full size; in the
+    # StatusVerifier seat the anchor (the Assistant's result) IS the newest
+    # message, so it was floored while the 15k-char task was what needed
+    # cutting (review of 520c95e28, probed: anchor 2822 -> 247 chars, task
+    # cut anyway, est 569 of budget 740).  Deduplicated by identity: the
+    # newest message is often the anchor itself.  Room uses the same
+    # chars/token ratio the fallback uses (3.5): conservative with tiktoken,
+    # and cutting from the left means over-cutting only shrinks the payload.
+    candidates = []
+    for m in protected + messages[-1:]:
+        if not any(m is c for c in candidates):
+            candidates.append(m)
+    for p in sorted(candidates,
                     key=lambda m: count_tokens_for_messages([m], model),
                     reverse=True):
         if count_tokens_for_messages(messages, model) <= budget:
             break
         p_idx = next((i for i, m in enumerate(messages) if m is p), None)
-        if p_idx is None or p_idx == len(messages) - 1:
-            continue  # gone, or already handled as the last message above
+        if p_idx is None:
+            continue  # dropped above
         others = messages[:p_idx] + messages[p_idx + 1:]
         overhead_tokens = (count_tokens_for_messages(others, model)
                            + _TOKENS_PER_MSG
