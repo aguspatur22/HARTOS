@@ -365,6 +365,83 @@ def helper_tool_names(agent):
     return out
 
 
+def _schema_or_none(agent):
+    """The names on ``agent``'s LLM schema, or None when it has no schema to
+    read (no dict llm_config: a recorder, a UserProxy, llm_config=False).
+    None means "only the attach ledger can say what is attached"."""
+    if not isinstance(getattr(agent, 'llm_config', None), dict):
+        return None
+    return helper_tool_names(agent)
+
+
+# Words that carry no capability.  Stopwords would over-attach: 'the' passes
+# len>2 AND is a substring of 'synthesis', so "summarize the page" would match
+# nearly every tool.
+_NEED_STOPWORDS = frozenset({
+    'the', 'and', 'for', 'you', 'your', 'with', 'that', 'this',
+    'please', 'need', 'want', 'tool', 'tools', 'use', 'able',
+    'can', 'get', 'have', 'from', 'into', 'about', 'some', 'any'})
+
+
+def _need_names_tool(name, need_text, need_stems):
+    """True when the need NAMES this tool: every salient word of the tool's
+    name appears in the need, verbatim or by its 4-character stem.
+
+    The stricter half of discover_and_attach's selector.  Its keyword/stem
+    matcher answers "which tools might serve this need" and over-matches on
+    purpose (measured: 'share context with other agents' also matched
+    device_control, execute_coding_task and Post_As_User), which is fine for
+    the Helper, the seat that only speaks when asked.  A tool goes onto the
+    seat that SPEAKS only when the need names it, the same rule
+    attach_for_names applies to a recipe."""
+    tokens = [t for t in _re.split(r'[^a-z0-9]+', str(name).lower())
+              if len(t) > 2 and t not in _NEED_STOPWORDS]
+    return bool(tokens) and all(
+        t in need_text or (len(t) >= 4 and t[:4] in need_stems)
+        for t in tokens)
+
+
+def _attach_tool(helper, executor, fn, description, make_func,
+                 attached_names, helper_live, proposer_live):
+    """Attach one tool: its schema onto the Helper (with execution on
+    ``executor``) unless it is already there, and onto the proposing seat
+    too when ``proposer_live`` is given.  The ONE primitive the three attach
+    paths (discover_and_attach, attach_for_names, attach_for_tags) share.
+
+    "Already attached" is the ledger AND the live schema.  The ledger alone
+    was wrong once schemas could shrink: fit_schema_to_ctx / defer_helper_
+    schema take a tool off the schema but not out of the ledger, and every
+    attach path skipped ledger names, so a deferred tool could never come
+    back (measured in the review of f526c4580: attach_for_names returned 0
+    for it and request_tools answered "No local registry tool matches").
+    ``helper_live`` None (no readable schema) keeps the ledger-only rule.
+
+    ``proposer_live``: the names on ``executor``'s own schema, when the tool
+    should also reach ``executor`` as a proposer; None when it should not.
+    Updated in place, as are ``attached_names`` and ``helper_live``.
+
+    Returns (on_helper, on_proposer) for what this call added, or None when
+    ``make_func`` produced no callable (the backing service is down).
+    """
+    need_helper = not (fn in attached_names
+                       and (helper_live is None or fn in helper_live))
+    need_proposer = proposer_live is not None and fn not in proposer_live
+    if not (need_helper or need_proposer):
+        return False, False
+    func = make_func()
+    if func is None:
+        return None
+    if need_helper:
+        register_dual(helper, executor, func, fn, description)
+        attached_names.add(fn)
+        if helper_live is not None:
+            helper_live.add(fn)
+    if need_proposer:
+        executor.register_for_llm(name=fn, description=description)(func)
+        proposer_live.add(fn)
+    return need_helper, need_proposer
+
+
 def defer_helper_schema(helper, names):
     """Drop ``names`` from the helper's LLM schema, leaving execution intact.
 
@@ -712,15 +789,38 @@ def discover_and_attach(need, helper, executor, registry, attached_names,
             any recipe uses.  Omitted or empty is a strict no-op.
     Returns a human/model-readable summary string.
     """
-    # Stopwords would over-attach: 'the' passes len>2 AND is a substring of
-    # 'synthesis', so "summarize the page" would match nearly every tool.
-    stop = {'the', 'and', 'for', 'you', 'your', 'with', 'that', 'this',
-            'please', 'need', 'want', 'tool', 'tools', 'use', 'able',
-            'can', 'get', 'have', 'from', 'into', 'about', 'some', 'any'}
     words = {w for w in str(need).lower().replace(',', ' ').split()
-             if len(w) > 2 and w not in stop}
+             if len(w) > 2 and w not in _NEED_STOPWORDS}
     if not words:
         return "Tell me what capability you need, e.g. 'text to speech'."
+    # The seat that proposes its own tool calls (register_core_tools'
+    # executor_proposes: the main leg's Assistant) gets the tools the need
+    # NAMES on its own schema; everything the looser matcher finds goes to
+    # the Helper as before.  Measured live 2026-09-25 (A2A-3): the Assistant
+    # answered "the delegate_to_specialist tool isn't available in my current
+    # toolset" because every attach put the schema on the Helper only.
+    need_text = str(need).lower()
+    need_stems = {w[:4] for w in _re.split(r'[^a-z0-9]+', need_text)
+                  if len(w) >= 4}
+    helper_live = _schema_or_none(helper)
+    exec_live = helper_tool_names(executor)
+    proposes = bool(exec_live)
+    to_proposer = []
+
+    def _attach(fn, desc, make_func):
+        named = proposes and _need_names_tool(fn, need_text, need_stems)
+        got = _attach_tool(helper, executor, fn, desc, make_func,
+                           attached_names, helper_live,
+                           exec_live if named else None)
+        if got is None:
+            return None
+        on_helper, on_proposer = got
+        if on_proposer:
+            to_proposer.append(fn)
+        if on_helper or on_proposer:
+            attached.append(fn)
+        return got
+
     attached, startable = [], []
     for tool_name, tool in registry._tools.items():
         hay = ' '.join([tool_name, ' '.join(tool.tags or []),
@@ -738,24 +838,16 @@ def discover_and_attach(need, helper, executor, registry, attached_names,
             if not any(w in hay_ep or (len(w) >= 4 and w[:4] in stems)
                        for w in words):
                 continue
-            if fn in attached_names:
-                continue
-            func = registry.create_endpoint_function(tool_name, ep_name)
-            if func is None:
+            if _attach(fn, ep.get('description', f'{tool_name} {ep_name}'),
+                       lambda t=tool_name, e=ep_name:
+                           registry.create_endpoint_function(t, e)) is None:
                 startable.append(fn)
-                continue
-            register_dual(helper, executor, func, fn,
-                          ep.get('description', f'{tool_name} {ep_name}'))
-            attached_names.add(fn)
-            attached.append(fn)
     # Core closures: SAME selector (the keyword/stem matcher above), same
     # idempotent `attached_names`, same register_dual primitive — only the
     # SOURCE differs.  Kept in this function rather than a sibling so there is
     # one answer to "attach the tool this need describes", not two that drift
     # (the reason attach_for_names holds its core loop inline too).
     for _c_name, _c_desc, _c_func in (core_tools or []):
-        if _c_name in attached_names:
-            continue
         hay_core = (str(_c_name) + ' ' + str(_c_desc or '')).lower()
         core_words = {hw for hw in _re.split(r'[^a-z0-9]+', hay_core)
                       if len(hw) >= 4}
@@ -763,9 +855,7 @@ def discover_and_attach(need, helper, executor, registry, attached_names,
         if not any(w in hay_core or (len(w) >= 4 and w[:4] in core_stems)
                    for w in words):
             continue
-        register_dual(helper, executor, _c_func, _c_name, _c_desc)
-        attached_names.add(_c_name)
-        attached.append(_c_name)
+        _attach(_c_name, _c_desc, lambda f=_c_func: f)
 
     # THIRD source: tools the EXECUTOR can already run but the helper can no
     # longer SEE.  `register_dual` splits schema (helper.register_for_llm) from
@@ -797,8 +887,6 @@ def discover_and_attach(need, helper, executor, registry, attached_names,
     # time and visual factories must degrade to today's behaviour, not raise.
     for _x_name, _x_func in sorted(
             (getattr(executor, '_function_map', None) or {}).items()):
-        if _x_name in attached_names:
-            continue
         # _function_map carries no description — the docstring's first line is
         # the only text the tool ships with, and it is what the model will read
         # once re-attached.  Fall back to the name so a doc-less callable is
@@ -811,9 +899,16 @@ def discover_and_attach(need, helper, executor, registry, attached_names,
         if not any(w in hay_x or (len(w) >= 4 and w[:4] in x_stems)
                    for w in words):
             continue
-        register_dual(helper, executor, _x_func, _x_name, _x_desc)
-        attached_names.add(_x_name)
-        attached.append(_x_name)
+        _attach(_x_name, _x_desc, lambda f=_x_func: f)
+
+    # Bound what reached the proposing seat to the live n_ctx, protecting what
+    # this request named.  The CREATE leg has no per-turn fit (only REUSE's
+    # _attach_named_tools_for_action runs one), so without this a request
+    # could widen the Assistant, the seat whose bodies fit, past the window.
+    on_proposer = list(to_proposer)
+    if to_proposer:
+        deferred = fit_schema_to_ctx(executor, protect=to_proposer)
+        on_proposer = [n for n in to_proposer if n not in deferred]
 
     parts = []
     if attached:
@@ -826,6 +921,19 @@ def discover_and_attach(need, helper, executor, registry, attached_names,
               "internet-access or capability restriction applies. "
               "Immediately CALL the one that fits the task. Do NOT tell "
               "the user this is unavailable - the tool is live.")
+        if proposes:
+            # Which seat can call which: a tool only the Helper holds is
+            # called by tagging it, and saying so is what keeps "ready to
+            # call NOW" true for the seat that asked.
+            _name = lambda a, d: str(getattr(a, 'name', '') or d)
+            if on_proposer:
+                parts.append(f"{_name(executor, 'You')} can call directly: "
+                             + ', '.join(on_proposer) + '.')
+            helper_only = [n for n in attached if n not in on_proposer]
+            if helper_only:
+                h = _name(helper, 'Helper')
+                parts.append(f"Held by @{h}; ask @{h} to call: "
+                             + ', '.join(helper_only) + '.')
     if startable:
         parts.append("Exists locally but the backing service is down — it "
                      "can be self-hosted/started via the install flow: "
@@ -856,21 +964,23 @@ def attach_for_tags(cap_tags, helper, executor, registry, attached_names):
     cap = set(cap_tags or [])
     if not cap:
         return 0
+    # Helper only: a tag is inferred from the turn's prose, never a request
+    # that names the tool, so it does not reach the seat that speaks.
+    helper_live = _schema_or_none(helper)
     n = 0
     for tool_name, tool in registry._tools.items():
         if not (set(tool.tags or []) & cap):
             continue
         for ep_name, ep in tool.endpoints.items():
             fn = tool_name if ep_name == tool_name else f"{tool_name}_{ep_name}"
-            if fn in attached_names:
-                continue
-            func = registry.create_endpoint_function(tool_name, ep_name)
-            if func is None:
-                continue
-            register_dual(helper, executor, func, fn,
-                          ep.get('description', f'{tool_name} {ep_name}'))
-            attached_names.add(fn)
-            n += 1
+            got = _attach_tool(
+                helper, executor, fn,
+                ep.get('description', f'{tool_name} {ep_name}'),
+                lambda t=tool_name, e=ep_name:
+                    registry.create_endpoint_function(t, e),
+                attached_names, helper_live, None)
+            if got and got[0]:
+                n += 1
     return n
 
 
@@ -950,30 +1060,77 @@ def attach_for_names(names, helper, executor, registry, attached_names,
     want = {str(n) for n in (names or []) if n}
     if not want:
         return 0
+    # A name the action's recipe declares is a request that names the tool,
+    # so it reaches a proposing ``executor``'s own schema too (the main leg's
+    # Assistant, which emits its own tool_calls).  Bounding that schema to the
+    # live n_ctx is the caller's job, with these names protected: REUSE's
+    # _attach_named_tools_for_action runs fit_schema_to_ctx right after.
+    helper_live = _schema_or_none(helper)
+    exec_live = helper_tool_names(executor)
+    proposer_live = exec_live if exec_live else None
     n = 0
+
+    def _count(got):
+        return 1 if got and (got[0] or got[1]) else 0
+
     for tool_name, tool in registry._tools.items():
         for ep_name, ep in tool.endpoints.items():
             fn = tool_name if ep_name == tool_name else f"{tool_name}_{ep_name}"
-            if fn not in want or fn in attached_names:
+            if fn not in want:
                 continue
-            func = registry.create_endpoint_function(tool_name, ep_name)
-            if func is None:
-                continue
-            register_dual(helper, executor, func, fn,
-                          ep.get('description', f'{tool_name} {ep_name}'))
-            attached_names.add(fn)
-            n += 1
+            n += _count(_attach_tool(
+                helper, executor, fn,
+                ep.get('description', f'{tool_name} {ep_name}'),
+                lambda t=tool_name, e=ep_name:
+                    registry.create_endpoint_function(t, e),
+                attached_names, helper_live, proposer_live))
 
     # Core closures: same selector, same idempotent set — only the SOURCE
     # differs.  Kept inside this function rather than a sibling so there is one
     # answer to "attach the tools this turn names", not two that can drift.
     for core_name, core_desc, core_func in (core_tools or []):
-        if core_name not in want or core_name in attached_names:
+        if core_name not in want:
             continue
-        register_dual(helper, executor, core_func, core_name, core_desc)
-        attached_names.add(core_name)
-        n += 1
+        n += _count(_attach_tool(helper, executor, core_name, core_desc,
+                                 lambda f=core_func: f, attached_names,
+                                 helper_live, proposer_live))
     return n
+
+
+REQUEST_TOOLS_DESCRIPTION = (
+    "Discover and attach additional tools by describing the capability you "
+    "need, e.g. 'text to speech' or 'crawl a webpage'. Call this FIRST "
+    "whenever your current tools lack a capability - never tell the user "
+    "something is unavailable without trying this. If it finds no match, "
+    "call it once more with different wording.")
+
+
+def register_request_tools(helper, executor, registry, attached_names):
+    """Register ``request_tools``, the never-say-unavailable escape, on a
+    helper/executor pair.  ONE home for the closure the CREATE and REUSE main
+    legs each defined inline.
+
+    The schema goes on the Helper and, when ``executor`` proposes its own
+    tool calls (register_core_tools' executor_proposes), on ``executor`` too.
+    The escape has to be reachable from the seat that speaks: measured live
+    2026-09-25 (A2A-3), the Assistant, holding a schema without it, answered
+    "the delegate_to_specialist tool isn't available in my current toolset"
+    instead of asking.  The core closure list is read from
+    ``executor._hart_core_tools`` at CALL time, as both inline copies did, so
+    a list set after registration is still seen.
+    """
+    def request_tools(need: str) -> str:
+        return discover_and_attach(need, helper, executor, registry,
+                                   attached_names,
+                                   core_tools=getattr(
+                                       executor, '_hart_core_tools', None))
+    register_dual(helper, executor, request_tools, 'request_tools',
+                  REQUEST_TOOLS_DESCRIPTION)
+    if helper_tool_names(executor):
+        executor.register_for_llm(
+            name='request_tools',
+            description=REQUEST_TOOLS_DESCRIPTION)(request_tools)
+    return request_tools
 
 
 # ---------------------------------------------------------------------------
