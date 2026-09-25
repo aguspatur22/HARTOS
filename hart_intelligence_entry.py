@@ -10164,6 +10164,15 @@ def chat():
                 review_agents[_ak] = False
                 _touch_agent_timestamp(_ak)
             prompt = data.get('prompt', None)
+            # The words the user sent this turn, for _chat_reply's user_prompt:
+            # it records the user side (conversation mirror, SimpleMem, the
+            # MemoryGraph) only when given one, and every gather exit below
+            # left it out, so creation turns were stored as assistant-only
+            # (live GR7).  Taken HERE because `prompt` is rewritten below for
+            # gather_info (cloud name/goal appended on the first turn, the
+            # wrap-up instruction on the last), and neither is what the user
+            # said.  tests/unit/test_gather_turn_mirrors_user_side.py
+            _user_turn_text = prompt
             if prompt_id not in first_promts:
                 first_promts.append(prompt_id)
                 try:
@@ -10369,6 +10378,7 @@ def chat():
                         intent=['FINAL_ANSWER'],
                         req_token_count=0, res_token_count=0, history_request_id=[],
                         Agent_status='Creation Mode', prompt_id=prompt_id,
+                        user_prompt=_user_turn_text,
                     )
                 else:
                     # Completed (or forced completion after max turns)
@@ -10384,6 +10394,7 @@ def chat():
                             intent=['FINAL_ANSWER'],
                             req_token_count=0, res_token_count=0, history_request_id=[],
                             Agent_status='Creation Mode', prompt_id=prompt_id,
+                            user_prompt=_user_turn_text,
                         )
                     app.logger.info('COMPLETED STATUS')
                     _save_and_enter_review(new_res)
@@ -10394,6 +10405,7 @@ def chat():
                         intent=['FINAL_ANSWER'],
                         req_token_count=0, res_token_count=0, history_request_id=[],
                         Agent_status='Review Mode', prompt_id=prompt_id,
+                        user_prompt=_user_turn_text,
                     )
 
             except Exception as e:
@@ -10435,6 +10447,7 @@ def chat():
                         intent=['FINAL_ANSWER'],
                         req_token_count=0, res_token_count=0, history_request_id=[],
                         Agent_status='Review Mode', prompt_id=prompt_id,
+                        user_prompt=_user_turn_text,
                     )
                 _record_lifecycle('Creation Mode', user_id, prompt_id, f'Creation continuing after parse error: {e}')
                 return _chat_reply(
@@ -10442,6 +10455,7 @@ def chat():
                     intent=['FINAL_ANSWER'],
                     req_token_count=0, res_token_count=0, history_request_id=[],
                     Agent_status='Creation Mode', prompt_id=prompt_id,
+                    user_prompt=_user_turn_text,
                 )
         # Phase 2: Review Phase (re-snapshot flags under lock after Phase 1 may have mutated)
         with _user_lock:
