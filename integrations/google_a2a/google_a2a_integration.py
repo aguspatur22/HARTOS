@@ -14,8 +14,9 @@ import logging
 from typing import Dict, List, Any, Optional
 from datetime import datetime
 from flask import Flask, request, jsonify, Response
-import asyncio
 from enum import Enum
+
+from core.event_loop import run_async
 
 logger = logging.getLogger(__name__)
 
@@ -148,11 +149,14 @@ class A2AMessageHandler:
         message_id = message.get("messageId", str(uuid.uuid4()))
         context_id = message.get("contextId", str(uuid.uuid4()))
 
-        # Extract message content
+        # Extract message content. A2A 0.2.x names a part's discriminator
+        # "kind"; this node's own clients (peer_reuse, hart CLI) still send
+        # the pre-0.2 "type". Read both, or a spec-conformant peer's text
+        # reaches the executor as an empty prompt.
         parts = message.get("parts", [])
         message_text = ""
         for part in parts:
-            if part.get("type") == "text":
+            if part.get("kind", part.get("type")) == "text":
                 message_text += part.get("text", "")
 
         # Create task
@@ -370,8 +374,19 @@ class A2AProtocolServer:
             return jsonify(agent_card.to_dict())
 
         @self.app.route('/a2a/<agent_id>/jsonrpc', methods=['POST'])
-        async def handle_jsonrpc(agent_id):
-            """JSON-RPC endpoint for A2A messages"""
+        def handle_jsonrpc(agent_id):
+            """JSON-RPC endpoint for A2A messages.
+
+            A SYNC view on purpose. Flask runs an ``async def`` view through
+            asgiref's async_to_sync, and asgiref is not installed (not in
+            any requirements file, not frozen), so an async view raised
+            before its body ran and every POST -- the 404 / 400 JSON-RPC
+            error branches included -- answered Flask's HTML 500. The
+            handler coroutines are driven by core.event_loop.run_async, the
+            canonical sync->async runner; the WSGI server calls this view on
+            a worker thread (waitress thread / hypercorn run_in_executor),
+            which has no running loop of its own.
+            """
             if agent_id not in self.message_handlers:
                 return jsonify({
                     "jsonrpc": "2.0",
@@ -396,11 +411,11 @@ class A2AProtocolServer:
 
                 # Route to appropriate handler
                 if method == "message/send":
-                    result = await handler.handle_message_send(params)
+                    result = run_async(handler.handle_message_send(params))
                 elif method == "message/get":
-                    result = await handler.handle_message_get(params)
+                    result = run_async(handler.handle_message_get(params))
                 elif method == "task/cancel":
-                    result = await handler.handle_task_cancel(params)
+                    result = run_async(handler.handle_task_cancel(params))
                 else:
                     return jsonify({
                         "jsonrpc": "2.0",

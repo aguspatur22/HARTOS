@@ -19,11 +19,10 @@ Covers the directive's four legs:
       zero network calls when the flag is off
   (d) invoke_peer_agent happy + failure envelopes
 
-The JSON-RPC invoke tests use a minimal sync Flask app that serves
-the exact wire envelopes A2ATask.to_dict / the jsonrpc route produce
-(the real route is an async view; this env has no flask[async]).
+The JSON-RPC invoke tests use a minimal Flask app that serves the
+exact wire envelopes A2ATask.to_dict / the jsonrpc route produce; the
+REAL jsonrpc route is driven end to end in TestJsonRpcRouteUnauthenticated.
 """
-import asyncio
 import json
 import os
 import sys
@@ -442,15 +441,15 @@ class TestInvokePeerAgent:
 # These exercise the REAL Flask routes an untrusted peer can reach with no
 # credentials:
 #   - GET  /a2a/<agent_id>/recipe   (sync)  -> _safe_filename traversal gate
-#   - POST /a2a/<agent_id>/jsonrpc  (async) -> unknown-agent / unknown-method
+#   - POST /a2a/<agent_id>/jsonrpc  (sync)  -> unknown-agent / unknown-method
 #                                              routing + unauthenticated exec
-# The recipe route runs through the full werkzeug stack via test_client so
-# the "'..' after URL-decode" case is genuinely decoded by the router, not
-# hand-fed. The jsonrpc route is an ``async def`` view and this env has no
-# flask[async] (asgiref absent), so it is driven by running the REAL route
-# coroutine (``app.view_functions['handle_jsonrpc']``) under asyncio.run
-# inside a real request context; the only mock is the agent-executor
-# boundary (a spy coroutine).
+# Both routes run through the full werkzeug + Flask dispatch stack via
+# test_client, exactly as a peer's POST does. The jsonrpc route used to be
+# an ``async def`` view; Flask dispatches those through asgiref, which is
+# not installed, so EVERY live POST (404/400 branches included) came back
+# as an HTML 500. These tests used to call the view coroutine directly under
+# asyncio.run, which bypassed Flask's dispatch and hid that. The only mock
+# is the agent-executor boundary (a spy coroutine).
 # ---------------------------------------------------------------------------
 
 
@@ -523,23 +522,27 @@ class TestJsonRpcRouteUnauthenticated:
 
         server.register_agent('agentX_0', 'X', 'd', [{'id': 's'}], spy)
         server.setup_routes()
-        return app, app.view_functions['handle_jsonrpc'], calls
+        return app, None, calls
 
     @staticmethod
     def _run(app, view, agent_id, *, json_body=None, raw_data=None,
              content_type=None):
+        """POST through Flask's real dispatch (test_client), as a peer does.
+
+        Every jsonrpc answer, error branches included, must be a JSON-RPC
+        envelope with a JSON content type -- never Flask's HTML 500 page.
+        """
         kw = {}
         if json_body is not None:
             kw['json'] = json_body
         if raw_data is not None:
             kw['data'] = raw_data
             kw['content_type'] = content_type or 'text/plain'
-        with app.test_request_context(
-                f'/a2a/{agent_id}/jsonrpc', method='POST', **kw):
-            resp = asyncio.run(view(agent_id))
-            status = resp[1] if isinstance(resp, tuple) else 200
-            body = (resp[0] if isinstance(resp, tuple) else resp).get_json()
-        return status, body
+        resp = app.test_client().post(f'/a2a/{agent_id}/jsonrpc', **kw)
+        assert resp.mimetype == 'application/json', (
+            f'jsonrpc answered {resp.status_code} {resp.mimetype}: '
+            f'{resp.get_data(as_text=True)[:200]}')
+        return resp.status_code, resp.get_json()
 
     def test_unknown_agent_returns_404_envelope(self):
         app, view, calls = self._server_with_agent()
@@ -588,6 +591,23 @@ class TestJsonRpcRouteUnauthenticated:
         assert result['content']['parts'][0]['text'] == 'ran:attacker input'
         assert calls == [('attacker input', result['contextId'])]
         assert body['id'] == '7'
+
+    def test_message_send_reads_a2a_kind_text_parts(self):
+        # A2A 0.2.x spells a part's discriminator 'kind'; the local
+        # clients (peer_reuse, hart CLI) still send the legacy 'type'.
+        # Both must reach the executor; a 'kind' part must not arrive
+        # as an empty prompt.
+        app, view, calls = self._server_with_agent()
+        status, body = self._run(
+            app, view, 'agentX_0',
+            json_body={'method': 'message/send', 'id': '8', 'params': {
+                'message': {'messageId': 'm2',
+                            'parts': [{'kind': 'text', 'text': 'spec '},
+                                      {'type': 'text', 'text': 'legacy'},
+                                      {'kind': 'file', 'text': 'ignored'}]}}})
+        assert status == 200
+        assert calls == [('spec legacy', body['result']['contextId'])]
+        assert body['result']['content']['parts'][0]['text'] ==             'ran:spec legacy'
 
     def test_malformed_body_returns_clean_jsonrpc_error_not_crash(self):
         # request.json raises (415 UnsupportedMediaType) inside the try.
