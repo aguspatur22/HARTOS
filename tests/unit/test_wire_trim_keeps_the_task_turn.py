@@ -116,6 +116,55 @@ def test_unnamed_bodies_are_unchanged(monkeypatch):
     assert out == [sys_m, newest]
 
 
+def _two_large_protected(task_words, anchor_words):
+    """[system, user/User task, assistant, user/Assistant result, assistant]:
+    the StatusVerifier seat's shape, where the newest user turn is the
+    Assistant's result (the anchor) and the task is the user's input."""
+    sys_m = _sys()
+    task = _task('TASKHEAD ' + 'task ' * task_words + ' TASKTAIL')
+    anchor = {'role': 'user', 'name': 'Assistant',
+              'content': 'RESULTHEAD ' + 'result ' * anchor_words
+                         + ' RESULTTAIL'}
+    msgs = [sys_m, task, _bulk('assistant', 'a1'), anchor,
+            {'role': 'assistant', 'content': 'ok'}]
+    return sys_m, task, anchor, msgs
+
+
+def test_only_the_larger_protected_message_is_cut_when_that_suffices(
+        monkeypatch):
+    """Review of bac8f91c4, measured with a probe: the anchor was truncated
+    FIRST, its room computed with the big task still at full size, so it fell
+    to the 64-token floor -- then the task was cut anyway and budget was left
+    unused.  The verifier lost the head of the result it had to check.  When
+    cutting only the larger message fits, the smaller must stay whole."""
+    sys_m, task, anchor, msgs = _two_large_protected(3000, 400)
+    # Room for the whole anchor plus a slice of the task, not the whole task.
+    keep = [sys_m, _task('task ' * 200), anchor,
+            {'role': 'assistant', 'content': 'ok'}]
+    out, est_after, budget = _trim_so_that_only(keep, msgs, monkeypatch)
+    kept_anchor = [m for m in out if m.get('name') == 'Assistant']
+    kept_task = [m for m in out if m.get('name') == 'User']
+    assert kept_anchor and kept_anchor[0]['content'] == anchor['content'], (
+        'the result the verifier must check was cut although cutting only '
+        'the larger task turn fits')
+    assert kept_task and kept_task[0]['content'].startswith(WIRE_TRIM_MARKER)
+    assert est_after <= budget
+
+
+def test_the_mirror_case_keeps_the_smaller_task_whole(monkeypatch):
+    """Same rule the other way round, so no iteration order can pass both."""
+    sys_m, task, anchor, msgs = _two_large_protected(400, 3000)
+    keep = [sys_m, task, {'role': 'user', 'name': 'Assistant',
+                          'content': 'result ' * 200},
+            {'role': 'assistant', 'content': 'ok'}]
+    out, est_after, budget = _trim_so_that_only(keep, msgs, monkeypatch)
+    kept_task = [m for m in out if m.get('name') == 'User']
+    kept_anchor = [m for m in out if m.get('name') == 'Assistant']
+    assert kept_task and kept_task[0]['content'] == task['content']
+    assert kept_anchor and kept_anchor[0]['content'].startswith(WIRE_TRIM_MARKER)
+    assert est_after <= budget
+
+
 def test_an_oversized_task_turn_is_truncated_not_left_over_budget(monkeypatch):
     """Protecting the task must not make the trim unable to fit: a task that
     alone exceeds the budget is left-truncated with the marker, as the

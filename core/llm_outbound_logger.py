@@ -1054,10 +1054,21 @@ def _trim_to_budget(body: dict) -> tuple:
     # on the installed build: system+anchor ~5597 tok against budget 3840 —
     # every trim ended in the STILL-over error below and llama-server rejected
     # the turn, 95x in 11 minutes.  Same policy, same helper, applied to each
-    # protected message (the newest-user anchor first, then the task turn):
-    # protecting a message from the drop must never make the trim unable to
-    # fit it.
-    for p in protected:
+    # protected message: protecting a message from the drop must never make
+    # the trim unable to fit it.
+    #
+    # LARGEST FIRST.  Each message's room is computed with the others at their
+    # current size, so the order decides who is cut.  Anchor-first (the first
+    # cut) sized the anchor against a still-full task, floored it at 64
+    # tokens, then cut the task anyway and left budget unused: measured in the
+    # StatusVerifier seat (review of bac8f91c4), the Assistant's 2.7k-char
+    # result -- the thing the verifier must check -- went to ~224 chars while
+    # the user's 15k-char input was what needed cutting.  Shrinking the larger
+    # message first means the smaller one is only cut when the larger alone
+    # cannot make room.
+    for p in sorted(protected,
+                    key=lambda m: count_tokens_for_messages([m], model),
+                    reverse=True):
         if count_tokens_for_messages(messages, model) <= budget:
             break
         p_idx = next((i for i, m in enumerate(messages) if m is p), None)
