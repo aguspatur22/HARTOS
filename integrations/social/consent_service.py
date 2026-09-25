@@ -436,10 +436,12 @@ class ConsentService:
     @staticmethod
     def request_consent(db, user_id: str, consent_type: str,
                         scope: str = '*', agent_id=None, reason: str = '',
-                        requester_name: str = ''):
+                        requester_name: str = '', reask: bool = False):
         """Create a pending (not yet granted) consent record.
 
         Returns existing record if one already exists for this combination.
+        ``reask`` sends the card again after a grant (a credential the site
+        rejected has to be entered again), but never after a "no".
         ``reason`` rides on the ask, so the card can say what is asked for.
         ``requester_name`` is the person asking when the asker is not an
         agent (a device ask: the phone's owner), shown like agent_name.  It
@@ -497,7 +499,8 @@ class ConsentService:
                 or_(UserConsent.granted == True,
                     UserConsent.revoked_at.isnot(None)),
             ).first()
-            if decided is None:
+            if decided is None or (reask and not ConsentService.declined(
+                    db, user_id, consent_type, scope, agent_id)):
                 _emit('consent.request', ask,
                       msg_id=f'consent.request:{existing.id}')
             return existing

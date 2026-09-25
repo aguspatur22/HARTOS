@@ -114,6 +114,49 @@ def test_a_declined_ask_says_so_and_is_not_asked_again(world):
     assert [t for t, _ in world if t == 'consent.request'] == []
 
 
+@pytest.mark.parametrize('agent', ['42', None])
+def test_a_rejected_credential_is_asked_for_again(world, agent):
+    """Owner 2026-09-25: "agent shd ask user when login attempts fails".
+    The stored value was rejected by the site, so the card comes back even
+    though the owner already answered it once (the card's grant writes a
+    row for no agent, the same one consent_api writes)."""
+    from hartos.ai_key_vault import get_ai_key_vault, request_credential
+    from integrations.social.consent_service import ConsentService
+    request_credential(ASK, agent_id=agent)
+    get_ai_key_vault().store_credential('site_password', SECRET)
+    with db_session(commit=True) as db:
+        ConsentService.grant_consent(db, OWNER, 'credential', 'secret:SITE_PASSWORD')
+    world.clear()
+
+    out = request_credential(ASK[:-1] + ', "rejected": true}', agent_id=agent)
+    assert SECRET not in out
+    assert '{{secret:SITE_PASSWORD}}' in out
+    assert 'Asked the owner' in out
+    requests = [d for t, d in world if t == 'consent.request']
+    assert len(requests) == 1
+    assert requests[0]['scope'] == 'secret:SITE_PASSWORD'
+    assert 'rejected' in requests[0]['reason']
+
+
+def test_the_alias_answer_says_how_to_report_a_rejection(world):
+    from hartos.ai_key_vault import get_ai_key_vault, request_credential
+    get_ai_key_vault().store_credential('site_password', SECRET)
+    assert '"rejected": true' in request_credential(ASK, agent_id='42')
+
+
+def test_a_rejection_after_the_owner_said_no_is_not_asked_again(world):
+    from hartos.ai_key_vault import request_credential
+    from integrations.social.consent_service import ConsentService
+    request_credential(ASK, agent_id='42')
+    with db_session(commit=True) as db:
+        ConsentService.revoke_consent(db, OWNER, 'credential',
+                                      'secret:SITE_PASSWORD', '42')
+    world.clear()
+    out = request_credential(ASK[:-1] + ', "rejected": true}', agent_id='42')
+    assert 'said no' in out
+    assert [t for t, _ in world if t == 'consent.request'] == []
+
+
 def test_with_no_owner_nothing_is_filed(world, monkeypatch):
     from hartos.ai_key_vault import request_credential
     monkeypatch.delenv('HEVOLVE_OWNER_USER_ID')

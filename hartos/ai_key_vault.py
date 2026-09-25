@@ -392,9 +392,13 @@ def request_credential(resource_description, agent_id=None) -> str:
                                  req.get('channel_type') or '')
     alias = '{{secret:' + name + '}}'
     use = (f"use {alias} wherever the value is needed: it is filled in only "
-           f"when a tool runs, and you never see it. Do not ask for it in chat.")
+           f"when a tool runs, and you never see it. Do not ask for it in chat. "
+           f"If signing in with it fails, call this tool again with the same "
+           f'key_name and "rejected": true, and the owner is asked for it again.')
+    # The site refused the stored value: never hand it back, ask again.
+    rejected = req.get('rejected') is True
 
-    if vault.get_tool_key(name):
+    if vault.get_tool_key(name) and not rejected:
         return f"'{label}' is stored on this computer. To use it, {use}"
 
     # The pending list behind /api/credentials/pending.
@@ -413,7 +417,8 @@ def request_credential(resource_description, agent_id=None) -> str:
                 f"computer who could provide it.")
 
     reason = ' '.join(filter(None, [
-        f"{label} is needed for {used_by}.",
+        (f"{label} was rejected when {used_by} tried it; enter it again."
+         if rejected else f"{label} is needed for {used_by}."),
         str(req.get('description') or '').strip(),
         f"It is kept encrypted on this computer; the agent only sees {alias}.",
     ]))
@@ -424,26 +429,23 @@ def request_credential(resource_description, agent_id=None) -> str:
         from integrations.vlm.safety import _known_agent
         agent = _known_agent(agent_id)
         scope = CREDENTIAL_SCOPE_PREFIX + name
+        # Only reached with no usable value (missing, or rejected), so an
+        # earlier Accept does not settle it: ask again unless the owner said
+        # no.  request_consent keeps one row, so the card is still one card.
         with db_session(commit=True) as db:
-            if ConsentService.check_or_request(db, owner, 'credential',
+            declined = ConsentService.declined(db, owner, 'credential',
+                                               scope=scope, agent_id=agent)
+            if not declined:
+                ConsentService.request_consent(db, owner, 'credential',
                                                scope=scope, agent_id=agent,
-                                               reason=reason):
-                answer = 'allowed'
-            elif ConsentService.declined(db, owner, 'credential',
-                                         scope=scope, agent_id=agent):
-                answer = 'declined'
-            else:
-                answer = 'asked'
+                                               reason=reason, reask=True)
     except Exception:
         logger.exception("credential %s could not be asked for", name)
         return (f"Could not ask for '{label}': the permission system is "
                 f"unavailable.")
 
-    if answer == 'declined':
+    if declined:
         return f"The owner of this computer said no to providing '{label}'."
-    if answer == 'allowed':
-        return (f"'{label}' was allowed before but is not stored on this "
-                f"computer now; the owner has to enter it again.")
     return (f"Asked the owner of this computer for '{label}' on the consent "
             f"card. Once they enter it, {use}")
 
