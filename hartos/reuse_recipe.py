@@ -3649,11 +3649,12 @@ def _reuse_is_pipeline_text(content):
     differently:
 
       _build_reuse_action_message   the dispatch alone — actions 2..N
-      _reuse_seed_message           ``f"{message}\\n\\n{dispatch}"`` — the
-                                    opening turn put the USER'S WORDS first
-                                    until 2026-09-25; it now leads with the
-                                    dispatch (lifecycle_hooks.dispatch_action_id
-                                    reads only a leading marker), but a model
+      _reuse_seed_message           the opening turn put the USER'S WORDS
+                                    first until 2026-09-25; it is now the
+                                    marker line, the user's words, then the
+                                    steps (lifecycle_hooks.dispatch_action_id
+                                    reads only a leading marker, and the token
+                                    cap keeps a message's head), but a model
                                     echo can still carry it anywhere
 
     Measured live 2026-09-10 10:05:25 (agent 88094979291): the second shape
@@ -6772,9 +6773,18 @@ def _reuse_seed_message(user_prompt, message):
     # search came back empty: live 2026-09-25, 42 "[REUSE-VERIFY] ... no
     # canonical receipt" lines across 14 sessions, all action 1, 0 advances.
     # Same shape as CREATE's [EXECUTE-PENDING] dispatch (marker, then text).
+    # The user's words go BETWEEN the marker line and the steps, not after
+    # the whole dispatch: every reuse context chain runs helper.token_limiter
+    # at AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, and autogen keeps the HEAD of a
+    # message, so text placed after the steps is what the cap cuts.  Measured
+    # on the banked recipes (review of 9adccbcaf): action 1's steps alone run
+    # to 1547 tokens, and dispatch-first cut the user's request off the wire.
+    # The steps are the redundant part (the recipe is also in the system
+    # prompt), so they sit last, where the cap eats them first.
     try:
         current_action_id = user_tasks[user_prompt].current_action
-        seeded = f"{_build_reuse_action_message(user_prompt, current_action_id)}\n\n{message}"
+        seeded = _build_reuse_action_message(
+            user_prompt, current_action_id, user_words=message)
         current_app.logger.info(
             f"[REUSE-SEED] seeded action {current_action_id} "
             f"(+{len(seeded) - len(message)} chars)")
@@ -6786,8 +6796,16 @@ def _reuse_seed_message(user_prompt, message):
         return message
 
 
-def _build_reuse_action_message(user_prompt, action_id):
-    """Build the action execution message for REUSE mode."""
+def _build_reuse_action_message(user_prompt, action_id, user_words=None):
+    """Build the action execution message for REUSE mode.
+
+    ONE format for every dispatch: the marker line first (the only thing
+    ``lifecycle_hooks.dispatch_action_id`` reads), the steps last.
+    ``user_words`` is for the opening turn only (``_reuse_seed_message``): it
+    goes between the two, so the per-message token cap -- which keeps a
+    message's head -- cuts the redundant steps before the user's request.
+    Without it (actions 2..N) the message is byte-identical to before.
+    """
     action_message = user_tasks[user_prompt].get_action(action_id - 1)['action']
     recipe_actions = recipes[user_prompt].get('actions', [])
     if action_id - 1 < len(recipe_actions):
@@ -6806,8 +6824,10 @@ def _build_reuse_action_message(user_prompt, action_id):
     else:
         steps = []
         current_app.logger.warning(f"[REUSE] No recipe for action {action_id} — executing without steps")
-    return (f"{_REUSE_ACTION_MESSAGE_PREFIX}{action_id}:{action_message}"
-            f"\n follow these steps: {steps}")
+    head = f"{_REUSE_ACTION_MESSAGE_PREFIX}{action_id}:{action_message}"
+    if user_words:
+        head = f"{head}\n\n{user_words}"
+    return f"{head}\n follow these steps: {steps}"
 
 
 # A registry tool name as `attach_for_names` compares it.  MOVED to

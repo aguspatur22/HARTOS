@@ -122,5 +122,70 @@ class ReuseSeedOpensActionOneWindow(unittest.TestCase):
                                       'kind': 'tool_receipt'}}))
 
 
+class ReuseSeedSurvivesThePerMessageTokenCap(unittest.TestCase):
+    """What reaches the MODEL, not what sits in group_chat.messages.
+
+    Review of 9adccbcaf (measured on the banked recipes): every reuse context
+    chain runs helper.token_limiter with AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE,
+    and autogen's truncation keeps the HEAD of a message.  Dispatch-first put
+    the steps (up to 1547 tokens for action 1 in the banked recipes) ahead of
+    the user's words, so the cap cut the user's request off the wire.  The
+    steps are the redundant part -- the recipe is also in the system prompt --
+    so they must be what the cap eats.
+    """
+
+    def setUp(self):
+        self._saved_task = reuse_recipe.user_tasks.get(_UP)
+        reuse_recipe.user_tasks[_UP] = _FakeTask()
+        # A long banked recipe: far more than one message's token cap.
+        reuse_recipe.recipes[_UP] = {'actions': [{'recipe': [
+            {'steps': f'step {i}: look up source {i} and note its figure',
+             'tool_name': _TOOL,
+             'generalized_functions': f'def f{i}(x):\n    return x * {i}\n'}
+            for i in range(120)]}]}
+        app = types.SimpleNamespace(logger=mock.MagicMock())
+        self._app = mock.patch.object(reuse_recipe, 'current_app', app)
+        self._app.start()
+        self.seed = reuse_recipe._reuse_seed_message(_UP, _USER_TEXT)
+
+    def tearDown(self):
+        self._app.stop()
+        if self._saved_task is None:
+            reuse_recipe.user_tasks.pop(_UP, None)
+        else:
+            reuse_recipe.user_tasks[_UP] = self._saved_task
+        reuse_recipe.recipes.pop(_UP, None)
+
+    def _on_the_wire(self):
+        from core.constants import (AUTOGEN_MESSAGE_TOKEN_BUDGET,
+                                    AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE)
+        from hartos import helper
+        limiter = helper.token_limiter(
+            max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET,
+            max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE,
+            min_tokens=0)
+        out = limiter.apply_transform(
+            [{'role': 'user', 'name': 'UserProxy', 'content': self.seed}])
+        return out[0]['content']
+
+    def test_precondition_the_seed_really_exceeds_the_cap(self):
+        """Without this the test below could pass by never truncating."""
+        self.assertNotEqual(self._on_the_wire(), self.seed)
+
+    def test_the_users_words_survive_the_cap(self):
+        self.assertIn(_USER_TEXT, self._on_the_wire())
+
+    def test_the_truncated_seed_is_still_the_action_1_dispatch(self):
+        self.assertEqual(lh.dispatch_action_id(self._on_the_wire()), 1)
+
+    def test_actions_2_to_n_are_byte_identical(self):
+        """The dispatch builder's other caller must not change at all."""
+        msg = reuse_recipe._build_reuse_action_message(_UP, 1)
+        self.assertTrue(msg.startswith(
+            f"{reuse_recipe._REUSE_ACTION_MESSAGE_PREFIX}1:{_ACTION}"
+            "\n follow these steps: "))
+        self.assertNotIn(_USER_TEXT, msg)
+
+
 if __name__ == '__main__':
     unittest.main()
