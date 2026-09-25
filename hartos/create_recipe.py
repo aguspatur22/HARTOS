@@ -5844,8 +5844,9 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
     action recipe in 3 weeks), so every restart re-walked from Action 1 and
     no flow ever reached the completion charge.
 
-    Trace-derived banking records what really ran — only the executed tool
-    calls, never fabricated steps. An action with NO tool work banks an
+    Trace-derived banking records what really ran — the tool calls that did
+    not fail and the code blocks the Executor ran with exitcode 0, never
+    fabricated steps. An action with NO such work banks an
     explicit no-op marker (the 2026-06-04 "synthesis poisons validator"
     guard). Must only be called IN-RUN: the trace lives in this dispatch's
     group_chat and is gone after a restart. Returns True if banked.
@@ -5888,14 +5889,35 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
                 if isinstance(cj, str) and 'Execute Action ' in cj:
                     end = j
                     break
+            # Only work that SUCCEEDED is a step (CR3, live 2026-09-25).  Two
+            # kinds of work run in the group chat:
+            #  * a tool call, answered by a tool message whose tool_responses
+            #    carry the call's id.  A reply that opens with a failure
+            #    prefix means the call did nothing: "Error: ..." is what the
+            #    executor (hartos/helper.py enhanced_execute_function) answers
+            #    for an unknown function, bad arguments or a raise, and "Tool
+            #    execution failed: " is core.tool_logging's error envelope.
+            #    Banking those made a failed save_data_in_memory the recipe.
+            #  * a code block the Executor ran: the Assistant posts ```lang
+            #    fences and the Executor answers "exitcode: 0 ...".  Reading
+            #    only tool_calls dropped this work, so a code-only action
+            #    banked "no-op" and REUSE had no code to replay.
+            _FAILED_REPLY_PREFIXES = ('Error:', 'Tool execution failed:')
+            from autogen.code_utils import extract_code, UNKNOWN
+            window = [m for m in msgs[start:end] if isinstance(m, dict)]
+            failed_ids = set()
+            for m in window:
+                for r in (m.get('tool_responses') or []):
+                    if (isinstance(r, dict) and r.get('tool_call_id')
+                            and str(r.get('content') or '').lstrip()
+                            .startswith(_FAILED_REPLY_PREFIXES)):
+                        failed_ids.add(r['tool_call_id'])
             found = []
-            for m in msgs[start:end]:
-                if not isinstance(m, dict):
-                    continue
+            for k, m in enumerate(window):
                 for tc in (m.get('tool_calls') or []):
                     fn = (tc.get('function') or {}) if isinstance(tc, dict) else {}
                     nm = fn.get('name', '')
-                    if not nm:
+                    if not nm or tc.get('id') in failed_ids:
                         continue
                     found.append({
                         'steps': f"{nm}({str(fn.get('arguments') or '')[:400]})",
@@ -5903,6 +5925,25 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
                         'generalized_functions': '',
                         'agent_to_perform_this_action': 'Helper',
                     })
+                c = m.get('content')
+                if not (isinstance(c, str) and c.startswith('exitcode: 0 ')):
+                    continue
+                # The code that ran is the newest earlier message holding a
+                # fenced block -- the one the Executor scanned.
+                for prev in reversed(window[:k]):
+                    blocks = [(lang, code) for lang, code
+                              in extract_code(prev.get('content') or '')
+                              if lang != UNKNOWN]
+                    if blocks:
+                        found.append({
+                            'steps': 'run the code in generalized_functions',
+                            'tool_name': '',
+                            'generalized_functions': '\n\n'.join(
+                                f"```{lang}\n{code}\n```"
+                                for lang, code in blocks),
+                            'agent_to_perform_this_action': 'Executor',
+                        })
+                        break
             return found
 
         # Newest window first: a re-dispatch that did the work supersedes the
@@ -5952,8 +5993,9 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
         try:
             from security.secret_redactor import redact_secrets
             for _ri in json_obj['recipe']:
-                if isinstance(_ri.get('steps'), str):
-                    _ri['steps'], _ = redact_secrets(_ri['steps'])
+                for _rk in ('steps', 'generalized_functions'):
+                    if isinstance(_ri.get(_rk), str):
+                        _ri[_rk], _ = redact_secrets(_ri[_rk])
         except ImportError:
             pass
         name = helper_fun.safe_prompt_path(prompt_id, flow, action_id)
