@@ -558,6 +558,17 @@ ACTION_STATES_AWAITING_USER = frozenset({
     ActionState.PREVIEW_PENDING})
 
 
+def autonomy_needs_user(value):
+    """True when a ``can_perform_without_user_input`` value says the action
+    needs the user.  The CREATE prompt asks for "no" WITH a reason ("no-i
+    need user's likes and dislike"), so the rule is a leading 'no', not
+    equality: 1 of the 15 explicit 'no' values in the banked recipes is
+    'no - requires specific dish constraints, ...'.  A missing value is not
+    a 'no'.  One rule for every reader of the question (the verifier hook
+    here, REUSE's declared-pause check)."""
+    return str(value or '').strip().lower().startswith('no')
+
+
 # ── No-progress stall guard for the CREATE loop ───────────────────────────
 # create_recipe.get_response_group's main loop can spin to its 300-iteration
 # cap (~25 min of wasted compute, observed live) when an action sits in a
@@ -1770,9 +1781,8 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
 
         if status == 'pending':  # Still pending (not overridden)
             if validate_state_transition(user_prompt, current_action_id, ActionState.PENDING):
-                needs_user = str(
-                    json_obj.get('can_perform_without_user_input') or ''
-                ).strip().lower().startswith('no')
+                needs_user = autonomy_needs_user(
+                    json_obj.get('can_perform_without_user_input'))
                 if needs_user:
                     mark_action_waiting_for_user(
                         user_prompt, current_action_id,

@@ -243,6 +243,28 @@ class TestAPauseForTheUserIsNotAFailure:
         assert 'action 2 did not finish' in rec.messages[0]
         assert 'actions 3 to 4 were not reached' in rec.messages[0]
 
+    def test_a_no_with_its_reason_is_still_a_declared_pause(
+            self, rr, lh, monkeypatch):
+        """Review of 8439cd049, measured on a banked recipe: the CREATE prompt
+        asks for 'no' WITH a reason, and one of the 15 explicit values is
+        'no - requires specific dish constraints, ...'.  Equality with 'no'
+        reported that pause as unfinished; the lifecycle hook reads a
+        leading 'no'.  One rule, lifecycle_hooks.autonomy_needs_user."""
+        task = _Task(1)
+        for a in task.actions:
+            a['can_perform_without_user_input'] = (
+                'no - requires specific dish constraints, dietary restrictions')
+        posted, chat, rec = _run(rr, lh, monkeypatch, task,
+                                 lh.ActionState.IN_PROGRESS)
+        assert rec.messages == [] and posted is False, rec.messages
+        assert chat.messages[-1].get('content') == PROMISE
+
+    @pytest.mark.parametrize('value,needs', [
+        ('no', True), ('No - I need the likes of the user', True),
+        (' no', True), ('yes', False), ('', False), (None, False)])
+    def test_the_shared_rule(self, lh, value, needs):
+        assert lh.autonomy_needs_user(value) is needs
+
     def test_the_waiting_states_are_exactly_the_three_the_enum_names(self, lh):
         assert lh.ACTION_STATES_AWAITING_USER == frozenset({
             lh.ActionState.PENDING, lh.ActionState.FALLBACK_REQUESTED,

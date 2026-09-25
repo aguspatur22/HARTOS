@@ -349,7 +349,7 @@ from hartos.lifecycle_hooks import (
     sync_action_state_to_ledger, register_ledger_for_session,
     ActionState, safe_set_state, force_state_through_valid_path, get_action_state,
     clear_action_states, settled_action_id, commit_verified_action_completion,
-    dispatch_action_id, ACTION_STATES_AWAITING_USER,
+    dispatch_action_id, ACTION_STATES_AWAITING_USER, autonomy_needs_user,
 )
 from hartos.cultural_wisdom import get_cultural_prompt
 
@@ -4106,24 +4106,27 @@ def _reuse_action_is_autonomous(user_prompt, action_id):
 
 def _reuse_action_autonomy(user_prompt, action_id):
     """The action's ``can_perform_without_user_input``, lower-cased; '' when
-    absent or unreadable.  The one reader of that field for the two questions
-    asked of it: "may the walk advance on its own?" (only on an explicit
-    'yes') and "did the recipe say this action stops for the user?" (only on
-    an explicit 'no', see _reuse_action_declares_user_pause)."""
+    absent or unreadable.  Read from the session's task, for the two
+    questions asked of it: "may the walk advance on its own?" (only on an
+    explicit 'yes') and "did the recipe say this action stops for the user?"
+    (a leading 'no', lifecycle_hooks.autonomy_needs_user; see
+    _reuse_action_declares_user_pause).  The recipe-dict subscripts in the
+    time and timer paths read the same field from the recipe itself."""
     try:
         action = user_tasks[user_prompt].actions[action_id - 1]
-        return str(action.get('can_perform_without_user_input', '')).lower()
+        return str(action.get('can_perform_without_user_input', '')).strip().lower()
     except Exception:
         return ''
 
 
 def _reuse_action_declares_user_pause(user_prompt, action_id):
     """True only when the recipe explicitly marks the action as needing the
-    user ('no').  A missing field is NOT a declared pause: reading it as one
+    user: a leading 'no', usually followed by the reason the CREATE prompt
+    asks for ('no - requires specific dish constraints').  A missing field is NOT a declared pause: reading it as one
     silenced the incomplete report for every recipe without the field
     (review of b6ac59c89: 52 of 1062 banked actions, 25 whole recipes,
     including agent 88094979291 whose four actions all lack it)."""
-    return _reuse_action_autonomy(user_prompt, action_id) == 'no'
+    return autonomy_needs_user(_reuse_action_autonomy(user_prompt, action_id))
 
 
 # How far back to look for the StatusVerifier's verdict.  Bounded because
