@@ -37,11 +37,13 @@ logger = logging.getLogger('hevolve.auto_evolve')
 AUTO_EVOLVE_MAX_PARALLEL_DISPATCH = 4
 
 # PRODUCT_MAP §10: super-majority threshold for VOTE stage — candidates must
-# clear 2/3 of the weighted tally, not a simple majority.  Expressed as a
-# fraction of the maximum possible score so callers can still tune per-session
-# via min_approval_score (which is applied as an absolute-score floor in
-# addition to this ratio).
-AUTO_EVOLVE_SUPERMAJORITY_RATIO = 2.0 / 3.0
+# clear 2/3 of the weighted tally, not a simple majority.  The rule itself
+# (quorum + this ratio) lives in voting_rules.approval_verdict, shared with
+# the evaluation-goal writer; this name is kept for existing importers.
+# Callers can still tune per-session via min_approval_score (an absolute-score
+# floor applied in addition to the rule).
+from integrations.social.voting_rules import (  # noqa: E402
+    SUPERMAJORITY_RATIO as AUTO_EVOLVE_SUPERMAJORITY_RATIO)
 
 # How long a dispatched cycle may stay un-terminal before reconcile() closes
 # it out.  This exists because 'paused' is NOT a terminal goal status (six
@@ -466,28 +468,26 @@ class AutoEvolveOrchestrator:
             from integrations.social.models import db_session
             from integrations.social.thought_experiment_service import (
                 ThoughtExperimentService)
+            from integrations.social.voting_rules import approval_verdict
 
             with db_session(commit=False) as db:
                 for exp in candidates:
                     tally = ThoughtExperimentService.tally_votes(
                         db, exp['id'])
                     score = tally.get('weighted_score', 0)
-                    total_for = tally.get('total_for', 0) or 0
-                    total_against = tally.get('total_against', 0) or 0
-                    decisive = total_for + total_against
-                    # Super-majority: ≥ 2/3 of DECISIVE (non-abstain) weight
-                    # must be FOR.  Abstains are excluded from denominator.
-                    super_ratio = (total_for / decisive) if decisive > 0 else 0.0
+                    # The ONE approval rule (voting_rules.approval_verdict):
+                    # quorum of DISTINCT identities -- no single identity
+                    # approves alone, a tally that does not answer fails
+                    # closed -- AND >= 2/3 of DECISIVE weight FOR.  The
+                    # evaluation-goal writer asks the same rule, so ranking
+                    # and dispatch cannot disagree.
+                    verdict = approval_verdict(tally)
+                    super_ratio = verdict['super_majority']
+                    quorate = verdict['quorum_met']
                     exp['_approval_score'] = score
-                    exp['_super_majority'] = round(super_ratio, 4)
+                    exp['_super_majority'] = super_ratio
                     exp['_tally'] = tally
-                    # Quorum of DISTINCT identities (voting_rules): no single
-                    # identity approves alone, however unanimous its vote.
-                    # A tally that does not answer it fails closed.
-                    quorate = tally.get('quorum_met') is True
-                    if (score >= min_score
-                            and super_ratio >= AUTO_EVOLVE_SUPERMAJORITY_RATIO
-                            and quorate):
+                    if score >= min_score and verdict['approved']:
                         scored.append(exp)
                     else:
                         logger.debug(

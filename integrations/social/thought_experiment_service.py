@@ -349,16 +349,39 @@ class ThoughtExperimentService:
         - traditional:  uses LLM scoring (propose → evaluate → refine)
         - physical_ai:  uses visual context (hypothesis → observe → measure)
         - research:     uses web search (search → synthesize → score)
+
+        GATED HERE, for every caller.  The experiment must be approved by
+        the vote (voting_rules.approval_verdict: distinct-identity quorum AND
+        2/3 super-majority), and its lifecycle must be able to reach
+        'evaluating' (advance_status: never backwards from decided/archived).
+        Measured live 2026-09-25 (AE-7): with the gate only in auto-evolve's
+        ranking, one authenticated non-admin POSTed /evaluate on an unvoted
+        experiment and started an autonomous agent goal alone.  A refusal
+        mutates nothing.
         """
         from .models import ThoughtExperiment
+        from .voting_rules import approval_verdict
 
         experiment = db.query(ThoughtExperiment).filter_by(
             id=experiment_id).first()
         if not experiment:
             return {'success': False, 'reason': 'not_found'}
 
-        experiment.status = 'evaluating'
-        db.flush()
+        tally = ThoughtExperimentService.tally_votes(db, experiment_id)
+        verdict = approval_verdict(tally)
+        if not verdict['approved']:
+            return {'success': False, 'reason': 'not_approved',
+                    'verdict': verdict,
+                    'distinct_voters': tally.get('distinct_voters'),
+                    'distinct_supporters': tally.get('distinct_supporters')}
+
+        # advance_status is the ONE writer of the status column; it refuses
+        # to move backwards, so a decided or archived experiment stays closed.
+        if experiment.status != 'evaluating' and not \
+                ThoughtExperimentService.advance_status(
+                    db, experiment_id, 'evaluating'):
+            return {'success': False, 'reason': 'invalid_status',
+                    'current_status': experiment.status}
 
         # ONE live evaluation goal per experiment.  A paused goal is not
         # terminal, so an auto-evolve cycle holding one ages out after 6 h

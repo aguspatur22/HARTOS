@@ -79,6 +79,45 @@ def quorum_met(distinct_voters: int, distinct_supporters: int) -> bool:
             and distinct_supporters >= MIN_DISTINCT_SUPPORTERS)
 
 
+# PRODUCT_MAP §10: at least 2/3 of the DECISIVE (for + against) weight must
+# be FOR.  Abstains are excluded from the denominator.
+SUPERMAJORITY_RATIO = 2.0 / 3.0
+
+
+def approval_verdict(tally: dict) -> dict:
+    """The ONE approval rule for a thought experiment, read from a tally.
+
+    `tally` is ThoughtExperimentService.tally_votes' result.  Approved
+    requires both:
+      - quorum_met is True (a tally that does not answer it fails closed);
+      - total_for / (total_for + total_against) >= SUPERMAJORITY_RATIO.
+
+    Every caller that turns a vote into action asks this: auto-evolve's
+    ranking, and the evaluation-goal writer itself, so no caller can start
+    an agent goal for an experiment the vote has not approved.  A caller may
+    ADD a stricter floor (auto-evolve's min_approval_score); none may skip it.
+
+    Returns {'approved', 'reason', 'quorum_met', 'super_majority'}.
+    """
+    total_for = tally.get('total_for', 0) or 0
+    total_against = tally.get('total_against', 0) or 0
+    decisive = total_for + total_against
+    ratio = (total_for / decisive) if decisive > 0 else 0.0
+    quorate = tally.get('quorum_met') is True
+    if not quorate:
+        reason = 'no_quorum'
+    elif ratio < SUPERMAJORITY_RATIO:
+        reason = 'no_super_majority'
+    else:
+        reason = 'approved'
+    return {
+        'approved': reason == 'approved',
+        'reason': reason,
+        'quorum_met': quorate,
+        'super_majority': round(ratio, 4),
+    }
+
+
 # ─── Context Classification ──────────────────────────────────────────
 
 # Keywords that map to decision contexts (checked against title + hypothesis)
