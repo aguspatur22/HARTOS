@@ -110,3 +110,82 @@ def test_should_run_skips_torch_probe_when_hevolveai_absent():
                 patch.object(sup, '_child_can_import_torch') as probe:
             assert sup.supervisor_should_run() is False
             probe.assert_not_called()
+
+
+# ── a torch the child can FIND but cannot READ (live 2026-09-25) ──────
+# The installed python-embed's sitecustomize puts ~/.nunba/site-packages
+# first; its torch/ carried an Administrators-only ACL, so under the
+# normal (unelevated) token find_spec resolved it and the gate passed,
+# then the child died reading torch/__init__.py with PermissionError and
+# crash-looped 5x per breaker window.  These tests run the REAL probe in a
+# REAL child interpreter against a fake torch package the child can find
+# but cannot open, and a readable control.
+import contextlib  # noqa: E402
+import logging  # noqa: E402
+
+import pytest  # noqa: E402
+
+
+@contextlib.contextmanager
+def _unreadable(path):
+    """Hold ``path`` so no other process can read it, while its directory
+    entry (what find_spec checks) stays visible.  Windows: an open handle
+    with share mode 0 -> any other open fails ERROR_SHARING_VIOLATION
+    (PermissionError, errno 13), exactly the error the live child raised.
+    POSIX: mode 000."""
+    if sys.platform == 'win32':
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        h = k32.CreateFileW(str(path), 0x80000000, 0, None, 3, 0x80, None)
+        if h in (None, wintypes.HANDLE(-1).value):
+            pytest.skip('could not lock the fake torch file exclusively')
+        try:
+            yield
+        finally:
+            k32.CloseHandle(h)
+    else:
+        if hasattr(os, 'geteuid') and os.geteuid() == 0:
+            pytest.skip('root reads mode-000 files')
+        os.chmod(path, 0)
+        try:
+            yield
+        finally:
+            os.chmod(path, 0o644)
+
+
+def _fake_torch(tmp_path, monkeypatch):
+    pkg = tmp_path / 'torch'
+    pkg.mkdir()
+    init = pkg / '__init__.py'
+    init.write_text('x = 1\n')
+    # The probe inherits this env; PYTHONPATH puts the fake torch ahead of
+    # any real one, as sitecustomize put ~/.nunba/site-packages first.
+    monkeypatch.setenv('PYTHONPATH', str(tmp_path))
+    # Probe THIS interpreter, never a dev hevolveai checkout's pinned one.
+    monkeypatch.setattr(sup, '_resolve_repo_root', lambda: None)
+    monkeypatch.setattr(sup, '_resolve_python_exe', lambda: sys.executable)
+    _reset_cache()
+    return init
+
+
+def test_torch_probe_true_for_a_readable_torch(tmp_path, monkeypatch):
+    _fake_torch(tmp_path, monkeypatch)
+    assert sup._child_can_import_torch() is True
+
+
+def test_torch_probe_false_when_child_finds_torch_but_cannot_read_it(
+        tmp_path, monkeypatch, caplog):
+    init = _fake_torch(tmp_path, monkeypatch)
+    with _unreadable(init), caplog.at_level(logging.INFO,
+                                             logger='hevolve_agent_engine'):
+        verdict = sup._child_can_import_torch()
+    assert verdict is False
+    # Actionable: the operator is told WHICH file and WHY, not just "no torch".
+    text = caplog.text
+    assert str(init) in text or repr(str(init))[1:-1] in text
+    assert 'errno 13' in text.lower()

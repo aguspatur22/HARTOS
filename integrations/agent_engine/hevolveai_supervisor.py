@@ -315,6 +315,29 @@ def _resolve_repo_python() -> Optional[str]:
 # None = not yet probed; True/False = the cached result for this process.
 _CHILD_TORCH_OK: Optional[bool] = None
 
+# What the probe runs in the child interpreter.  Finding torch is not
+# enough: find_spec only sees the directory entry.  Live 2026-09-25 the
+# child resolved ~/.nunba/site-packages/torch (first on sys.path via the
+# embed's sitecustomize), whose files had an Administrators-only ACL, so
+# find_spec passed and the child then died reading torch/__init__.py with
+# PermissionError, 5x per breaker window.  Opening the resolved origin is
+# the read the child's import does first; it proves that without paying
+# for a full torch import.  Exit 3 = not found, 4 = found but unreadable
+# (origin + errno printed for the supervisor's log).
+_TORCH_PROBE_SNIPPET = (
+    "import importlib.util as u, sys\n"
+    "s = u.find_spec('torch')\n"
+    "if s is None:\n"
+    "    print('torch not found'); sys.exit(3)\n"
+    "if s.origin and s.has_location:\n"
+    "    try:\n"
+    "        open(s.origin, 'rb').close()\n"
+    "    except OSError as e:\n"
+    "        print('torch at %s is not readable: errno %s %s'"
+    " % (s.origin, e.errno, e.strerror)); sys.exit(4)\n"
+    "print('torch at %s' % s.origin)\n"
+)
+
 
 def _child_can_import_torch() -> bool:
     """True when the CHILD interpreter can resolve ``torch``.
@@ -337,8 +360,10 @@ def _child_can_import_torch() -> bool:
     normally.  This is a POSITIVE capability gate, not an OS check: the
     brain auto-enables on any box where the child can import torch.
 
-    One short, cached subprocess per process (``find_spec`` only -- does
-    not load torch).  Conservative: any probe failure / timeout ->
+    One short, cached subprocess per process (``_TORCH_PROBE_SNIPPET``:
+    find_spec, then open the resolved ``torch/__init__.py`` -- does not
+    load torch).  A torch the child finds but cannot read fails the gate
+    and the log names the file and errno.  Conservative: any probe failure / timeout ->
     unavailable, so a flaky probe never starts a crash-looping child.
     macOS incident 2026-06-16: the post-build ``Nunba --validate`` smoke
     test spawned this brain, which crash-looped on ``import torch`` (torch
@@ -349,6 +374,7 @@ def _child_can_import_torch() -> bool:
     if _CHILD_TORCH_OK is not None:
         return _CHILD_TORCH_OK
     verdict = False
+    _probe_exe: Optional[str] = None
     try:
         from core.subprocess_safe import run_bounded
         # Probe the interpreter that will ACTUALLY run the child: the
@@ -359,22 +385,23 @@ def _child_can_import_torch() -> bool:
             if _repo_py:
                 _probe_exe = _repo_py
         res = run_bounded(
-            [_probe_exe, '-c',
-             "import importlib.util as u, sys; "
-             "sys.exit(0 if u.find_spec('torch') else 3)"],
+            [_probe_exe, '-c', _TORCH_PROBE_SNIPPET],
             timeout=30.0,
         )
         verdict = (res.returncode == 0 and not res.timed_out)
+        _detail = (res.stdout or res.stderr or '').strip()[-500:]
     except Exception as e:  # FileNotFoundError / OSError / anything
         logger.warning(
             "hevolveai_supervisor: torch probe failed (%s); treating torch "
             "as unavailable and skipping brain spawn", e)
         verdict = False
+        _detail = ''
     if not verdict:
         logger.info(
             "hevolveai_supervisor: child interpreter (%s) cannot import "
-            "torch; brain spawn disabled (install torch where the child "
-            "resolves it to enable embodied-AI)", _resolve_python_exe())
+            "torch%s; brain spawn disabled (install torch where the child "
+            "resolves it, readable by this user, to enable embodied-AI)",
+            _probe_exe, f' ({_detail})' if _detail else '')
     _CHILD_TORCH_OK = verdict
     return verdict
 
