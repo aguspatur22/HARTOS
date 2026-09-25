@@ -372,3 +372,41 @@ class TestADeferredToolComesBack:
                                ledger) == 1
         assert attach_for_tags({'web'}, helper, assistant, _Registry(),
                                ledger) == 0
+
+
+class TestARequestDoesNotEvictTheActionsOwnTool:
+    """Review of ee79a6fcb, measured: request_tools' fit protected only what
+    it had just attached, so it evicted the action's recipe-named tool that
+    the per-turn fit had protected (crawl4ai_crawl gone after
+    request_tools(delegate_to_specialist)).  One protected set per agent."""
+
+    def test_the_turns_protected_tool_survives_a_request(self, monkeypatch):
+        helper, assistant, _ = _main_leg()
+        attach_for_names(['crawl4ai_crawl'], helper, assistant, _Registry(),
+                         set())
+        # Room for exactly the action's tool plus the one about to be named.
+        probe = autogen.AssistantAgent('Probe', llm_config=dict(_CFG))
+        probe.register_for_llm(
+            name='delegate_to_specialist',
+            description=_delegate_to_specialist.__doc__)(_delegate_to_specialist)
+        room = (_room_for(assistant, {'crawl4ai_crawl'}, slack=0)
+                + _room_for(probe, {'delegate_to_specialist'}, slack=10))
+        monkeypatch.setattr(lol, 'schema_token_room', lambda: room)
+        # The per-turn fit, as REUSE's attach door runs it.
+        fit_schema_to_ctx(assistant, protect={'crawl4ai_crawl'},
+                          turn_protect=True)
+        assert 'crawl4ai_crawl' in helper_tool_names(assistant)
+        discover_and_attach('delegate_to_specialist', helper, assistant,
+                            _EmptyRegistry(), set(),
+                            core_tools=[('delegate_to_specialist',
+                                         _delegate_to_specialist.__doc__,
+                                         _delegate_to_specialist)])
+        on = helper_tool_names(assistant)
+        assert 'delegate_to_specialist' in on, on
+        assert 'crawl4ai_crawl' in on, (
+            "the request evicted the action's own recipe-named tool: %r" % on)
+
+    def test_without_turn_protect_nothing_is_remembered(self):
+        helper, assistant, _ = _main_leg()
+        fit_schema_to_ctx(assistant, protect={'send_message_to_user'})
+        assert not getattr(assistant, '_hart_turn_protect', None)

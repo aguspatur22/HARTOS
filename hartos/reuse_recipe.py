@@ -7372,8 +7372,8 @@ def _attach_named_tools_for_action(user_prompt):
         # never undone by the budget below it.
         from core.agent_tools import fit_schema_to_ctx
         _protect = set(_named or ()) | {'send_message_to_user'}
-        fit_schema_to_ctx(helper, protect=_protect)
-        fit_schema_to_ctx(assistant, protect=_protect)
+        fit_schema_to_ctx(helper, protect=_protect, turn_protect=True)
+        fit_schema_to_ctx(assistant, protect=_protect, turn_protect=True)
         return _nn
     except Exception as err:
         # WARNING, not debug -- same class as d6495f499.  A failure here

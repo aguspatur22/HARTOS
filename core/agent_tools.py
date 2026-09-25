@@ -522,7 +522,7 @@ def defer_helper_schema(helper, names):
     return removed
 
 
-def fit_schema_to_ctx(agent, protect=(), room=None):
+def fit_schema_to_ctx(agent, protect=(), room=None, *, turn_protect=False):
     """Defer tool schemas from ``agent`` until they fit the LIVE n_ctx.
 
     The budget half of :func:`defer_helper_schema`.  That function answers
@@ -596,7 +596,21 @@ def fit_schema_to_ctx(agent, protect=(), room=None):
             room = schema_token_room()
         room = int(room)
 
-        keep_first = {'request_tools'} | {str(p) for p in (protect or ()) if p}
+        # ONE protected set per agent across every fit of a turn.  The
+        # per-turn fit (turn_protect=True, REUSE's per-action attach door)
+        # records the action's own recipe-named tools on the agent; every
+        # later fit in the turn protects them too.  Without it a request_tools
+        # fit, protecting only what it had just attached, evicted the action's
+        # own tool from the Assistant (review of ee79a6fcb, measured:
+        # crawl4ai_crawl gone after request_tools(delegate_to_specialist)).
+        asked = {str(p) for p in (protect or ()) if p}
+        if turn_protect:
+            try:
+                agent._hart_turn_protect = set(asked)
+            except Exception:
+                pass
+        keep_first = ({'request_tools'} | asked
+                      | set(getattr(agent, '_hart_turn_protect', None) or ()))
 
         def _rank(item):
             idx, entry = item
