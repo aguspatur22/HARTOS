@@ -3882,6 +3882,95 @@ def safe_function_call(func, arguments):
         raise e
 
 
+def tool_argument_error(func, func_name, arguments, repaired):
+    """Why ``arguments`` cannot be given to ``func`` as keywords, or None.
+
+    A dict is bound to the tool's own signature (``inspect.signature`` follows
+    the ``__wrapped__`` chain of autogen's and core.tool_logging's wrappers to
+    the real closure).  Lists and scalars keep safe_function_call's handling
+    and are not checked here; neither is a tool whose signature cannot be read.
+
+    ``repaired`` says the arguments did not parse as JSON and were recovered by
+    retrieve_json.  json_repair reads an unquoted string value as a run of
+    bare ``key: value`` pairs: live 2026-09-22 08:23:01, ``{"text": Financial
+    Dashboard ... - Consulting: $5,000 ...}`` became ``{"text": "...$10",
+    "Consulting": "5,000", ...}`` and the tool raised "unexpected keyword
+    argument 'Consulting'", which reads as a naming mistake.  So a repaired
+    call that does not bind is reported as broken JSON, with the keys that
+    could be read shown as what was received, not as names to fix.
+    """
+    if not isinstance(arguments, dict):
+        return None
+    import inspect
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError):
+        return None
+    try:
+        sig.bind(**arguments)
+        return None
+    except TypeError:
+        pass
+    params = [p for p in sig.parameters.values()
+              if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)]
+    takes_any = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
+    names = {p.name for p in params}
+    missing = [p.name for p in params
+               if p.default is p.empty and p.name not in arguments]
+    unknown = [] if takes_any else [k for k in arguments if k not in names]
+    expected = ', '.join(p.name + (' (required)' if p.default is p.empty else '')
+                         for p in params) or 'none'
+    if repaired:
+        text = (f"Error: the arguments for {func_name} were not valid JSON, so "
+                f"{func_name} was not run. Every string value must be in "
+                f"double quotes, with any double quote inside it written as "
+                f"\\\" and any line break as \\n. What could be read from "
+                f"them had the keys: {', '.join(map(str, arguments)) or 'none'}.")
+    else:
+        text = f"Error: {func_name} was not run."
+        if unknown:
+            text += f" Unknown argument(s): {', '.join(map(str, unknown))}."
+    if missing:
+        text += f" Missing required argument(s): {', '.join(missing)}."
+    return (text + f" Expected parameters: {expected}. Call {func_name} again "
+            f"with one JSON object using these names.")
+
+
+def bind_tool_call_arguments(func, func_name, input_string, format_json_str,
+                             where=''):
+    """Parse a tool call's arguments and check them against the tool.
+
+    Returns ``(arguments, None)`` when the tool may be called with them and
+    ``(None, error_text)`` when it may not.  The one parse-and-bind step for
+    the patched ``execute_function`` and ``a_execute_function``: autogen's
+    strict parse first, retrieve_json only when that fails, then
+    ``tool_argument_error`` on whatever came back, including the ``{}``
+    used when nothing could be recovered.
+    """
+    try:
+        arguments = json.loads(format_json_str(input_string))
+        print(f" ORIGINAL AUTOGEN{where}: Successfully parsed arguments for {func_name}")
+        repaired = False
+    except Exception as e:
+        print(f" ORIGINAL AUTOGEN{where} FAILED: {e} - falling back to enhanced parsing for {func_name}")
+        try:
+            arguments = retrieve_json(input_string)
+            if arguments is None:
+                arguments = {}
+            elif isinstance(arguments, str):
+                arguments = json.loads(arguments)
+        except Exception as fallback_error:
+            print(f" FALLBACK{where} FAILED: {fallback_error}")
+            return None, f"Error: {e}\n The argument must be in JSON format."
+        print(f" FALLBACK{where} PARSED: arguments for {func_name}: {arguments}")
+        repaired = True
+    error = tool_argument_error(func, func_name, arguments, repaired)
+    if error is not None:
+        print(f" ARGUMENTS REFUSED{where}: {func_name} not run: {error}")
+        return None, error
+    return arguments, None
+
+
 def force_apply_autogen_json_fix():
     """Force apply the autogen JSON fix with robust error handling."""
 
@@ -3905,26 +3994,8 @@ def force_apply_autogen_json_fix():
             # ========== PRESERVE ORIGINAL AUTOGEN LOGIC ==========
             # Extract arguments from a json-like string and put it into a dict.
             input_string = func_call.get("arguments", "{}")
-
-            try:
-                # Try original autogen approach first
-                formatted_string = self._format_json_str(input_string)
-                arguments = json.loads(formatted_string)
-                print(f" ORIGINAL AUTOGEN: Successfully parsed arguments for {func_name}")
-            except (json.JSONDecodeError, Exception) as e:
-                # Only if original fails, fall back to our enhanced parsing
-                print(f" ORIGINAL AUTOGEN FAILED: {e} - falling back to enhanced parsing for {func_name}")
-                try:
-                    arguments = retrieve_json(input_string)
-                    if arguments is None:
-                        arguments = {}
-                    elif isinstance(arguments, str):
-                        arguments = json.loads(arguments)
-                    print(f" FALLBACK SUCCESSFUL: Enhanced parsing worked for {func_name}")
-                except Exception as fallback_error:
-                    print(f" FALLBACK FAILED: {fallback_error}")
-                    arguments = None
-                    content = f"Error: {e}\n The argument must be in JSON format."
+            arguments, content = bind_tool_call_arguments(
+                func, func_name, input_string, self._format_json_str)
 
             # ========== PRESERVE ORIGINAL EXECUTION LOGIC ==========
             if arguments is not None:
@@ -3972,26 +4043,9 @@ def force_apply_autogen_json_fix():
         is_exec_success = False
         if func is not None:
             input_string = func_call.get("arguments", "{}")
-
-            try:
-                # Try original autogen approach first
-                formatted_string = self._format_json_str(input_string)
-                arguments = json.loads(formatted_string)
-                print(f" ORIGINAL AUTOGEN ASYNC: Successfully parsed arguments for {func_name}")
-            except (json.JSONDecodeError, Exception) as e:
-                # Only if original fails, fall back to our enhanced parsing
-                print(f" ORIGINAL AUTOGEN ASYNC FAILED: {e} - falling back to enhanced parsing for {func_name}")
-                try:
-                    arguments = retrieve_json(input_string)
-                    if arguments is None:
-                        arguments = {}
-                    elif isinstance(arguments, str):
-                        arguments = json.loads(arguments)
-                    print(f" FALLBACK ASYNC SUCCESSFUL: Enhanced parsing worked for {func_name}")
-                except Exception as fallback_error:
-                    print(f" FALLBACK ASYNC FAILED: {fallback_error}")
-                    arguments = None
-                    content = f"Error: {e}\n The argument must be in JSON format."
+            arguments, content = bind_tool_call_arguments(
+                func, func_name, input_string, self._format_json_str,
+                where=' ASYNC')
 
             if arguments is not None:
                 iostream.print(f"\n>>>>>>>> EXECUTING ASYNC FUNCTION {func_name}...", flush=True)
