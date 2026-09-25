@@ -3326,12 +3326,17 @@ def save_conversation_db(text, user_id, prompt_id, database_url, request_id):
     """Save a conversation turn to the database via the conversation API.
 
     Canonical implementation — create_recipe.py and reuse_recipe.py delegate here.
+
+    user_id goes out as given: a desktop user's id is a UUID string (the
+    bundled /conversation route stores it as is), and a cloud user's integer
+    id stays an integer.  int(user_id) here failed every Generate_video
+    avatar call for UUID users before anything was sent.
     """
     headers = {'Content-Type': 'application/json'}
     data = {
         "request": 'VIDEO GENERATION FROM GENERATE_VIDEO',
         "response": text.strip(),
-        "user_id": int(user_id),
+        "user_id": user_id,
         "conv_bot_name": 'GPT-4o',
         "topic": f'{prompt_id}',
         "revision": False,
