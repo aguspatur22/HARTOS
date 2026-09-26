@@ -790,8 +790,9 @@ def _truncate_msg_content(msg: dict, target_chars: int, marker: str,
 
     Returns ``(new_msg, n_cut_chars)`` — ``(msg, 0)`` when it already fits.
     Multimodal-aware: rebuilds list-shaped content preserving image parts.
-    The ONE truncation implementation; both the last-message step and the
-    anchor step in ``_trim_to_budget`` call it.
+    The ONE truncation implementation; ``_trim_to_budget`` calls it for both
+    of its cuts: the pass over the messages the drop could not remove, and
+    the system-message last resort.
     """
     text = content_to_text(msg.get('content'))
     if len(text) <= target_chars:
@@ -865,17 +866,22 @@ def _trim_to_budget(body: dict) -> tuple:
     """Return ``(trimmed_body, n_dropped, n_truncated_chars, est_before,
     est_after, budget)``.
 
-    Trim policy (always-succeeds, idempotent):
-      1. budget = per_slot - max_tokens - safety
+    Trim policy (best-effort, idempotent):
+      1. budget = per_slot - max_tokens - safety - the tool schema's tokens
       2. If under budget → return unchanged.
       3. Left-drop non-system messages (preserve index 0 if role=system)
-         until the remaining set fits.  Always keep the system message,
+         until the remaining set fits.  Never dropped: the system message,
          the most-recent message, the newest role='user' message and the
          task turn (:func:`_task_turn`, the initiator's newest turn).
-      4. If even [system, last_message] is over budget, left-truncate
-         the last message's content character-by-character until it
-         fits, prefixed with ``WIRE_TRIM_MARKER`` so the LLM sees the
-         truncation.
+      4. If still over, left-truncate the messages step 3 could not drop,
+         one at a time, until the set fits: the most-recent message first
+         when nothing protects it, then the protected ones, largest first.
+         Each is cut only as far as the others at their current size
+         require, never below 64 tokens, and its content is prefixed with
+         ``WIRE_TRIM_MARKER`` so the LLM sees the truncation.
+      5. If STILL over, left-truncate the system message the same way.
+      A body that is still over after step 5 is sent as is and logged as
+      an error.
 
     Idempotent: calling on an already-trimmed body returns it unchanged.
     Multimodal-aware: rebuilds list-shaped content preserving image
@@ -1023,24 +1029,26 @@ def _trim_to_budget(body: dict) -> tuple:
         if count_tokens_for_messages(messages, model) <= budget:
             break
 
-    # (b)+(c) reserves below: the message-frame overhead of the message being
-    # truncated, and the truncation marker we'll prepend.  Previous bug:
-    # didn't subtract (c), so the post-truncation message exceeded budget by
-    # the marker length (~7 tokens) and the wire request still tickled n_ctx.
+    # Each cut below sizes a message against everything else in the set plus
+    # two reserves: the envelope overhead of the message being cut, and the
+    # truncation marker prepended to it.  Previous bug: the marker was not
+    # reserved, so the cut message exceeded budget by the marker length
+    # (~7 tokens) and the wire request still tickled n_ctx.
     _TOKENS_PER_MSG = 4  # OpenAI envelope overhead per message
     marker_tokens = count_tokens_for_text(WIRE_TRIM_MARKER, model)
 
     n_truncated_chars = 0
 
-    # The anchor (newest user message) is drop-protected, so when IT is the
-    # oversized component the step above never touches it: it only truncates
-    # messages[-1], and in the autogen.reuse conversations the anchor sits
-    # mid-list behind assistant/tool replies.  Measured 2026-08-30 19:35-19:46
-    # on the installed build: system+anchor ~5597 tok against budget 3840 —
-    # every trim ended in the STILL-over error below and llama-server rejected
-    # the turn, 95x in 11 minutes.  Same policy, same helper, applied to each
-    # protected message: protecting a message from the drop must never make
-    # the trim unable to fit it.
+    # The drop above never removes a protected message or the newest one, so
+    # when one of those is the oversized component, cutting its content is
+    # the only way to fit.  The cut once reached only messages[-1], and in the
+    # autogen.reuse conversations the anchor sits mid-list behind
+    # assistant/tool replies.  Measured 2026-08-30 19:35-19:46 on the
+    # installed build: system+anchor ~5597 tok against budget 3840 -- every
+    # trim ended in the STILL-over error below and llama-server rejected the
+    # turn, 95x in 11 minutes.  So the cut covers every message the drop
+    # kept: protecting a message from the drop must never make the trim
+    # unable to fit it.
     #
     # LARGEST FIRST.  Each message's room is computed with the others at their
     # current size, so the order decides who is cut.  Anchor-first (the first
@@ -1080,9 +1088,8 @@ def _trim_to_budget(body: dict) -> tuple:
     for p in sorted(candidates, key=_cut_order):
         if count_tokens_for_messages(messages, model) <= budget:
             break
-        p_idx = next((i for i, m in enumerate(messages) if m is p), None)
-        if p_idx is None:
-            continue  # dropped above
+        # Always found: the drop skips every candidate (protected or newest).
+        p_idx = next(i for i, m in enumerate(messages) if m is p)
         others = messages[:p_idx] + messages[p_idx + 1:]
         overhead_tokens = (count_tokens_for_messages(others, model)
                            + _TOKENS_PER_MSG
@@ -1100,7 +1107,7 @@ def _trim_to_budget(body: dict) -> tuple:
     # measured 2026-08-30 20:06-20:20 on the installed build: 86 of 100
     # STILL-over failures were this shape (sample: [system 28,154 chars,
     # assistant 247]), each sent doomed and rejected by llama-server.  When
-    # drops + last + anchor have all run and the set is STILL over, the
+    # the drop and the cut pass have both run and the set is STILL over, the
     # system message is the only mass left; left-truncating it cuts the
     # boilerplate head and keeps the actionable recipe tail.  Only reached
     # when the alternative is a guaranteed reject.
@@ -1118,13 +1125,14 @@ def _trim_to_budget(body: dict) -> tuple:
             messages[0] = new_sys
 
     # ─── Post-trim acceptance test — the trim is best-effort, so CHECK it ───
-    # Trimming can be structurally unable to reach the budget: it drops and
-    # truncates the LAST message, which cannot shrink the SYSTEM message.  On
-    # 2026-08-29 that produced est 795 against a budget of 351 — over by 2.3x —
-    # and the request was sent anyway because `we truncated something` was
-    # treated as success.  llama-server then rejected it (11,236 > n_ctx 8192).
-    # Say so here: a silent doomed request costs a full round trip and surfaces
-    # to the user as an unexplained failure (see #591 for the caller side).
+    # Trimming can be structurally unable to reach the budget: every message
+    # it cuts keeps at least 64 tokens.  On 2026-08-29, when the trim could
+    # not yet cut the system message, that produced est 795 against a budget
+    # of 351 — over by 2.3x — and the request was sent anyway because `we
+    # truncated something` was treated as success.  llama-server then
+    # rejected it (11,236 > n_ctx 8192).  Say so here: a silent doomed
+    # request costs a full round trip and surfaces to the user as an
+    # unexplained failure (see #591 for the caller side).
     _est_after = count_tokens_for_messages(messages, model)
     _wire_total = _est_after + tools_tokens
     _per_slot = _get_budget_per_slot()
@@ -1133,8 +1141,8 @@ def _trim_to_budget(body: dict) -> tuple:
             "[TRIM] trim could not reach budget — request is STILL over and "
             "will very likely be rejected: messages %d tok + schema %d tok = "
             "%d tok against n_ctx %d (budget was %d, %d msg(s) dropped, %d "
-            "char(s) truncated). Trimming cannot shrink the system message; "
-            "the oversized component is %s.",
+            "char(s) truncated). Every message the trim may cut keeps at "
+            "least 64 tokens; the oversized component is %s.",
             _est_after, tools_tokens, _wire_total, _per_slot, budget,
             n_dropped, n_truncated_chars,
             'the tool/function schema' if tools_tokens > _est_after
