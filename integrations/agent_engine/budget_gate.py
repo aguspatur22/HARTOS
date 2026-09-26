@@ -590,13 +590,7 @@ def meter_llm_call(model: str, tokens_in: int, tokens_out: int,
     Never raises: metering must not break the call it meters.
     """
     try:
-        node_id = os.environ.get('HEVOLVE_NODE_ID', '')
-        if not node_id:
-            try:
-                from security.node_integrity import get_node_identity
-                node_id = get_node_identity().get('node_id', '')
-            except Exception:
-                node_id = ''
+        node_id = _this_node_id()
         if _is_local_model():
             usd_per_1k = 0.0
         else:
@@ -610,3 +604,205 @@ def meter_llm_call(model: str, tokens_in: int, tokens_out: int,
     except Exception as e:
         logger.warning(f"LLM metering failed (the call itself is unaffected): {e}")
         return None
+
+
+def _this_node_id() -> str:
+    """This node's id: HEVOLVE_NODE_ID, else the node identity's, else ''."""
+    node_id = os.environ.get('HEVOLVE_NODE_ID', '')
+    if not node_id:
+        try:
+            from security.node_integrity import get_node_identity
+            node_id = get_node_identity().get('node_id', '')
+        except Exception:
+            node_id = ''
+    return node_id
+
+
+def metered_usage_by_model(db) -> list:
+    """Calls and tokens per model over every MeteredAPIUsage row.
+
+    /api/gateway/metering read MeteredAPIUsage.provider and .tokens_used,
+    neither of which exists on either definition of the table, so every call
+    answered 500.  A row records the model, not a provider; the key stays
+    'provider' for the response shape the route always had.
+    """
+    from sqlalchemy import func as sa_func
+    from integrations.social.models import MeteredAPIUsage
+    rows = db.query(
+        MeteredAPIUsage.model_id,
+        sa_func.sum(sa_func.coalesce(MeteredAPIUsage.tokens_in, 0)
+                    + sa_func.coalesce(MeteredAPIUsage.tokens_out, 0)),
+        sa_func.count(MeteredAPIUsage.id),
+    ).group_by(MeteredAPIUsage.model_id).all()
+    return [{'provider': r[0], 'total_tokens': int(r[1] or 0), 'calls': int(r[2])}
+            for r in rows]
+
+
+# ── Remote compute: the requester pays, the serving operator earns ───
+#
+# Owner rulings 2026-09-26.  (a) What is metered is work that goes to "hive
+# nodes usage that's not their node", tracked inside HARTOS.  (b) The rate is
+# "proportinal to compute spent and earned": ONE measured quantity is debited
+# from the requester and credited, unchanged, to the operator of the node that
+# served it (before the 90/9/1 split, which revenue_aggregator owns).  (c) "for
+# local person'a work zero spark earned": the requester's own node, a node
+# proven SAME_USER, or a local model costs 0 and earns 0.
+#
+# The debit happens here, on the requesting node, only after the remote work
+# has COMPLETED (standing decision: charge on completed work).  The row it
+# writes is the operator's credit, paid by settle_metered_api_costs.
+
+REMOTE_COMPUTE_TASK_SOURCE = 'hive_compute'
+
+
+def spark_per_1k_compute_tokens() -> float:
+    """Spark per 1K tokens of compute run on a node the requester does not own.
+
+    Composed from the two conversions HARTOS already has, no new number:
+    tokens to GPU time is hosting_reward_service.GPU_SECONDS_PER_1K_TOKENS
+    (what gpu_hours_served is credited with), and GPU time to Spark is the
+    wallet's own award table, AWARD_TABLE['compute_hour'] (Spark per compute
+    hour lent).  spark_per_1k() is NOT this: it prices a paid API by model
+    family and says 0 for every local family, so a peer's Qwen would be free.
+    """
+    from integrations.social.hosting_reward_service import GPU_SECONDS_PER_1K_TOKENS
+    from integrations.social.resonance_engine import AWARD_TABLE
+    spark_per_hour = float(AWARD_TABLE['compute_hour']['spark'])
+    return GPU_SECONDS_PER_1K_TOKENS / 3600.0 * spark_per_hour
+
+
+def remote_call_tokens(prompt, response, usage=None) -> Tuple[int, int]:
+    """(tokens_in, tokens_out) a remote call spent: the peer's own ``usage``
+    block when it reported one, else counted from the text sent and received
+    (core.token_utils, the one counter)."""
+    usage = usage if isinstance(usage, dict) else {}
+    try:
+        tin = int(usage.get('prompt_tokens') or 0)
+        tout = int(usage.get('completion_tokens') or 0)
+    except (TypeError, ValueError):
+        tin = tout = 0
+    if tin > 0 or tout > 0:
+        return tin, tout
+    from core.token_utils import count_tokens_for_text
+    return (count_tokens_for_text(prompt if isinstance(prompt, str) else ''),
+            count_tokens_for_text(response if isinstance(response, str) else ''))
+
+
+def _serving_node_is_users(user_id: str, serving_node_id: str,
+                           operator_id: str) -> bool:
+    """Is the serving node the requester's own?
+
+    Its PeerNode operator is the requester, or this node holds a link to it
+    that PeerLink.owned_by proves is the requester's (SAME_USER, the rule of
+    19d4c5b02).  No second ownership rule lives here.
+    """
+    if operator_id and operator_id == user_id:
+        return True
+    try:
+        from core.peer_link.link_manager import get_link_manager
+        link = get_link_manager().get_link(serving_node_id)
+    except Exception:
+        link = None
+    return bool(link is not None and link.owned_by(user_id))
+
+
+def charge_remote_compute(user_id, serving_node_id, tokens_in, tokens_out,
+                          source: str, ref_id: str = '',
+                          model_id: str = '') -> int:
+    """Debit the requester for COMPLETED compute on a node they do not own.
+
+    Call only after the remote work returned a result.  Returns the whole
+    Spark debited (0 when nothing moved).  Never raises.
+
+    - Own node or SAME_USER node, no requester, nothing measured: 0, no row.
+    - Serving operator unknown: 0, no row.  Nobody could be credited, and
+      spend must equal earn.
+    - Otherwise one MeteredAPIUsage row (task_source 'hive_compute', node_id =
+      the serving node, operator_id = its operator, requester_user_id = the
+      requester, tokens = the measured units, cost_per_1k_tokens = the rate).
+      The Spark owed is the requester's running total with this operator,
+      exact, minus the whole Spark already moved; its whole part is debited
+      now, the fraction waits for the next call.
+    - Insufficient Spark: ResonanceService.spend_spark is all or nothing and
+      refuses, so nothing is debited and nothing will be credited; the row is
+      kept as 'unfunded' (the work was served and delivered) and that amount
+      is not billed again.
+    """
+    import math
+    user_id = str(user_id or '')
+    serving_node_id = str(serving_node_id or '')
+    tin = max(0, int(tokens_in or 0))
+    tout = max(0, int(tokens_out or 0))
+    if not user_id or not serving_node_id or (tin + tout) <= 0:
+        return 0
+    try:
+        from sqlalchemy import func as sa_func
+        from integrations.social.models import db_session, PeerNode, MeteredAPIUsage
+        from integrations.social.resonance_engine import ResonanceService
+        from integrations.agent_engine.revenue_aggregator import SPARK_PER_USD
+        if not hasattr(MeteredAPIUsage, 'requester_user_id'):
+            # The installed hevolve_database (sql.models) predates v57.
+            logger.warning(
+                "Remote compute not charged: MeteredAPIUsage has no "
+                "requester_user_id on this install (hevolve_database needs the "
+                "v57 column)")
+            return 0
+        rate = spark_per_1k_compute_tokens()
+        with db_session() as db:
+            peer = db.query(PeerNode).filter_by(node_id=serving_node_id).first()
+            operator_id = str(peer.node_operator_id) if (
+                peer is not None and peer.node_operator_id) else ''
+            if _serving_node_is_users(user_id, serving_node_id, operator_id):
+                return 0
+            if not operator_id:
+                logger.info(
+                    "Remote compute on %s not charged: no operator known for "
+                    "that node, so no one could be credited", serving_node_id)
+                return 0
+            exact_prior, moved_prior = db.query(
+                sa_func.coalesce(sa_func.sum(
+                    (sa_func.coalesce(MeteredAPIUsage.tokens_in, 0)
+                     + sa_func.coalesce(MeteredAPIUsage.tokens_out, 0))
+                    * MeteredAPIUsage.cost_per_1k_tokens / 1000.0), 0.0),
+                sa_func.coalesce(sa_func.sum(
+                    MeteredAPIUsage.estimated_spark_cost), 0),
+            ).filter(
+                MeteredAPIUsage.task_source == REMOTE_COMPUTE_TASK_SOURCE,
+                MeteredAPIUsage.requester_user_id == user_id,
+                MeteredAPIUsage.operator_id == operator_id,
+            ).one()
+            exact_now = (tin + tout) / 1000.0 * rate
+            owed = float(exact_prior or 0.0) - float(moved_prior or 0) + exact_now
+            amount = max(0, int(math.floor(owed + 1e-9)))
+            row = MeteredAPIUsage(
+                node_id=serving_node_id,
+                operator_id=operator_id,
+                model_id=(model_id or source or 'remote')[:100],
+                task_source=REMOTE_COMPUTE_TASK_SOURCE,
+                requester_node_id=_this_node_id() or None,
+                requester_user_id=user_id,
+                tokens_in=tin,
+                tokens_out=tout,
+                cost_per_1k_tokens=rate,
+                estimated_spark_cost=amount,
+                actual_usd_cost=amount / float(SPARK_PER_USD or 100),
+                settlement_status='pending' if amount > 0 else 'settled',
+            )
+            db.add(row)
+            db.flush()
+            if amount > 0:
+                ok, _balance = ResonanceService.spend_spark(
+                    db, user_id, amount, 'hive_compute_spent', row.id,
+                    f'Compute on {serving_node_id} ({source} {ref_id})'.strip())
+                if not ok:
+                    row.settlement_status = 'unfunded'
+                    logger.info(
+                        "Remote compute on %s: %s has %s Spark, %d owed; "
+                        "recorded unfunded", serving_node_id, user_id,
+                        _balance, amount)
+                    return 0
+            return amount
+    except Exception as e:
+        logger.warning("Remote compute charge failed (the work itself is "
+                       "unaffected): %s", e)
+        return 0

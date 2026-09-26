@@ -253,7 +253,7 @@ class ComputeMeshService:
                     result['offloaded_to'] = peer_id
                     result['peer_address'] = peer.address
                     result['transport'] = 'peerlink'
-                    return result
+                    return self._charged(peer_id, prompt, options, result)
         except Exception:
             pass
 
@@ -269,11 +269,39 @@ class ComputeMeshService:
                 result = resp.json()
                 result['offloaded_to'] = peer_id
                 result['peer_address'] = peer.address
-                return result
+                return self._charged(peer_id, prompt, options, result)
             else:
                 return {'error': f'Peer returned status {resp.status_code}'}
         except Exception as e:
             return {'error': f'Offload to {peer_id} failed: {str(e)}'}
+
+    @staticmethod
+    def _charged(peer_id: str, prompt: str, options: Optional[dict],
+                 result: Dict[str, Any]) -> Dict[str, Any]:
+        """Charge ``options['user_id']`` for an offload that COMPLETED on
+        ``peer_id`` and return the result unchanged.
+
+        The peer's /mesh/infer runs every request as an LLM chat on its Model
+        Bus (/v1/chat infers ModelType.LLM whatever model_type says), so the
+        compute it spent is tokens: its ``usage`` block when present, else
+        counted from the prompt sent and the response text received.  A body
+        carrying 'error' did not complete and is not charged.  No user_id, no
+        charge: the requester is unknown.  Never raises."""
+        try:
+            from integrations.agent_engine.budget_gate import (
+                charge_remote_compute, remote_call_tokens)
+            user_id = (options or {}).get('user_id') or ''
+            if user_id and 'error' not in result:
+                response = result.get('response')
+                tin, tout = remote_call_tokens(
+                    prompt, response if isinstance(response, str) else '',
+                    result.get('usage'))
+                charge_remote_compute(
+                    user_id, peer_id, tin, tout, source='compute_mesh',
+                    model_id=str(result.get('model') or 'mesh_peer'))
+        except Exception as e:
+            logger.warning("mesh compute charge skipped: %s", e)
+        return result
 
     def offload_to_best_peer(
         self, model_type: str, prompt: str, options: Optional[dict] = None

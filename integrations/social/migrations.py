@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 56
+SCHEMA_VERSION = 57
 
 
 # Tables that hold tenant-scoped user content. v40 adds a nullable
@@ -2065,6 +2065,35 @@ def run_migrations():
         logger.info("HevolveSocial: migrating to v56 "
                     "(agent_goals.config_json require_consent)")
         set_schema_version(engine, 56)
+
+    if current < 57:
+        # v57 (2026-09-26): metered_api_usage.requester_user_id.  Owner ruling:
+        # a task run on a node its person does not own is charged to that
+        # person "proportinal to compute spent and earned".  The requesting
+        # node writes one row per completed remote call
+        # (budget_gate.charge_remote_compute); this column says whose task it
+        # was, so the fraction of a Spark not yet debited carries per person
+        # and operator.  Nullable, NULL on every other row.
+        logger.info("HevolveSocial: migrating to v57 "
+                    "(metered_api_usage.requester_user_id)")
+        for sql, label in [
+            ("ALTER TABLE metered_api_usage ADD COLUMN requester_user_id "
+             "VARCHAR(64)", "ADD COLUMN metered_api_usage.requester_user_id"),
+            ("CREATE INDEX IF NOT EXISTS ix_metered_api_usage_requester_user_id "
+             "ON metered_api_usage (requester_user_id)",
+             "INDEX metered_api_usage(requester_user_id)"),
+        ]:
+            try:
+                with engine.connect() as conn:
+                    conn.execute(text(sql))
+                    conn.commit()
+            except Exception as e:
+                if _is_already_exists_error(e):
+                    logger.info("v57 migration: %s skipped (already exists)",
+                                label)
+                else:
+                    logger.warning("v57 migration: %s failed: %s", label, e)
+        set_schema_version(engine, 57)
 
     # v56's DATA repair, deliberately OUTSIDE the version gate above.
     #

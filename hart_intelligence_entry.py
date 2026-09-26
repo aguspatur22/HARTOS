@@ -1669,20 +1669,10 @@ try:
     def _gateway_metering():
         """SDK usage metering stats for billing dashboard."""
         try:
-            from integrations.social.models import db_session, MeteredAPIUsage
-            from sqlalchemy import func
-            with db_session() as session:
-                rows = session.query(
-                    MeteredAPIUsage.provider,
-                    func.sum(MeteredAPIUsage.tokens_used),
-                    func.count(MeteredAPIUsage.id)
-                ).group_by(MeteredAPIUsage.provider).all()
-                return jsonify({
-                    'providers': [
-                        {'provider': r[0], 'total_tokens': int(r[1] or 0), 'calls': r[2]}
-                        for r in rows
-                    ]
-                })
+            from integrations.social.models import db_session
+            from integrations.agent_engine.budget_gate import metered_usage_by_model
+            with db_session(commit=False) as session:
+                return jsonify({'providers': metered_usage_by_model(session)})
         except Exception as e:
             return jsonify({'error': str(e)}), 500
 

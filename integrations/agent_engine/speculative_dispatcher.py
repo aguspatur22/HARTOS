@@ -1827,7 +1827,14 @@ class SpeculativeDispatcher:
                     choices = data.get('choices') or []
                     if choices:
                         msg = (choices[0] or {}).get('message') or {}
-                        return msg.get('content') or ''
+                        content = msg.get('content') or ''
+                        if content:
+                            # Completed on a peer's node: the requester pays
+                            # the compute it spent (owner ruling 2026-09-26).
+                            self._charge_hive_expert(
+                                user_id, cfg, inner_model_id, prompt,
+                                content, data.get('usage'))
+                        return content
                 else:
                     logger.debug(
                         "hive expert %s returned HTTP %s",
@@ -1915,6 +1922,23 @@ class SpeculativeDispatcher:
         except Exception as e:
             logger.debug("local expert HTTP dispatch failed: %s", e)
         return ''
+
+    @staticmethod
+    def _charge_hive_expert(user_id, cfg: dict, model_id: str, prompt: str,
+                            content: str, usage) -> int:
+        """Charge the requester for a COMPLETED hive expert turn: real tokens
+        from the peer's ``usage`` block, counted tokens when it sent none.
+        The serving node is the peer HiveExpertDiscovery registered the
+        backend for.  Never raises."""
+        try:
+            from .budget_gate import charge_remote_compute, remote_call_tokens
+            tin, tout = remote_call_tokens(prompt, content, usage)
+            return charge_remote_compute(
+                user_id, (cfg or {}).get('peer_id', ''), tin, tout,
+                source='hive_expert', model_id=model_id)
+        except Exception as e:
+            logger.warning("hive expert compute charge skipped: %s", e)
+            return 0
 
     # ─── Helpers ───
 

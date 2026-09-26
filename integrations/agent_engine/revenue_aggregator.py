@@ -265,6 +265,10 @@ def settle_metered_api_costs(db, period_hours: int = 24) -> Dict:
       3. award_spark(db, operator_id, spark, 'api_cost_recovery', usage.id, desc)
       4. Mark settlement_status = 'settled'
 
+    A 'hive_compute' row (budget_gate.charge_remote_compute) is paid its
+    estimated_spark_cost instead: the whole Spark its requester was already
+    debited, so what the operator earns equals what was spent.
+
     Returns: {settled_count, total_spark_awarded, total_usd_settled}
     """
     from sqlalchemy import and_
@@ -284,17 +288,33 @@ def settle_metered_api_costs(db, period_hours: int = 24) -> Dict:
     total_spark = 0
     total_usd = 0.0
 
+    from integrations.agent_engine.budget_gate import REMOTE_COMPUTE_TASK_SOURCE
+
     for usage in pending:
         if not usage.operator_id:
             usage.settlement_status = 'written_off'
             continue
 
-        spark_amount = max(1, int(usage.actual_usd_cost * SPARK_PER_USD))
+        if usage.task_source == REMOTE_COMPUTE_TASK_SOURCE:
+            # Compute served for someone else's task: the operator earns
+            # exactly the whole Spark the requester was debited for this row
+            # (budget_gate.charge_remote_compute), spend == earn.
+            spark_amount = int(usage.estimated_spark_cost or 0)
+            source_type = 'hive_compute_earned'
+            description = (f'Compute served: {usage.model_id} for '
+                           f'{usage.requester_user_id}')
+            if spark_amount <= 0:
+                usage.settlement_status = 'settled'
+                continue
+        else:
+            spark_amount = max(1, int(usage.actual_usd_cost * SPARK_PER_USD))
+            source_type = 'api_cost_recovery'
+            description = (f'API cost recovery: {usage.model_id} '
+                           f'({usage.task_source})')
         try:
             ResonanceService.award_spark(
                 db, usage.operator_id, spark_amount,
-                'api_cost_recovery', usage.id,
-                f'API cost recovery: {usage.model_id} ({usage.task_source})')
+                source_type, usage.id, description)
             usage.settlement_status = 'settled'
             settled_count += 1
             total_spark += spark_amount
@@ -313,7 +333,7 @@ def settle_metered_api_costs(db, period_hours: int = 24) -> Dict:
                     'task_source': usage.task_source,
                     'usd_cost': round(usage.actual_usd_cost, 6),
                     'spark_awarded': spark_amount,
-                    'source_type': 'api_cost_recovery',
+                    'source_type': source_type,
                 })
             except Exception:
                 pass

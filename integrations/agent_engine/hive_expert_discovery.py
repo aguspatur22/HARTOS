@@ -410,6 +410,9 @@ class HiveExpertDiscovery:
                     'base_url': f'{endpoint}/v1',
                     'price': [0, 0],
                     'specialty': list(model.get('specialty') or []),
+                    # The serving node: whoever this backend's turns are
+                    # charged against (budget_gate.charge_remote_compute).
+                    'peer_id': peer_id,
                 },
                 avg_latency_ms=latency_ms,
                 accuracy_score=baseline,

@@ -2925,6 +2925,9 @@ class MeteredAPIUsage(Base):
     # v34 — thought-experiment consumption tracking
     escrow_id = Column(Integer, nullable=True, index=True)
     experiment_post_id = Column(String(64), nullable=True, index=True)
+    # v57 — the person whose task ran on node_id (task_source='hive_compute',
+    # budget_gate.charge_remote_compute).  NULL on every other row.
+    requester_user_id = Column(String(64), nullable=True, index=True)
 
     def to_dict(self):
         return {
@@ -2935,6 +2938,7 @@ class MeteredAPIUsage(Base):
             'task_source': self.task_source,
             'goal_id': self.goal_id,
             'requester_node_id': self.requester_node_id,
+            'requester_user_id': self.requester_user_id,
             'tokens_in': self.tokens_in,
             'tokens_out': self.tokens_out,
             'cost_per_1k_tokens': self.cost_per_1k_tokens,
