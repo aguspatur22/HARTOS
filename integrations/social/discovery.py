@@ -6,6 +6,7 @@ Separate from per-agent A2A cards - this advertises the platform itself.
 import json
 import os
 import logging
+import threading
 import time as _time
 from flask import Blueprint, jsonify, request
 from core.port_registry import get_port
@@ -1377,12 +1378,16 @@ def hierarchy_node_assignment(node_id):
         db.close()
 
 
-def _sender_signature_valid(db, data: dict) -> bool:
+def _sender_signature_valid(db, data: dict, node_id=None) -> bool:
     """STRICT node-identity check: True ONLY when ``data`` carries a node_id +
     signature that verifies against a peer's REGISTERED PeerNode.public_key,
     looked up by the DECLARED node_id (or the legacy key-prefix fallback, which
     still resolves to a key ALREADY ON FILE).  Never trusts a key from the
     request, and has NO enforcement-mode escape.
+
+    ``node_id``: the declared sender when the payload names it somewhere other
+    than a top-level 'node_id' (admitted_peer_sender's ``sender`` block); the
+    signature still covers the whole payload.
 
     Two policies over one verify: _verify_sync_sender layers the migration
     escape (apply unsigned/invalid under non-hard enforcement) on top of this
@@ -1394,7 +1399,7 @@ def _sender_signature_valid(db, data: dict) -> bool:
     (node_integrity.canonical_payload); keep the payload otherwise clean or
     update _signed_send_payload in lockstep."""
     from .models import PeerNode
-    node_id = data.get('node_id')
+    node_id = node_id or data.get('node_id')
     sig = data.get('signature', '')
     if not node_id or not sig:
         return False
@@ -1472,6 +1477,104 @@ def _verify_sync_sender(db, data: dict) -> bool:
     logger.warning("hierarchy_sync: applying unverified batch from node_id=%s "
                    "(no/invalid signature; non-hard enforcement)", node_id)
     return True
+
+
+# ─── A request from a node the hive admitted ───
+#
+# OWNER RULING 2026-09-26: "we had trust created in same network and when
+# auto mode the consent is implicit only a hash verified node is enough what
+# other creds are we talking about? torrents is the analogy for our design".
+# A node that passed the gossip admission gate (guardrail hash + Ed25519; a
+# PeerNode row) proves who it is with the key it gossips under: no API key,
+# no second credential.  signed_peer_request is the sending half and
+# admitted_peer_sender the receiving half, so the two can never disagree on
+# the shape.  First caller: the A2A jsonrpc route (google_a2a_integration).
+
+# Signatures already admitted, until they fall out of the freshness window:
+# a captured request replayed inside the window is refused.  Bounded by the
+# window: every entry expires, and pruning runs on each insert.
+_seen_peer_signatures = {}
+_seen_peer_signatures_lock = threading.Lock()
+
+
+def signed_peer_request(payload: dict) -> dict:
+    """``payload`` plus ``sender`` {node_id, public_key}, ``timestamp`` and
+    ``signature``: signed by this node's Ed25519 key over every field but
+    'signature' (node_integrity.canonical_payload).
+
+    node_id is SyncEngine.canonical_node_id(), the id this node's PeerNode row
+    carries on every peer (gossip.node_id).  No new key material.  Raises if
+    the node cannot sign; the caller decides whether to send unsigned."""
+    from security.node_integrity import get_public_key_hex, sign_json_payload
+    from .sync_engine import SyncEngine
+    body = {k: v for k, v in payload.items() if k != 'signature'}
+    body['sender'] = {'node_id': SyncEngine.canonical_node_id(),
+                      'public_key': get_public_key_hex()}
+    body['timestamp'] = int(_time.time())
+    body['signature'] = sign_json_payload(body)
+    return body
+
+
+def admitted_peer_sender(db, payload: dict):
+    """(node_id, '') when ``payload`` was signed by a node this node admitted,
+    else (None, reason).  The ONE rule for "is this request from an admitted
+    peer":
+
+      - ``sender.node_id`` names a PeerNode row (the gossip admission gate
+        wrote it; nothing else does);
+      - the row is not banned: integrity_status 'banned', or a ban_until still
+        in the future whatever the status says.  'suspicious' is admitted: it
+        is where a served-out ban and a score over 40 land, and every other
+        peer path (peer_reuse.admitted_peers, witness and auditor selection)
+        filters only 'banned';
+      - the key the sender names is the key on file, and the signature
+        verifies against the key on file (_sender_signature_valid: never a
+        key from the request);
+      - ``timestamp`` is within WITNESS_TIMESTAMP_MAX_AGE of now either way,
+        the named freshness rule for a node-signed peer request (gossip
+        announces carry none; the LAN beacon's 300 is an unnamed literal);
+      - the signature has not been admitted before inside that window.
+
+    Row status (active/stale/dead) is not consulted: a node calling us is
+    alive, and liveness is the health round's business, not trust.
+    """
+    from datetime import datetime
+    from .integrity_service import WITNESS_TIMESTAMP_MAX_AGE
+    from .models import PeerNode
+
+    sender = payload.get('sender')
+    signature = payload.get('signature')
+    if not isinstance(sender, dict) or not signature \
+            or not isinstance(signature, str):
+        return None, 'unsigned'
+    node_id = sender.get('node_id')
+    sent_key = sender.get('public_key')
+    if not node_id or not isinstance(node_id, str) or not sent_key:
+        return None, 'no sender'
+    ts = payload.get('timestamp')
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None, 'no timestamp'
+    now = _time.time()
+    if abs(now - ts) > WITNESS_TIMESTAMP_MAX_AGE:
+        return None, 'stale timestamp'
+    peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+    if peer is None:
+        return None, 'unknown node'
+    if peer.integrity_status == 'banned' or (
+            peer.ban_until is not None and peer.ban_until > datetime.utcnow()):
+        return None, 'node is banned'
+    if not peer.public_key or peer.public_key != sent_key:
+        return None, 'key is not the key on file'
+    if not _sender_signature_valid(db, payload, node_id=node_id):
+        return None, 'signature does not verify'
+    with _seen_peer_signatures_lock:
+        for sig, expires in list(_seen_peer_signatures.items()):
+            if expires <= now:
+                del _seen_peer_signatures[sig]
+        if signature in _seen_peer_signatures:
+            return None, 'replayed request'
+        _seen_peer_signatures[signature] = now + 2 * WITNESS_TIMESTAMP_MAX_AGE
+    return node_id, ''
 
 
 @discovery_bp.route('/api/social/hierarchy/sync', methods=['POST'])

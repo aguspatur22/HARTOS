@@ -407,6 +407,14 @@ def invoke_peer_agent(peer_url: str, agent_id: str, prompt: str,
                       timeout: float = _INVOKE_TIMEOUT_S) -> Optional[dict]:
     """POST the existing /a2a/<id>/jsonrpc message/send contract.
 
+    The body is signed with this node's gossip identity
+    (discovery.signed_peer_request: sender {node_id, public_key},
+    timestamp, Ed25519 signature) and names the agent it is for, so a
+    peer that admitted this node runs a shared agent without any other
+    credential (owner ruling 2026-09-26; the server half is
+    discovery.admitted_peer_sender).  A node that cannot sign sends the
+    body unsigned, which only a LAN-trusted peer admits.
+
     Returns the A2A task envelope (id/contextId/state/content) or None
     on any transport / JSON-RPC failure (logged). NOTE: an envelope
     with state == 'failed' is returned as-is; callers decide."""
@@ -422,7 +430,15 @@ def invoke_peer_agent(peer_url: str, agent_id: str, prompt: str,
                 'parts': [{'type': 'text', 'text': prompt}],
             }
         },
+        'agent_id': agent_id,
     }
+    try:
+        from integrations.social.discovery import signed_peer_request
+        rpc = signed_peer_request(rpc)
+    except Exception as e:
+        logger.warning(f'peer_reuse: could not sign the invoke of {agent_id} '
+                       f'({e}); sending unsigned, which a peer that is not '
+                       f'LAN-trusted refuses with 401')
     try:
         resp = pooled_post(url, json=rpc, timeout=timeout)
     except Exception as e:

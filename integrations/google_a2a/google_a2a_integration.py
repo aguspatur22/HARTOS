@@ -293,35 +293,69 @@ class A2AProtocolServer:
 
         logger.info(f"Registered A2A agent: {agent_id} ({name})")
 
-    def _message_send_refusal(self, agent_id):
-        """(http_code, message) when this request may not RUN the agent,
-        else None.  Called inside the jsonrpc view's request.
+    def _jsonrpc_refusal(self, agent_id, rpc_request):
+        """(http_code, message) when this request may not run the agent, read
+        its tasks or cancel them, else None.  Called inside the jsonrpc view's
+        request for message/send, message/get and task/cancel.
 
         message/send runs a /chat turn as the agent's owner (autonomous, with
-        its tools), so it is admitted exactly as /chat is: the one API gate,
-        security.middleware's check_api_auth, asked about '/chat'.  /a2a/ is
-        an exempt prefix for the peer protocol's discovery half (cards,
-        directory, recipe pull), and that exemption let an unauthenticated
-        caller on another machine run a turn (review of 309bcd032, measured
-        with NUNBA_BUNDLED=1 and on central: POST /chat 401, POST
-        /a2a/<id>/jsonrpc 200 with the dispatch called).  And, like the
-        recipe pull, only an agent this node would export may be run
-        (peer_reuse.export_allowed).  Fail closed on any error."""
+        its tools), so a caller is admitted when EITHER
+          (a) /chat would admit it: the one API gate, security.middleware's
+              check_api_auth, asked about '/chat' (the desktop's own callers,
+              LAN-trusted tiers, a key or JWT, an allowed phone).  /a2a/ is an
+              exempt prefix for the peer protocol's discovery half, and that
+              exemption let an unauthenticated caller on another machine run
+              a turn (review of 309bcd032); or
+          (b) the body is signed by a node the hive admitted, for THIS agent
+              (discovery.admitted_peer_sender; owner ruling 2026-09-26: "only
+              a hash verified node is enough").  peer_reuse.invoke_peer_agent
+              signs; without (b) every peer invoke of a bundled, central or
+              keyed node was a 401.
+        A refusal carries the gate's own status (a phone's consent_pending is
+        403, not 401).  message/get and task/cancel read and end those turns,
+        so they take the same admission.  And, like the recipe pull, only an
+        agent this node would export is served (peer_reuse.export_allowed).
+        Fail closed on any error."""
         try:
             from security.middleware import _apply_api_auth
             refused = _apply_api_auth(self.app, register=False)(as_path='/chat')
         except Exception as e:
-            logger.warning(f'A2A message/send auth check failed: {e}')
+            logger.warning(f'A2A jsonrpc auth check failed: {e}')
             return 503, 'authorization unavailable'
         if refused is not None:
-            return 401, 'authentication required to run an agent'
+            body = rpc_request if isinstance(rpc_request, dict) else {}
+            if 'signature' in body or 'sender' in body:
+                try:
+                    from integrations.social.discovery import admitted_peer_sender
+                    from integrations.social.models import db_session
+                    with db_session(commit=False) as db:
+                        peer, why = admitted_peer_sender(db, body)
+                except Exception as e:
+                    logger.warning(f'A2A peer admission check failed: {e}')
+                    return 503, 'authorization unavailable'
+                if peer is None:
+                    logger.info(f'A2A {agent_id}: signed request refused ({why})')
+                    return 401, f'peer not admitted: {why}'
+                if body.get('agent_id') != agent_id:
+                    logger.info(f'A2A {agent_id}: peer {peer[:8]} signed for '
+                                f'{body.get("agent_id")!r}; refused')
+                    return 401, 'peer not admitted: signed for another agent'
+                logger.info(f'A2A {agent_id}: admitted peer {peer[:8]}')
+            else:
+                resp, status = refused if isinstance(refused, tuple) else (
+                    refused, getattr(refused, 'status_code', 401))
+                try:
+                    error = (resp.get_json(silent=True) or {}).get('error')
+                except Exception:
+                    error = None
+                return status, error or 'authentication required to run an agent'
         try:
             from .peer_reuse import export_allowed
             prompt_id = agent_id.rsplit('_', 1)[0] if '_' in agent_id else agent_id
             if not export_allowed(prompt_id):
                 return 403, 'agent not shared with peers'
         except Exception as e:
-            logger.warning(f'A2A message/send export gate failed: {e}')
+            logger.warning(f'A2A jsonrpc export gate failed: {e}')
             return 503, 'authorization unavailable'
         return None
 
@@ -442,13 +476,14 @@ class A2AProtocolServer:
                 handler = self.message_handlers[agent_id]
 
                 # Route to appropriate handler
-                if method == "message/send":
-                    refused = self._message_send_refusal(agent_id)
+                if method in ("message/send", "message/get", "task/cancel"):
+                    refused = self._jsonrpc_refusal(agent_id, rpc_request)
                     if refused is not None:
                         code, message = refused
                         return jsonify({"jsonrpc": "2.0", "error": {
                             "code": -32001, "message": message},
                             "id": rpc_id}), code
+                if method == "message/send":
                     result = run_async(handler.handle_message_send(params))
                 elif method == "message/get":
                     result = run_async(handler.handle_message_get(params))
