@@ -82,6 +82,12 @@ class StrictNumbers(unittest.TestCase):
         # or dropped to '{}'.
         self.assertEqual(parsed, {'key': 'user.id', 'value': '620e51403072992921'})
 
+    def test_negative_overflowing_number_becomes_its_own_string(self):
+        # json.loads reads it as -inf; nlohmann refuses it like +inf.
+        out = _out_args(ensure_tool_call_arguments_json(
+            _call('{"v": -620e51403072992921}')))
+        self.assertEqual(_strict_loads(out), {'v': '-620e51403072992921'})
+
     def test_nan_and_infinity_literals_are_quoted(self):
         for literal in ('NaN', 'Infinity', '-Infinity'):
             with self.subTest(literal=literal):
@@ -117,6 +123,13 @@ class StrictNumbers(unittest.TestCase):
         out = _out_args(ensure_tool_call_arguments_json(_call(text)))
         self.assertEqual(out, text)
 
+    def test_a_coerced_call_is_counted_in_the_guard_log(self):
+        app = Flask(__name__)
+        with app.app_context(), self.assertLogs(app.logger, 'INFO') as logs:
+            ensure_tool_call_arguments_json(_call(LIVE_ARGS))
+        self.assertTrue(any('[TOOL-ARGS-GUARD] coerced 1 ' in line
+                            for line in logs.output), logs.output)
+
     def test_validate_messages_sends_strict_arguments(self):
         app = Flask(__name__)
         with app.app_context():
@@ -135,6 +148,13 @@ class LoneSurrogates(unittest.TestCase):
         out = _out_args(ensure_tool_call_arguments_json(
             _call('{"v": "a\\ud800b", "k": 1}')))
         self.assertEqual(_strict_loads(out), {'v': 'a\ufffdb', 'k': 1})
+
+    def test_every_lone_surrogate_in_one_value_is_replaced(self):
+        # Two lone surrogates, not a pair (the low one follows 'b', not the
+        # high one): both must go, or the second still 500s.
+        out = _out_args(ensure_tool_call_arguments_json(
+            _call('{"v": "a\\ud800b\\udc00c"}')))
+        self.assertEqual(_strict_loads(out), {'v': 'a�b�c'})
 
     def test_lone_low_surrogate_in_a_key_becomes_replacement_char(self):
         out = _out_args(ensure_tool_call_arguments_json(_call('{"\\udc00x": 1}')))
