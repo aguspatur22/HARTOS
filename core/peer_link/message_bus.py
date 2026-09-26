@@ -160,7 +160,18 @@ def crossbar_topic_is_per_user(topic: str) -> bool:
     Any other Crossbar topic -- a community, a game session, a global task or
     feed topic -- reaches whoever subscribes, which is other people.
     """
-    return '{user_id}' in TOPIC_MAP.get(topic, '')
+    return crossbar_uri_is_per_user(TOPIC_MAP.get(topic, ''))
+
+
+def crossbar_uri_is_per_user(uri_template: str) -> bool:
+    """The one ownership rule, over the Crossbar URI a leg actually publishes.
+
+    Only a URI carrying ``{user_id}`` is the user's own; any other URI
+    reaches whoever subscribes on whichever router the publisher joined.
+    ``crossbar_topic_is_per_user`` asks it for the MessageBus legacy URI; the
+    EventBus WAMP bridge asks it for ``com.hartos.event.<topic>``.
+    """
+    return '{user_id}' in (uri_template or '')
 
 
 class _ThirdPartyCopy:

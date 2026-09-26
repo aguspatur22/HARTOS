@@ -152,6 +152,30 @@ def test_a_real_emitter_now_delivers_instead_of_dropping(tmp_path):
                for c in sse.call_args_list)
 
 
+def test_an_emitter_that_knows_the_user_routes_to_them_on_a_multi_user_node(tmp_path):
+    """offer_sound_for_review knows whose sound it is.  On a node with more
+    than one human the sole-tenant fallback answers None and the P3a guard
+    refuses the SSE leg, so the card only reaches the person when the
+    emitter names them (user_id=).  This desktop's DB measured 315 human +
+    21 guest rows, i.e. exactly that node."""
+    from core.agent_tools import offer_sound_for_review
+    reg = _bootstrap(tmp_path, os_mode=False)
+    bus = reg.get('events')
+    halted, audit = _open_gates()
+    with halted, audit, \
+            patch('core.platform.events.broadcast_sse_safe') as sse, \
+            patch('core.platform.events.emit_event',
+                  side_effect=lambda t, d=None, async_=True: bus.emit(t, d)), \
+            patch('core.event_attribution.owner_user_id', return_value=None):
+        shown = offer_sound_for_review(
+            'user-9', 'prompt-1', 'g1', 'win',
+            {'url': 'http://127.0.0.1:5000/a.wav'})
+    assert shown is True
+    routed = [c.kwargs.get('user_id') for c in sse.call_args_list
+              if c.args and c.args[0] == 'agent.ui.update']
+    assert routed == ['user-9', 'user-9']      # the media card + the ask
+
+
 def test_bootstrap_is_idempotent_one_instance(tmp_path):
     reg = _bootstrap(tmp_path, os_mode=False)
     first = reg.get('LiquidUIService')

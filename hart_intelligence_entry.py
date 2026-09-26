@@ -3792,7 +3792,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
                         # _start_gateway_qr_pair_push with phone bound in
                         # request body.
                         'action': f'/api/social/channels/{channel_type}/connect-pair-code',
-                    },
+                    }, user_id=user_id,
                 )
         except Exception:
             logging.getLogger(__name__).exception("_start_gateway_qr_pair_push: swallowed Exception")
@@ -3894,7 +3894,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
                         f"(60-second window).  I've also pushed it "
                         f"to your phone with auto-copy to clipboard."
                     ),
-                },
+                }, user_id=user_id,
             )
     except Exception as e:
         _log.debug("gateway_qr: chat card emit failed: %s", e)
@@ -4013,7 +4013,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
                                     'message': (
                                         f"✅ {display_name} connected."
                                     ),
-                                },
+                                }, user_id=user_id,
                             )
                     except Exception:
                         logging.getLogger(__name__).exception("_poll: swallowed Exception")
@@ -4531,7 +4531,7 @@ def _handle_invite_friend_tool(input_text: str) -> str:
                         ],
                         'submit_label': 'Copy link',
                         'submit_action': 'copy_invite_url',
-                    },
+                    }, user_id=str(uid),
                 )
         except Exception as e:
             logger.debug("Invite_Friend: liquid UI emit skipped: %s", e)

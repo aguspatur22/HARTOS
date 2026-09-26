@@ -138,6 +138,51 @@ _SSE_GLOBAL_PREFIXES: tuple = (
 )
 
 
+# Topic prefixes whose events are addressed to ONE person.  Such an event is
+# bridged to WAMP only when the URI the bridge publishes it on is that
+# person's own, and that question has ONE answer:
+# core.peer_link.message_bus.crossbar_uri_is_per_user (19d4c5b02: a URI that
+# does not carry {user_id} reaches whoever subscribes, which is other people).
+# This tuple says WHO an event is for; it never decides ownership itself.
+# The bridge publishes on ``com.hartos.event.<topic>``, which names no user,
+# so today these are always withheld -- whichever router the bridge joined,
+# and Nunba joins central's in Hybrid/Hive mode.
+#
+# 'agent.ui.': an agent card is addressed to ONE person and can carry what
+# only they may see: the WhatsApp pair_code card holds the live linking code
+# in code / clipboard_payload / deeplink, which no DLP pattern matches, so a
+# scrubbed copy is not an option.  The card still reaches its owner on SSE
+# (the Nunba Demopage, per-user) and every in-process listener.  Measured
+# before this existed (review of a0ecafe09): with the backend's
+# LiquidUIService registered, that card was published to
+# com.hartos.event.agent.ui.update verbatim; at a0ecafe09^ the backend
+# published none, so this withholds nothing that was ever delivered from it.
+# Add a prefix here only for events addressed to one person.
+_ONE_PERSON_TOPIC_PREFIXES: tuple = (
+    'agent.ui.',
+)
+
+
+def _topic_bridges_to_wamp(topic: str) -> bool:
+    """May the WAMP bridge publish this topic?
+
+    Everyone's events: yes, as before.  An event addressed to one person:
+    only if the bridged URI is theirs under the canonical Crossbar rule.
+    If that rule cannot be consulted the one-person event is withheld: the
+    owner still has SSE and in-process listeners, and a leak cannot be
+    recalled.
+    """
+    if not topic.startswith(_ONE_PERSON_TOPIC_PREFIXES):
+        return True
+    try:
+        from core.peer_link.message_bus import crossbar_uri_is_per_user
+    except Exception as e:
+        logger.warning("WAMP bridge: ownership rule unavailable (%s); "
+                       "withholding one-person topic %s", e, topic)
+        return False
+    return crossbar_uri_is_per_user(_local_to_wamp(topic))
+
+
 def _topic_targets_sse(topic: str) -> bool:
     """True unless the topic is on the SSE denylist."""
     return not any(topic.startswith(prefix) for prefix in _SSE_DENYLIST_PREFIXES)
@@ -275,8 +320,11 @@ class EventBus:
             except Exception as e:
                 logger.warning("Wildcard listener error on '%s': %s", topic, e)
 
-        # Bridge to WAMP (skip if event already came from WAMP → no echo)
-        if not _from_wamp and self._wamp_connected and self._wamp_session:
+        # Bridge to WAMP (skip if event already came from WAMP → no echo, and
+        # a topic addressed to one person only onto a URI that is theirs:
+        # _topic_bridges_to_wamp)
+        if (not _from_wamp and self._wamp_connected and self._wamp_session
+                and _topic_bridges_to_wamp(topic)):
             self._publish_to_wamp(topic, data)
 
         # Bridge to SSE (Nunba desktop / Android web view).  This grew the

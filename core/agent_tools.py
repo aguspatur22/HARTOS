@@ -1244,7 +1244,7 @@ def offer_sound_for_review(user_id, prompt_id, game_id, state, record):
                     'controls': True,
                     'alt': f'{state} sound for {game_id}',
                     'title': f'{state} sound for {game_id}',
-                })
+                }, user_id=user_id)
             shown = bool(service.agent_ui_update(user_id, {
                 'type': 'approval',
                 'agent_id': str(prompt_id),
@@ -1254,7 +1254,7 @@ def offer_sound_for_review(user_id, prompt_id, game_id, state, record):
                     f"it, or say what is wrong and I will compose another."
                 ),
                 'options': ['Keep it', 'Compose another'],
-            }))
+            }, user_id=user_id))
     except Exception as e:
         # never at the cost of the composition that just succeeded
         tool_logger.debug(f'game sound: no card on screen ({e})')

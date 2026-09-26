@@ -282,7 +282,7 @@ def build_channel_tool_closures(ctx):
                                             f"couldn't connect: "
                                             f"{str(probe_err)[:120]}"
                                         ),
-                                    })
+                                    }, user_id=_probe_uid)
                             except Exception as toast_err:
                                 logger.debug(
                                     "Probe-failure toast emit skipped: %s",
@@ -841,7 +841,7 @@ def build_channel_tool_closures(ctx):
                         'type': 'toast', 'severity': 'info',
                         'channel': channel_type, 'channel_type': channel_type,
                         'text': f"{meta['display_name']} disconnected.",
-                    })
+                    }, user_id=uid)
             except Exception as e:
                 logger.debug("disconnect toast emit skipped: %s", e)
             return (
