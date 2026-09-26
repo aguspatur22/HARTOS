@@ -2472,8 +2472,22 @@ class GossipProtocol:
                 _budget_s = float(os.environ.get(
                     'HEVOLVE_INTEGRITY_ROUND_BUDGET_S', '30'))
                 _started = time.time()
-                _cursor = getattr(self, '_integrity_cursor', 0) % len(active_peers)
-                _ordered = active_peers[_cursor:] + active_peers[:_cursor]
+                #    A peer that just spoke for itself and was never
+                #    challenged goes FIRST, ahead of the cursor: since
+                #    cc281c3c3 only a 'verified' peer runs a shared agent, and
+                #    verification waited behind every row the cursor had not
+                #    reached (first seen -> first pass measured 23.6 h to
+                #    942.9 h on the owner's desktop; one unreachable row can
+                #    spend the whole budget).  Same challenge, same verdict
+                #    writer; only the order changes.  The cursor counts the
+                #    other rows only, so the backlog keeps advancing.
+                _first = self._never_challenged_live_peers(active_peers)
+                _first_ids = {p.node_id for p in _first}
+                _rest = [p for p in active_peers
+                         if p.node_id not in _first_ids]
+                _cursor = (getattr(self, '_integrity_cursor', 0)
+                           % max(len(_rest), 1))
+                _ordered = _first + _rest[_cursor:] + _rest[:_cursor]
                 _examined = 0
                 for i, peer in enumerate(_ordered):
                     if not self._running:
@@ -2485,9 +2499,10 @@ class GossipProtocol:
                             "Integrity round hit its %.0fs budget after %d/%d "
                             "peers; yielding so the gossip and health rounds "
                             "are not starved (resumes from this point next "
-                            "round)", _budget_s, _examined, len(_ordered))
+                            "round)", _budget_s, i, len(_ordered))
                         break
-                    _examined += 1
+                    if peer.node_id not in _first_ids:
+                        _examined += 1
                     _bad_url, _ = is_unroutable_peer_url(peer.url)
                     if _bad_url:
                         continue
@@ -2552,6 +2567,25 @@ class GossipProtocol:
             logger.debug(f"Integrity round error: {e}")
         finally:
             db.close()
+
+    def _never_challenged_live_peers(self, peers):
+        """The peers the integrity round challenges before its cursor.
+
+        A peer qualifies when it spoke for ITSELF (a key on file: _merge_peer
+        stores one only from the node's own signed announce), has never been
+        challenged (last_challenge_at is None; create_challenge stamps it
+        whatever the outcome, so a peer gets one prompt attempt, then the
+        cursor), and was heard from within the stale threshold (live: a
+        one-shot identity that announced once and went away drops out).
+        Newest first.  Relayed hints (no key) never jump the queue.
+        """
+        stale_s = getattr(self, 'stale_threshold',
+                          BANDWIDTH_PROFILES['full']['stale_threshold'])
+        horizon = datetime.utcnow() - timedelta(seconds=stale_s)
+        live = [p for p in peers
+                if p.public_key and p.last_challenge_at is None
+                and p.last_seen is not None and p.last_seen >= horizon]
+        return sorted(live, key=lambda p: p.last_seen, reverse=True)
 
     def _audit_peer_guardrails(self, db, peer):
         """Re-verify a peer's guardrail hash by directly querying it.
