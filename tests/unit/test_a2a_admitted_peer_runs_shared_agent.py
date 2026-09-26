@@ -14,10 +14,13 @@ or a central / keyed node every peer invoke became 401: the remote-invoke
 half of cross-node REUSE stopped working for the peers it exists for.
 
 THE FIX: the invoker signs the JSON-RPC body with this node's Ed25519 key
-(sender {node_id, public_key} + timestamp inside the signed body), and the
-server also admits a request signed by a peer that holds a PeerNode row
-(the gossip admission gate: guardrail hash + Ed25519), is not banned, whose
-key on file is the key that signed, and whose timestamp is fresh.  The one
+(sender {node_id, public_key}, audience = the receiving node's id, and a
+timestamp inside the signed body), and the server also admits a request
+signed by a peer this node has VERIFIED (integrity_status 'verified', which
+only an answered integrity challenge writes; review of a5364ba66: a bare
+PeerNode row is what any stranger gets from the open announce), not banned,
+whose key on file is the key that signed, for this node, with a fresh
+timestamp.  The real announce + challenge path is driven at the bottom.  The one
 rule lives in integrations.social.discovery.admitted_peer_sender.  The
 sharing rule (peer_reuse.export_allowed) still applies.  message/get and
 task/cancel get the same admission, and a /chat-gate verdict other than 401
@@ -52,9 +55,23 @@ from security.middleware import _apply_api_auth
 
 AGENT = 'livetest_shared_0'
 OTHER_AGENT = 'livetest_other_0'
-PEER_URL = 'http://node-b:5000'
+PEER_URL = 'http://node-b:5000'          # the serving node, as the invoker dials it
+SERVER_ID = 'livetest-serving-node'       # the serving node's own node_id
+INVOKER_URL = 'http://198.51.100.23:6777'  # the invoking node's advertised url
 REMOTE = {'REMOTE_ADDR': '198.51.100.23'}
 LOCAL = {'REMOTE_ADDR': '127.0.0.1'}
+
+# Both nodes live in this one process; SyncEngine.canonical_node_id answers
+# for whichever of them is handling the current call.
+_ROLE = {'who': 'invoker'}
+
+
+class _AsServer:
+    def __enter__(self):
+        self._prev, _ROLE['who'] = _ROLE['who'], 'server'
+
+    def __exit__(self, *a):
+        _ROLE['who'] = self._prev
 
 
 class _Resp:
@@ -92,8 +109,9 @@ def invoker(monkeypatch):
     monkeypatch.setattr(ni, '_private_key', priv)
     monkeypatch.setattr(ni, '_public_key', priv.public_key())
     node_id = f'livetest-{uuid.uuid4().hex[:12]}'
+    ids = {'invoker': node_id, 'server': SERVER_ID}
     monkeypatch.setattr(SyncEngine, 'canonical_node_id',
-                        staticmethod(lambda: node_id))
+                        staticmethod(lambda: ids[_ROLE['who']]))
     return types.SimpleNamespace(node_id=node_id,
                                  public_key=ni.get_public_key_hex())
 
@@ -103,8 +121,11 @@ def _other_key():
 
 
 def _admit(node_id, public_key, **over):
-    row = dict(node_id=node_id, url=PEER_URL, public_key=public_key,
-               status='active', integrity_status='unverified')
+    """A PeerNode row as the SERVING node holds it for the invoker.  Default
+    'verified': the state the integrity round writes once the peer answered
+    a challenge (the real path is driven in the announce tests below)."""
+    row = dict(node_id=node_id, url=INVOKER_URL, public_key=public_key,
+               status='active', integrity_status='verified')
     row.update(over)
     with db_session() as db:
         db.add(PeerNode(**row))
@@ -131,8 +152,15 @@ def node(monkeypatch):
         get_secret=lambda name: __import__('os').environ.get(name, ''))}
     seen = []
 
+    # The invoker knows the serving node by url and node_id (its peer store).
+    with db_session() as db:
+        db.add(PeerNode(node_id=SERVER_ID, url=PEER_URL, status='active',
+                        public_key=_other_key(), integrity_status='verified'))
+
     def routed_post(url, json=None, timeout=None, **kw):
-        r = client.post(urlsplit(url).path, json=json, environ_base=REMOTE)
+        with _AsServer():
+            r = client.post(urlsplit(url).path, json=json,
+                            environ_base=REMOTE)
         seen.append((r.status_code, r.get_json(silent=True)))
         return _Resp(r)
     monkeypatch.setattr(peer_reuse, 'pooled_post', routed_post)
@@ -141,8 +169,9 @@ def node(monkeypatch):
 
 
 def _post(node, body, agent=AGENT, environ=REMOTE):
-    r = node.client.post(f'/a2a/{agent}/jsonrpc', json=body,
-                         environ_base=environ)
+    with _AsServer():
+        r = node.client.post(f'/a2a/{agent}/jsonrpc', json=body,
+                             environ_base=environ)
     return r.status_code, r.get_json()
 
 
@@ -151,7 +180,7 @@ def _signed(method='message/send', agent=AGENT, text='summarise', **over):
             'params': {'message': {'messageId': uuid.uuid4().hex,
                                    'parts': [{'kind': 'text', 'text': text}]}},
             'agent_id': agent}
-    body = discovery.signed_peer_request(body)
+    body = discovery.signed_peer_request(body, audience=SERVER_ID)
     body.update(over)
     return body
 
@@ -173,6 +202,24 @@ def test_an_admitted_peer_runs_a_shared_agent_through_the_real_invoker(
     assert node.ran == ['collect metrics']
 
 
+def test_the_invoke_is_bound_to_the_node_at_that_url_not_any_peer(
+        node, invoker):
+    """The invoker's peer store holds other peers too; the audience must be
+    the node_id held for the url being dialled."""
+    _admit(invoker.node_id, invoker.public_key)
+    with db_session() as db:
+        db.query(PeerNode).filter_by(node_id=SERVER_ID).delete()
+        db.add(PeerNode(node_id='livetest-decoy-peer', url='http://node-c:6777',
+                        status='active', public_key=_other_key(),
+                        integrity_status='verified'))
+    with db_session() as db:
+        db.add(PeerNode(node_id=SERVER_ID, url=PEER_URL, status='active',
+                        public_key=_other_key(), integrity_status='verified'))
+    result = peer_reuse.invoke_peer_agent(PEER_URL, AGENT, 'bound')
+    assert result and result['state'] == 'completed', node.seen
+    assert node.ran == ['bound']
+
+
 def test_the_invoker_signs_with_the_nodes_gossip_identity(node, invoker):
     _admit(invoker.node_id, invoker.public_key)
     captured = {}
@@ -187,19 +234,37 @@ def test_the_invoker_signs_with_the_nodes_gossip_identity(node, invoker):
     assert body['sender'] == {'node_id': invoker.node_id,
                               'public_key': invoker.public_key}
     assert body['agent_id'] == AGENT
+    assert body['audience'] == SERVER_ID
     assert abs(body['timestamp'] - time.time()) < 5
     assert ni.verify_json_signature(invoker.public_key, body,
                                     body['signature'])
 
 
-def test_a_suspicious_peer_is_still_admitted(node, invoker):
-    """'suspicious' is where a served-out ban and a fraud score over 40 land;
-    no peer path refuses it (peer_reuse.admitted_peers, witness and auditor
-    selection all filter only 'banned').  Refusing on it here would make the
-    invoke stricter than the recipe pull it backs up."""
-    _admit(invoker.node_id, invoker.public_key, integrity_status='suspicious')
-    assert _post(node, _signed())[0] == 200
-    assert node.ran == ['summarise']
+@pytest.mark.parametrize('status', ['unverified', 'claimed', 'suspicious'])
+def test_a_peer_this_node_has_not_verified_is_refused(node, invoker, status):
+    """Review of a5364ba66: a row is not admission.  Any fresh key gets an
+    'unverified' row from the open announce; 'claimed' is a self-reported
+    code hash; 'suspicious' is a fraud score over 40.  Only a peer that
+    answered this node's integrity challenge ('verified') runs an agent."""
+    _admit(invoker.node_id, invoker.public_key, integrity_status=status)
+    code, body = _post(node, _signed())
+    assert code == 401, body
+    assert 'not verified' in body['error']['message']
+    assert node.ran == []
+
+
+def test_a_request_signed_for_another_node_is_refused(node, invoker):
+    """The audience is inside the signature: a request captured on its
+    way to one node does not run on another that also verified the sender."""
+    _admit(invoker.node_id, invoker.public_key)
+    body = discovery.signed_peer_request(
+        {'jsonrpc': '2.0', 'id': 1, 'method': 'message/send', 'agent_id': AGENT,
+         'params': {'message': {'parts': [{'kind': 'text', 'text': 'x'}]}}},
+        audience='livetest-some-other-node')
+    code, resp = _post(node, body)
+    assert code == 401, resp
+    assert 'another node' in resp['error']['message']
+    assert node.ran == []
 
 
 # ── what is refused ─────────────────────────────────────────────────────
@@ -217,7 +282,7 @@ def test_a_banned_node_is_refused(node, invoker, ban_until):
            ban_until=ban_until and datetime.utcnow() + ban_until)
     status, body = _post(node, _signed())
     assert status == 401, body
-    assert 'banned' in body['error']['message']
+    assert body['error']['message'] == 'peer not admitted: node is banned'
     assert node.ran == []
 
 
@@ -232,7 +297,7 @@ def test_a_ban_that_has_not_expired_is_refused_whatever_the_status(
 
 def test_a_ban_that_has_expired_no_longer_refuses(node, invoker):
     _admit(invoker.node_id, invoker.public_key,
-           integrity_status='suspicious',
+           integrity_status='verified',
            ban_until=datetime.utcnow() - timedelta(hours=1))
     assert _post(node, _signed())[0] == 200
 
@@ -405,7 +470,7 @@ def test_an_admitted_peer_reads_a_task(node, invoker):
     _admit(invoker.node_id, invoker.public_key)
     body = discovery.signed_peer_request({
         'jsonrpc': '2.0', 'id': 3, 'method': 'message/get',
-        'params': {'taskId': task_id}, 'agent_id': AGENT})
+        'params': {'taskId': task_id}, 'agent_id': AGENT}, audience=SERVER_ID)
     status, resp = _post(node, body)
     assert status == 200, resp
     assert resp['result']['state'] == 'completed'
@@ -444,3 +509,134 @@ def test_a_phones_consent_pending_is_reported_as_403_not_401(
         with db_session() as db:
             db.query(UserConsent).filter_by(user_id='livetest-owner').delete(
                 synchronize_session=False)
+
+
+# ── through the REAL admission path: announce, then the integrity challenge ──
+#
+# No planted rows: the invoker announces itself through the real
+# gossip.handle_announce (the one admission path), and becomes 'verified' only
+# by answering the serving node's real IntegrityService challenge with its own
+# real handle_challenge, signed by its own key.
+
+@pytest.fixture
+def gossip(monkeypatch):
+    from integrations.social.peer_discovery import gossip as g
+    # A new row starts an auto-follow thread that dials the peer: not this test.
+    monkeypatch.setattr(g, '_auto_federate_peer', lambda *a, **k: None)
+    return g
+
+
+def _announce(gossip, invoker, **fields):
+    info = {'node_id': invoker.node_id, 'url': INVOKER_URL,
+            'name': 'livetest-invoker', 'version': '1.0.0',
+            'public_key': invoker.public_key,
+            'timestamp': int(time.time()), 'tier': 'flat'}
+    info.update(fields)
+    info['signature'] = ni.sign_json_payload(info)
+    reasons = []
+    new = gossip.handle_announce(info, reasons=reasons)
+    return new, reasons
+
+
+def _row(node_id):
+    with db_session() as db:
+        r = db.query(PeerNode).filter_by(node_id=node_id).first()
+        return r and types.SimpleNamespace(
+            integrity_status=r.integrity_status, public_key=r.public_key)
+
+
+def _challenge(monkeypatch, invoker, challenge_type='guardrail_verify',
+               tamper=None):
+    """The serving node challenges the invoker, over the real protocol.  The
+    invoker answers with its real handle_challenge (signed by its key);
+    ``tamper`` lets a dishonest node change its answer and re-sign it."""
+    from integrations.social import integrity_service as isvc
+    from integrations.social.integrity_service import IntegrityService
+
+    def answer(url, json=None, timeout=None, **kw):
+        assert url == f'{INVOKER_URL}/api/social/integrity/challenge'
+        with db_session() as peer_db:
+            out = IntegrityService.handle_challenge(peer_db, json)
+        if tamper:
+            out['response'] = tamper(dict(out['response']))
+            out['signature'] = ni.sign_json_payload(out['response'])
+        return types.SimpleNamespace(status_code=200,
+                                     json=lambda: {'success': True, **out})
+    monkeypatch.setattr(isvc, 'pooled_post', answer)
+    with _AsServer(), db_session() as db:
+        return IntegrityService.create_challenge(
+            db, SERVER_ID, invoker.node_id, INVOKER_URL, challenge_type)
+
+
+def _hive_hashes():
+    from security.hive_guardrails import get_guardrail_hash
+    return {'guardrail_hash': get_guardrail_hash(),
+            'code_hash': 'livetest-unregistered-desktop-build'}
+
+
+def test_a_stranger_that_announced_itself_cannot_run_an_agent(
+        node, invoker, gossip):
+    """The reviewer's probe, as a test: a fresh key, no guardrail hash, an
+    unknown code hash.  The open announce admits the row ('unverified');
+    that row alone must not run anything."""
+    new, reasons = _announce(gossip, invoker)
+    assert new is True, reasons
+    assert _row(invoker.node_id).integrity_status == 'unverified'
+    result = peer_reuse.invoke_peer_agent(PEER_URL, AGENT,
+                                          'open notepad and type hi')
+    assert result is None
+    assert node.seen[-1][0] == 401, node.seen
+    assert 'not verified' in node.seen[-1][1]['error']['message']
+    assert node.ran == []
+
+
+def test_a_node_with_another_guardrail_hash_is_refused_at_announce(
+        node, invoker, gossip):
+    new, reasons = _announce(gossip, invoker, guardrail_hash='0' * 64)
+    assert new is False and 'guardrail hash mismatch' in reasons[0]
+    assert _row(invoker.node_id) is None
+    assert peer_reuse.invoke_peer_agent(PEER_URL, AGENT, 'x') is None
+    assert node.ran == []
+
+
+def test_a_peer_that_passed_the_real_verification_runs_the_agent(
+        node, invoker, gossip, monkeypatch):
+    new, reasons = _announce(gossip, invoker, **_hive_hashes())
+    assert new is True, reasons
+    assert _row(invoker.node_id).integrity_status == 'unverified'
+    verdict = _challenge(monkeypatch, invoker)
+    assert verdict['passed'] is True, verdict
+    assert _row(invoker.node_id).integrity_status == 'verified'
+    result = peer_reuse.invoke_peer_agent(PEER_URL, AGENT, 'collect metrics')
+    assert result and result['state'] == 'completed', node.seen
+    assert node.ran == ['collect metrics']
+
+
+def test_a_peer_that_answers_with_another_guardrail_hash_is_not_admitted(
+        node, invoker, gossip, monkeypatch):
+    """Announced without a hash (so the announce could not compare one), then
+    answered the challenge with a guardrail hash that is not the hive's."""
+    _announce(gossip, invoker)
+
+    def other_values(resp):
+        resp['guardrail_hash'] = resp['guardrail_hash_live'] = '0' * 64
+        return resp
+    verdict = _challenge(monkeypatch, invoker, tamper=other_values)
+    assert verdict['passed'] is False, verdict
+    assert _row(invoker.node_id).integrity_status != 'verified'
+    assert peer_reuse.invoke_peer_agent(PEER_URL, AGENT, 'x') is None
+    assert node.ran == []
+
+
+def test_a_verified_peer_that_later_fails_a_challenge_is_refused_again(
+        node, invoker, gossip, monkeypatch):
+    _announce(gossip, invoker, **_hive_hashes())
+    assert _challenge(monkeypatch, invoker)['passed'] is True
+
+    def other_values(resp):
+        resp['guardrail_hash'] = resp['guardrail_hash_live'] = '0' * 64
+        return resp
+    assert _challenge(monkeypatch, invoker, tamper=other_values)['passed'] is False
+    assert _row(invoker.node_id).integrity_status == 'claimed'
+    assert peer_reuse.invoke_peer_agent(PEER_URL, AGENT, 'x') is None
+    assert node.ran == []

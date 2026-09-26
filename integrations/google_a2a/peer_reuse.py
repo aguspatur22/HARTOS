@@ -403,8 +403,19 @@ def discover_peer_agent(
 
 # ─── Invoke (JSON-RPC message/send, the existing contract) ──────────
 
+def _peer_node_id_for(peer_url: str) -> str:
+    """The node_id this node holds for the peer at ``peer_url`` (the
+    audience a signed invoke is bound to), or '' when none is known."""
+    want = (peer_url or '').rstrip('/')
+    for p in admitted_peers(limit=1000):
+        if (p.get('url') or '').rstrip('/') == want:
+            return p.get('node_id') or ''
+    return ''
+
+
 def invoke_peer_agent(peer_url: str, agent_id: str, prompt: str,
-                      timeout: float = _INVOKE_TIMEOUT_S) -> Optional[dict]:
+                      timeout: float = _INVOKE_TIMEOUT_S,
+                      peer_node_id: Optional[str] = None) -> Optional[dict]:
     """POST the existing /a2a/<id>/jsonrpc message/send contract.
 
     The body is signed with this node's gossip identity
@@ -412,8 +423,11 @@ def invoke_peer_agent(peer_url: str, agent_id: str, prompt: str,
     timestamp, Ed25519 signature) and names the agent it is for, so a
     peer that admitted this node runs a shared agent without any other
     credential (owner ruling 2026-09-26; the server half is
-    discovery.admitted_peer_sender).  A node that cannot sign sends the
-    body unsigned, which only a LAN-trusted peer admits.
+    discovery.admitted_peer_sender, which also requires that the peer has
+    VERIFIED this node).  The signature is bound to the receiving node
+    (``peer_node_id``, else the node_id held for ``peer_url`` in the peer
+    store).  A node that cannot sign sends the body unsigned, which only a
+    LAN-trusted peer admits.
 
     Returns the A2A task envelope (id/contextId/state/content) or None
     on any transport / JSON-RPC failure (logged). NOTE: an envelope
@@ -434,7 +448,8 @@ def invoke_peer_agent(peer_url: str, agent_id: str, prompt: str,
     }
     try:
         from integrations.social.discovery import signed_peer_request
-        rpc = signed_peer_request(rpc)
+        rpc = signed_peer_request(
+            rpc, audience=peer_node_id or _peer_node_id_for(peer_url))
     except Exception as e:
         logger.warning(f'peer_reuse: could not sign the invoke of {agent_id} '
                        f'({e}); sending unsigned, which a peer that is not '

@@ -1497,36 +1497,48 @@ _seen_peer_signatures = {}
 _seen_peer_signatures_lock = threading.Lock()
 
 
-def signed_peer_request(payload: dict) -> dict:
-    """``payload`` plus ``sender`` {node_id, public_key}, ``timestamp`` and
-    ``signature``: signed by this node's Ed25519 key over every field but
-    'signature' (node_integrity.canonical_payload).
+def signed_peer_request(payload: dict, audience: str) -> dict:
+    """``payload`` plus ``sender`` {node_id, public_key}, ``audience``,
+    ``timestamp`` and ``signature``: signed by this node's Ed25519 key over
+    every field but 'signature' (node_integrity.canonical_payload).
 
     node_id is SyncEngine.canonical_node_id(), the id this node's PeerNode row
-    carries on every peer (gossip.node_id).  No new key material.  Raises if
-    the node cannot sign; the caller decides whether to send unsigned."""
+    carries on every peer (gossip.node_id).  ``audience`` is the node_id of
+    the node the request is FOR, so a captured request cannot be replayed to
+    another node that also admitted the sender.  No new key material.  Raises
+    if the node cannot sign; the caller decides whether to send unsigned."""
     from security.node_integrity import get_public_key_hex, sign_json_payload
     from .sync_engine import SyncEngine
     body = {k: v for k, v in payload.items() if k != 'signature'}
     body['sender'] = {'node_id': SyncEngine.canonical_node_id(),
                       'public_key': get_public_key_hex()}
+    body['audience'] = audience
     body['timestamp'] = int(_time.time())
     body['signature'] = sign_json_payload(body)
     return body
 
 
-def admitted_peer_sender(db, payload: dict):
-    """(node_id, '') when ``payload`` was signed by a node this node admitted,
-    else (None, reason).  The ONE rule for "is this request from an admitted
-    peer":
+def admitted_peer_sender(db, payload: dict, audience: str):
+    """(node_id, '') when ``payload`` was signed by a node this node has
+    VERIFIED, for this node, else (None, reason).  The ONE rule for "is this
+    request from an admitted peer":
 
-      - ``sender.node_id`` names a PeerNode row (the gossip admission gate
-        wrote it; nothing else does);
-      - the row is not banned: integrity_status 'banned', or a ban_until still
-        in the future whatever the status says.  'suspicious' is admitted: it
-        is where a served-out ban and a score over 40 land, and every other
-        peer path (peer_reuse.admitted_peers, witness and auditor selection)
-        filters only 'banned';
+      - ``sender.node_id`` names a PeerNode row whose integrity_status is
+        'verified'.  A row alone is not admission: POST
+        /api/social/peers/announce is open, checks the guardrail hash only
+        when one is sent and admits an unknown code hash as untrusted, so any
+        fresh key gets an 'unverified' row (review of a5364ba66, probed
+        through the real handle_announce).  'verified' is written by one
+        thing, IntegrityService.evaluate_challenge_response, when the node
+        answered this node's integrity challenge (nonce, signed by the key
+        on file; guardrail_verify compares its live guardrail hash, and a
+        failed or undecided code_hash_check withholds or revokes it).  That
+        is the hive's hash verification.  'unverified', 'claimed' (a
+        self-reported hash, never proven), 'suspicious' (fraud score >= 40)
+        and 'banned' are refused;
+      - no ban_until still in the future, whatever the status says;
+      - ``audience`` is this node's own id: a request signed for another node
+        does not run here;
       - the key the sender names is the key on file, and the signature
         verifies against the key on file (_sender_signature_valid: never a
         key from the request);
@@ -1537,6 +1549,13 @@ def admitted_peer_sender(db, payload: dict):
 
     Row status (active/stale/dead) is not consulted: a node calling us is
     alive, and liveness is the health round's business, not trust.
+
+    Measured on the owner's desktop DB (2026-09-26): the integrity round
+    does verify real peers (LAN desktop 230c3115 verified by passed
+    challenges; 73 distinct peers have passed at least one), but slowly on a
+    large table: 230c3115's first challenge came ~23.6 h after it was first
+    seen.  Until then the invoke is refused and the caller falls through to
+    local CREATE, as before this rule existed.
     """
     from datetime import datetime
     from .integrity_service import WITNESS_TIMESTAMP_MAX_AGE
@@ -1551,6 +1570,8 @@ def admitted_peer_sender(db, payload: dict):
     sent_key = sender.get('public_key')
     if not node_id or not isinstance(node_id, str) or not sent_key:
         return None, 'no sender'
+    if not audience or payload.get('audience') != audience:
+        return None, 'signed for another node'
     ts = payload.get('timestamp')
     if isinstance(ts, bool) or not isinstance(ts, (int, float)):
         return None, 'no timestamp'
@@ -1563,6 +1584,8 @@ def admitted_peer_sender(db, payload: dict):
     if peer.integrity_status == 'banned' or (
             peer.ban_until is not None and peer.ban_until > datetime.utcnow()):
         return None, 'node is banned'
+    if peer.integrity_status != 'verified':
+        return None, f'node not verified ({peer.integrity_status})'
     if not peer.public_key or peer.public_key != sent_key:
         return None, 'key is not the key on file'
     if not _sender_signature_valid(db, payload, node_id=node_id):

@@ -42,8 +42,13 @@ JSON-RPC 2.0 endpoint for A2A messages.
 `task/cancel` read and end those turns, so all three are admitted when
 EITHER the node's `/chat` gate admits the caller (this machine's own
 callers, LAN-trusted tiers, `X-API-Key` / Bearer JWT, a phone the owner
-allowed) OR the body is signed by a node the hive admitted (a `PeerNode`
-row written by the gossip admission gate, not banned). A peer signs with
+allowed) OR the body is signed by a node this node has VERIFIED: its
+`PeerNode` row (written by the gossip admission gate) is
+`integrity_status='verified'`, which only an answered integrity challenge
+writes (guardrail hash re-checked live; a failed or undecided code-hash
+check withholds or revokes it), and no ban is in force. A row the open
+announce created ('unverified'), a self-reported hash ('claimed') or a
+fraud score over 40 ('suspicious') does not run anything. A peer signs with
 the Ed25519 key it already gossips under; there is no other credential:
 
 ```json
@@ -52,6 +57,7 @@ the Ed25519 key it already gossips under; there is no other credential:
   "id": "req-001",
   "agent_id": "<the agent_id in the URL>",
   "sender": {"node_id": "<gossip node_id>", "public_key": "<hex>"},
+  "audience": "<the receiving node's node_id>",
   "timestamp": 1790000000,
   "signature": "<hex Ed25519 over every field but 'signature'>"
 }

@@ -306,7 +306,8 @@ class A2AProtocolServer:
               exempt prefix for the peer protocol's discovery half, and that
               exemption let an unauthenticated caller on another machine run
               a turn (review of 309bcd032); or
-          (b) the body is signed by a node the hive admitted, for THIS agent
+          (b) the body is signed by a node this node has VERIFIED (answered
+              its integrity challenge), for THIS node and THIS agent
               (discovery.admitted_peer_sender; owner ruling 2026-09-26: "only
               a hash verified node is enough").  peer_reuse.invoke_peer_agent
               signs; without (b) every peer invoke of a bundled, central or
@@ -328,8 +329,10 @@ class A2AProtocolServer:
                 try:
                     from integrations.social.discovery import admitted_peer_sender
                     from integrations.social.models import db_session
+                    from integrations.social.sync_engine import SyncEngine
                     with db_session(commit=False) as db:
-                        peer, why = admitted_peer_sender(db, body)
+                        peer, why = admitted_peer_sender(
+                            db, body, audience=SyncEngine.canonical_node_id())
                 except Exception as e:
                     logger.warning(f'A2A peer admission check failed: {e}')
                     return 503, 'authorization unavailable'
