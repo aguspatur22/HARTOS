@@ -271,3 +271,33 @@ def test_a_second_serving_shell_does_not_displace_the_first():
     second = LiquidUIService(a2ui_enabled=True)
     second._register_self()
     assert get_registry().get_or_none('LiquidUIService') is first
+
+
+def test_a_serving_shell_does_not_build_a_throwaway_headless_instance(tmp_path):
+    """Review of a0ecafe09 (item 3): _register_self called get_or_none to
+    inspect the seat, which ran bootstrap's lazy factory and built a full
+    headless LiquidUIService only to unregister it.  An un-instantiated
+    seat can only be headless (a serving registration is materialised as
+    it registers), so it is displaced without being built."""
+    from integrations.agent_engine.liquid_ui_service import LiquidUIService
+    reg = _bootstrap(tmp_path, os_mode=False)
+    shell = LiquidUIService(a2ui_enabled=True)
+    built = []
+    real_init = LiquidUIService.__init__
+
+    def _counting_init(self, *a, **k):
+        built.append(self)
+        real_init(self, *a, **k)
+    with patch.object(LiquidUIService, '__init__', _counting_init):
+        shell._register_self()
+    assert built == []
+    assert reg.get_or_none('LiquidUIService') is shell
+
+
+def test_a_lazily_registered_serving_shell_is_still_not_displaced():
+    """The first serving shell's seat is materialised when it registers, so
+    a later peek sees it and a second shell leaves it alone."""
+    from integrations.agent_engine.liquid_ui_service import LiquidUIService
+    first = LiquidUIService(a2ui_enabled=True)
+    first._register_self()
+    assert get_registry().peek('LiquidUIService') is first
