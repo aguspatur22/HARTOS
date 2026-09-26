@@ -26,20 +26,57 @@ discovery_bp = Blueprint('social_discovery', __name__)
 _ANNOUNCE_RATE = {}   # ip -> list of timestamps
 _RATE_LIMIT = 10      # max announcements per window per CLIENT IP (_observed_ip)
 _RATE_WINDOW = 60     # window in seconds
+_RATE_LOCK = threading.Lock()
+_rate_last_sweep = [0.0]
 
 
 def _check_announce_rate(ip: str) -> bool:
     """Returns True if request is allowed, False if rate-limited.
-    Prevents gossip flooding from rapid peer announcements."""
+    Prevents gossip flooding from rapid peer announcements.
+
+    Once per window, clients with no request inside the window are dropped,
+    so the table holds at most the clients active in one window instead of
+    every key ever seen."""
     now = _time.time()
-    times = _ANNOUNCE_RATE.get(ip, [])
-    # Prune expired entries
-    times = [t for t in times if now - t < _RATE_WINDOW]
-    if len(times) >= _RATE_LIMIT:
-        return False
-    times.append(now)
-    _ANNOUNCE_RATE[ip] = times
-    return True
+    with _RATE_LOCK:
+        if now - _rate_last_sweep[0] >= _RATE_WINDOW:
+            for k in [k for k, v in _ANNOUNCE_RATE.items()
+                      if not v or now - v[-1] >= _RATE_WINDOW]:
+                del _ANNOUNCE_RATE[k]
+            _rate_last_sweep[0] = now
+        times = _ANNOUNCE_RATE.get(ip, [])
+        # Prune expired entries
+        times = [t for t in times if now - t < _RATE_WINDOW]
+        if len(times) >= _RATE_LIMIT:
+            _ANNOUNCE_RATE[ip] = times
+            return False
+        times.append(now)
+        _ANNOUNCE_RATE[ip] = times
+        return True
+
+
+def _rate_client_key() -> str:
+    """Who to charge a rate-limited request to.
+
+    Behind Kong the socket peer is the gateway for EVERY node, so keying on
+    it made the whole network share one budget (55d8b9152). But
+    X-Forwarded-For is written by whoever sends the request, so it may only
+    be believed when the socket peer is a forwarder we run: the configured
+    TRUSTED_PROXY (the gate core/auth_local.py uses), or a literal loopback
+    or private address (a gateway on this host or this LAN). A direct
+    client from anywhere else is charged by its socket address, and a
+    header it sends cannot move it to a fresh budget."""
+    from security.middleware import _is_private_address
+    peer = request.remote_addr or ''
+    trusted = os.environ.get('TRUSTED_PROXY', '')
+    if peer and ((trusted and peer == trusted) or _is_private_address(peer)):
+        return _observed_ip() or peer
+    return peer or '0.0.0.0'
+
+
+def check_client_rate() -> bool:
+    """_check_announce_rate for the requesting client (see _rate_client_key)."""
+    return _check_announce_rate(_rate_client_key())
 
 _BASE_URL = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
 
@@ -198,7 +235,7 @@ def _observed_ip() -> str:
 @discovery_bp.route('/api/social/peers/announce', methods=['POST'])
 def peer_announce():
     """Receive a peer announcement. Merge into local peer list."""
-    if not _check_announce_rate(_observed_ip()):
+    if not check_client_rate():
         return jsonify({'success': False, 'error': 'Rate limited'}), 429
     from .peer_discovery import gossip
     data = request.get_json(force=True, silent=True) or {}
@@ -270,7 +307,7 @@ def peer_list():
 @discovery_bp.route('/api/social/peers/exchange', methods=['POST'])
 def peer_exchange():
     """Gossip exchange: receive their peers, return ours."""
-    if not _check_announce_rate(_observed_ip()):
+    if not check_client_rate():
         return jsonify({'success': False, 'error': 'Rate limited'}), 429
     from .peer_discovery import gossip
     data = request.get_json(force=True, silent=True) or {}
@@ -471,8 +508,7 @@ def peer_broadcast():
     Unknown types are acknowledged but not dispatched, so new gossip
     payload types can be added without wire-breaking older peers.
     """
-    ip = _observed_ip() or '0.0.0.0'  # the client, not the Kong gateway
-    if not _check_announce_rate(ip):
+    if not check_client_rate():  # the client, not the Kong gateway
         return jsonify({'success': False, 'reason': 'rate_limited'}), 429
 
     msg = request.get_json(force=True, silent=True) or {}
@@ -542,8 +578,7 @@ def peer_embedding_delta():
     Phase 1 gradient sync: peers submit embedding deltas via gossip.
     Deltas are validated and fed to FederatedAggregator's embedding channel.
     """
-    ip = _observed_ip() or '0.0.0.0'  # the client, not the Kong gateway
-    if not _check_announce_rate(ip):
+    if not check_client_rate():  # the client, not the Kong gateway
         return jsonify({'success': False, 'reason': 'rate_limited'}), 429
 
     body = request.get_json(silent=True) or {}
@@ -734,7 +769,7 @@ def federation_follow_notification():
             'node_id': follower_node,
             'url': follower_url,
             'name': f'follower-{follower_node[:8]}',
-        })
+        }, observed_ip=_observed_ip())
         # RECORD the follow — for this handler's whole life it logged "now
         # follows us" while writing nothing, so get_followers() stayed empty
         # on every node and push_to_followers never had a single target

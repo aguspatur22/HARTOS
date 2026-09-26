@@ -378,8 +378,8 @@ def _apply_api_auth(app: Flask, register: bool = True):
             with db_session(commit=True) as db:
                 verdict = verify_device_jwt(db, token, owner)
                 if verdict['status'] == 'pending':
-                    from integrations.social.discovery import _check_announce_rate
-                    if _check_announce_rate(request.remote_addr or ''):
+                    from integrations.social.discovery import check_client_rate
+                    if check_client_rate():
                         file_device_access_ask(db, owner, verdict['public_key'],
                                                verdict.get('claims') or {})
                     else:
