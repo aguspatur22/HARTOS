@@ -46,6 +46,8 @@ import logging
 from functools import partial, wraps
 from typing import get_type_hints
 
+from core.constants import TOOL_EXECUTION_FAILED_PREFIX
+
 # Module-level tool_logger named "agent_logger" — matches the legacy
 # logger create_recipe.py:284 configured with a RotatingFileHandler.
 # When that file is imported (which always happens at HARTOS boot)
@@ -170,7 +172,9 @@ def _error_envelope(func_name: str, exc: BaseException) -> str:
         "error_message": str(exc),
         "suggestion": "Check logs for detailed traceback information",
     }
-    return f"Tool execution failed: {json.dumps(payload)}"
+    # The prefix lives in core.constants so tool_reply_failed, which CREATE's
+    # trace banker and REUSE's fabrication gate both read, cannot drift from it.
+    return f"{TOOL_EXECUTION_FAILED_PREFIX} {json.dumps(payload)}"
 
 
 def log_tool_execution(func=None, *, name=None, plain_errors=False):

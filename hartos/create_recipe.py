@@ -5882,26 +5882,40 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
             # Only work that SUCCEEDED is a step (CR3, live 2026-09-25).  Two
             # kinds of work run in the group chat:
             #  * a tool call, answered by a tool message whose tool_responses
-            #    carry the call's id.  A reply that opens with a failure
-            #    prefix means the call did nothing: "Error: ..." is what the
-            #    executor (hartos/helper.py enhanced_execute_function) answers
-            #    for an unknown function, bad arguments or a raise, and "Tool
-            #    execution failed: " is core.tool_logging's error envelope.
-            #    Banking those made a failed save_data_in_memory the recipe.
+            #    carry the call's id.  A reply that core.constants
+            #    .tool_reply_failed reads as a failure means the call did not
+            #    do its work: the executor's "Error: ...", core.tool_logging's
+            #    error envelope, or one of TOOL_FAILURE_RESULTS -- which this
+            #    module's own execute_windows_or_android_command returns when
+            #    it refuses (operator gate, computer-control consent, a VLM
+            #    loop that could not finish).  Banking those made a failed
+            #    save_data_in_memory the recipe, and (review of dd46b4da0) a
+            #    desktop action refused for want of consent a step REUSE
+            #    would replay.  The REUSE fabrication gate reads the same
+            #    predicate, so the two ends cannot disagree about a failure.
             #  * a code block the Executor ran: the Assistant posts ```lang
             #    fences and the Executor answers "exitcode: 0 ...".  Reading
             #    only tool_calls dropped this work, so a code-only action
             #    banked "no-op" and REUSE had no code to replay.
-            _FAILED_REPLY_PREFIXES = ('Error:', 'Tool execution failed:')
+            from core.constants import tool_reply_failed
             from autogen.code_utils import extract_code, UNKNOWN
             window = [m for m in msgs[start:end] if isinstance(m, dict)]
             failed_ids = set()
             for m in window:
                 for r in (m.get('tool_responses') or []):
                     if (isinstance(r, dict) and r.get('tool_call_id')
-                            and str(r.get('content') or '').lstrip()
-                            .startswith(_FAILED_REPLY_PREFIXES)):
+                            and tool_reply_failed(r.get('content'))):
                         failed_ids.add(r['tool_call_id'])
+            # Window positions of the code messages already banked.  One
+            # authored block can earn several "exitcode: 0" replies: measured
+            # with the real autogen 0.2.37 executor configured as this module
+            # configures its Executor (last_n_messages=2, no docker) and a side-effect counter in the
+            # block, the Executor selected twice in a row ran the ONE block
+            # twice, and the Assistant (which also executes code here) a third
+            # time.  That is the executor re-scanning the same message, not
+            # new work, so the block is one step; banking it per reply made
+            # REUSE replay it, side effects and all, once per re-scan.
+            banked_code = set()
             found = []
             for k, m in enumerate(window):
                 for tc in (m.get('tool_calls') or []):
@@ -5927,11 +5941,14 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
                 # can span more group messages than 2 (review of ff929cd08,
                 # probed with the real Executor: a block three group messages
                 # back ran).
-                for prev in reversed(window[:k]):
+                for j in range(k - 1, -1, -1):
                     blocks = [(lang, code) for lang, code
-                              in extract_code(prev.get('content') or '')
+                              in extract_code(window[j].get('content') or '')
                               if lang != UNKNOWN]
                     if blocks:
+                        if j in banked_code:
+                            break
+                        banked_code.add(j)
                         found.append({
                             'steps': 'run the code in generalized_functions',
                             'tool_name': '',

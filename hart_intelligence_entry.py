@@ -3623,18 +3623,15 @@ def _wire_qr_pair_emitter(channel_type: str, meta: dict) -> None:
     spawn via the same callback.
     """
     try:
-        from core.platform.registry import get_registry as _platform_registry
+        from core.platform.registry import ServiceRegistry
         from integrations.channels.registry import get_registry
-        _lui = _platform_registry().get_or_none('LiquidUIService')
+        _lui = ServiceRegistry.get('LiquidUIService')
         if _lui is None:
             return
         adapter = get_registry().get(channel_type)
         if adapter is None or not hasattr(adapter, 'set_qr_callback'):
             return
-        # The card is FOR this user; None lets agent_ui_update fall back to
-        # the resolved owner rather than route to a user named 'system'.
-        _owner = thread_local_data.get_user_id() or None
-        user_id = _owner or 'system'
+        user_id = thread_local_data.get_user_id() or 'system'
         display_name = meta.get('display_name') or channel_type
 
         def _emit_qr(qr: str) -> None:
@@ -3648,7 +3645,7 @@ def _wire_qr_pair_emitter(channel_type: str, meta: dict) -> None:
                         "devices → Link a device → scan this code."
                     ),
                     'qr': qr,
-                }, user_id=_owner)
+                })
             except Exception as e:
                 logger.debug("qr_pair emit failed: %s", e)
 
@@ -3723,10 +3720,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
     # probes that load this helper before full HARTOS bootstrap).
     _log = _logging.getLogger(__name__)
 
-    # _owner is who the cards are FOR (None -> agent_ui_update's resolved
-    # owner); user_id keeps its 'system' placeholder for the gateway session.
-    _owner = thread_local_data.get_user_id() or None
-    user_id = _owner or 'system'
+    user_id = thread_local_data.get_user_id() or 'system'
     sid = user_id if str(user_id).startswith('user_') else f"user_{user_id}"
     display_name = meta.get('display_name') or channel_type
     icon = meta.get('icon') or channel_type
@@ -3788,7 +3782,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
                         # _start_gateway_qr_pair_push with phone bound in
                         # request body.
                         'action': f'/api/social/channels/{channel_type}/connect-pair-code',
-                    }, user_id=_owner,
+                    }, user_id=user_id,
                 )
         except Exception:
             logging.getLogger(__name__).exception("_start_gateway_qr_pair_push: swallowed Exception")
@@ -3890,7 +3884,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
                         f"(60-second window).  I've also pushed it "
                         f"to your phone with auto-copy to clipboard."
                     ),
-                }, user_id=_owner,
+                }, user_id=user_id,
             )
     except Exception as e:
         _log.debug("gateway_qr: chat card emit failed: %s", e)
@@ -4009,7 +4003,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
                                     'message': (
                                         f"✅ {display_name} connected."
                                     ),
-                                }, user_id=_owner,
+                                }, user_id=user_id,
                             )
                     except Exception:
                         logging.getLogger(__name__).exception("_poll: swallowed Exception")
@@ -4317,8 +4311,8 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                             user_id=int(thread_local_data.get_user_id() or 0),
                             channel_type=channel_type,
                         )
-                        from core.platform.registry import get_registry
-                        _lui = get_registry().get_or_none('LiquidUIService')
+                        from core.platform.registry import ServiceRegistry
+                        _lui = ServiceRegistry.get('LiquidUIService')
                         if _lui:
                             _lui.agent_ui_update(
                                 thread_local_data.get_user_id() or 'system',
@@ -4348,7 +4342,6 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                                     'external_url': meta.get('external_url'),
                                     'cta_label': f"Connect with {meta.get('display_name') or channel_type}",
                                 },
-                                user_id=thread_local_data.get_user_id() or None,
                             )
                             return (
                                 f"To connect {meta.get('display_name') or channel_type}, "
@@ -4372,8 +4365,8 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                 # via the admin Channels page (which shows ALL fields).
                 visible_fields = [f for f in setup_fields if not f.get('auto')]
                 if visible_fields:
-                    from core.platform.registry import get_registry
-                    _lui = get_registry().get_or_none('LiquidUIService')
+                    from core.platform.registry import ServiceRegistry
+                    _lui = ServiceRegistry.get('LiquidUIService')
                     if _lui:
                         _lui.agent_ui_update(
                             thread_local_data.get_user_id() or 'system',
@@ -4406,7 +4399,6 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                                 'submit_label': 'Connect',
                                 'submit_action': 'register_channel',
                             },
-                            user_id=thread_local_data.get_user_id() or None,
                         )
         except Exception as e:
             logger.debug("Connect_Channel: liquid UI emit skipped: %s", e)
@@ -4613,8 +4605,8 @@ def _handle_join_external_room_tool(input_text: str) -> str:
         if not allowed:
             # Surface a Liquid UI consent card so the user can grant in one click.
             try:
-                from core.platform.registry import get_registry
-                _lui = get_registry().get_or_none('LiquidUIService')
+                from core.platform.registry import ServiceRegistry
+                _lui = ServiceRegistry.get('LiquidUIService')
                 if _lui:
                     # A NOTIFICATION, not an approval card: the gate already
                     # decided, and this only points the owner at where to
@@ -4645,7 +4637,6 @@ def _handle_join_external_room_tool(input_text: str) -> str:
                                  'target': '/social/settings/privacy'},
                             ],
                         },
-                        user_id=str(uid),
                     )
             except Exception as e:
                 logger.debug("Join_External_Room: consent UI emit skipped: %s", e)

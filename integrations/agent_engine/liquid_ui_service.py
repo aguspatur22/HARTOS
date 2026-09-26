@@ -9825,11 +9825,6 @@ function renderAgentOverlay(ev) {{
         first shell to serve keeps the seat, and a second serve of the same
         instance is a no-op, not a double-register error.
 
-        The seat is inspected with peek(), which never runs a factory: a
-        serving registration is materialised as it registers (below), so an
-        un-built seat is bootstrap's lazy headless one and is displaced
-        without constructing a throwaway LiquidUIService.
-
         It does NOT reach a shell in another process: the :6800 unit on HART
         OS does not subscribe to `agent.ui.update`, so a push made in the
         backend process is not stored here (see run_home_compose for the one
@@ -9840,12 +9835,14 @@ function renderAgentOverlay(ev) {{
             from core.platform.registry import get_registry
             reg = get_registry()
             if reg.has('LiquidUIService'):
-                current = reg.peek('LiquidUIService')
+                try:
+                    current = reg.get_or_none('LiquidUIService')
+                except RuntimeError:
+                    current = None       # its factory failed: nothing to keep
                 if current is self or getattr(current, '_serves_shell', False):
                     return
                 reg.unregister('LiquidUIService')
             reg.register('LiquidUIService', lambda: self)
-            reg.get('LiquidUIService')   # materialise: a later peek sees it
         except Exception as e:
             logger.debug("LiquidUIService self-register skipped: %s", e)
 

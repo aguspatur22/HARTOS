@@ -1286,6 +1286,52 @@ TOOL_FAILURE_RESULTS: tuple = (
     "not running in your computer, Open the companion app & try again",
 )
 
+# How core.tool_logging's error envelope opens: a wrapped tool that RAISED
+# answers "Tool execution failed: {json}".  Here, not in tool_logging, so the
+# envelope's writer and tool_reply_failed below read one spelling.
+TOOL_EXECUTION_FAILED_PREFIX: str = "Tool execution failed:"
+
+# How a tool reply opens when the call did not run or raised.  "Error:" is
+# the executor's answer (hartos/helper.py enhanced_execute_function and
+# tool_argument_error: unknown function, arguments that do not bind, a raise).
+TOOL_ERROR_REPLY_PREFIXES: tuple = ("Error:", TOOL_EXECUTION_FAILED_PREFIX)
+
+
+def tool_reply_failed(content) -> bool:
+    """True when a tool call's reply says the call FAILED to do its work.
+
+    THE one rule, read by both ends of the recipe pipeline:
+      * CREATE's trace banker (create_recipe._bank_action_recipe_from_trace)
+        -- a failed call is not a recipe step;
+      * REUSE's fabrication gate and its two sibling readers
+        (reuse_recipe._reuse_fabricated_tools, _reuse_completion_evidence,
+        _reuse_own_tool_progress) -- a failed call is not the action's work.
+
+    Two kinds of failure, matched the way their producers write them:
+      * TOOL_ERROR_REPLY_PREFIXES open the reply (after leading whitespace).
+        Prefix only: a real result may QUOTE an error mid-text.
+      * TOOL_FAILURE_RESULTS appear anywhere in it: the tool returns one with
+        its reason APPENDED on a new line (execute_windows_or_android_command,
+        CREATE and REUSE), and the REUSE gate has always matched them by
+        substring.
+
+    Why one rule (review of dd46b4da0): the banker kept its own prefix list
+    and never read TOOL_FAILURE_RESULTS, so a desktop call refused for want
+    of consent -- TOOL_FAILURE_RESULTS[0] + "\\nComputer control consent
+    refused" -- was banked as a step and REUSE would replay it.  The REUSE
+    readers had the mirror gap: none knew the envelope, so a tool that raised
+    counted as done.  Guarded by
+    tests/unit/test_tool_reply_failed_is_one_rule.py.
+
+    HISTORICAL_TOOL_PLACEHOLDER is deliberately NOT covered: it means the
+    call produced nothing, not that it failed, and the REUSE readers test it
+    on its own.
+    """
+    body = "" if content is None else str(content)
+    if body.lstrip().startswith(TOOL_ERROR_REPLY_PREFIXES):
+        return True
+    return any(failure in body for failure in TOOL_FAILURE_RESULTS)
+
 # How much of what a tool OBSERVED may ride back in its return string.
 #
 # Same family as the failure strings above, hence the same home: both decide

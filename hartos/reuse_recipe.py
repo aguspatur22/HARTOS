@@ -23,6 +23,7 @@ from core.constants import (  # noqa: E402  (after io_guard, intentional)
     TOOL_FAILURE_RESULTS,
     TOOL_OBSERVATION_MAX_CHARS,
     VERDICT_COMPLETION_STATUSES,
+    tool_reply_failed,
 )
 
 from enum import Enum
@@ -2274,8 +2275,8 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                 # the user it could not.
                 #
                 # APPENDED, never substituted.  The fabrication gate matches
-                # by substring (`any(f in body for f in
-                # TOOL_FAILURE_RESULTS)`), so the constant still reads as a
+                # by substring (core.constants.tool_reply_failed), so the
+                # constant still reads as a
                 # refusal and a failed action still cannot count as
                 # completed.  Verified by
                 # test_the_failure_contract_is_untouched.
@@ -3960,11 +3961,12 @@ def _reuse_own_tool_progress(user_prompt, action_id, group_chat, agents):
         def _credit(call_id, content, fallback_name):
             body = str(content or '')
             # Same two exclusions the gate draws: the placeholder is minted
-            # BECAUSE nothing executed, and a tool that ran and reported it
-            # could not do the work has not advanced this action either.
+            # BECAUSE nothing executed, and a tool that failed (raised, was
+            # refused, or reported it could not do the work) has not advanced
+            # this action either.
             if HISTORICAL_TOOL_PLACEHOLDER in body:
                 return
-            if any(f in body for f in TOOL_FAILURE_RESULTS):
+            if tool_reply_failed(body):
                 return
             fn = call_fn.get(call_id) or fallback_name
             if fn in wanted:
@@ -4519,7 +4521,7 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                     body = str(result.get('content') or msg.get('content') or '')
                     if call_id in seen or HISTORICAL_TOOL_PLACEHOLDER in body:
                         continue
-                    if any(failure in body for failure in TOOL_FAILURE_RESULTS):
+                    if tool_reply_failed(body):
                         continue
                     if (call_fn.get(call_id) or result.get('name')) in wanted:
                         return True
@@ -5517,7 +5519,11 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
             # action advanced 25s later with unrun=[].  Treated like the
             # placeholder above: report UNRUN so _advance_reuse_action
             # re-steers (bounded) instead of silently marking it verified.
-            if any(f in _body for f in TOOL_FAILURE_RESULTS):
+            # core.constants.tool_reply_failed is the ONE rule, shared with
+            # CREATE's trace banker; it also covers a tool that RAISED
+            # (core.tool_logging's envelope) or never ran (the executor's
+            # "Error: ..."), which this gate used to credit as the work.
+            if tool_reply_failed(_body):
                 return
             fn = _call_fn.get(call_id) or fallback_name
             # Only a REGISTERED tool name counts.  An agent name satisfies
