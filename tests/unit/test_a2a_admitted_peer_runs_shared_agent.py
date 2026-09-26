@@ -220,6 +220,67 @@ def test_the_invoke_is_bound_to_the_node_at_that_url_not_any_peer(
     assert node.ran == ['bound']
 
 
+def _audience_of_invoke(url=PEER_URL):
+    captured = {}
+    real = peer_reuse.pooled_post
+
+    def capture(u, json=None, timeout=None, **kw):
+        captured['body'] = json
+        return real(u, json=json, timeout=timeout, **kw)
+    with patch.object(peer_reuse, 'pooled_post', capture):
+        result = peer_reuse.invoke_peer_agent(url, AGENT, 'x')
+    return captured['body'].get('audience'), result
+
+
+def test_the_audience_is_found_past_a_thousand_other_peers(node, invoker):
+    """The lookup scanned admitted_peers(limit=1000): a store holding more
+    than 1000 admitted rows ahead of the dialled one signed for audience ''
+    and the peer refused the invoke.  Now the url is looked up directly."""
+    _admit(invoker.node_id, invoker.public_key)
+    with db_session() as db:
+        db.query(PeerNode).filter_by(node_id=SERVER_ID).delete()
+    with db_session() as db:
+        db.add_all([PeerNode(node_id=f'livetest-crowd-{i:04d}',
+                             url=f'http://crowd-{i}:6777', status='active',
+                             public_key='', integrity_status='unverified')
+                    for i in range(1005)])
+    with db_session() as db:
+        db.add(PeerNode(node_id=SERVER_ID, url=PEER_URL, status='active',
+                        public_key=_other_key(), integrity_status='verified'))
+    audience, result = _audience_of_invoke()
+    assert audience == SERVER_ID
+    assert result and result['state'] == 'completed', node.seen
+
+
+def test_two_identities_at_one_url_sign_for_the_one_heard_from_last(
+        node, invoker):
+    """A url can carry an older identity too (the node re-keyed): the node
+    answering there now is the one that announced most recently."""
+    _admit(invoker.node_id, invoker.public_key)
+    now = datetime.utcnow()
+    with db_session() as db:
+        db.query(PeerNode).filter_by(node_id=SERVER_ID).one().last_seen = now
+        db.add(PeerNode(node_id='livetest-old-identity', url=PEER_URL + '/',
+                        status='active', public_key=_other_key(),
+                        integrity_status='verified',
+                        last_seen=now - timedelta(days=3)))
+    assert _audience_of_invoke()[0] == SERVER_ID
+    with db_session() as db:
+        db.query(PeerNode).filter_by(
+            node_id='livetest-old-identity').one().last_seen = (
+                now + timedelta(seconds=5))
+    assert _audience_of_invoke()[0] == 'livetest-old-identity'
+
+
+def test_a_banned_row_at_the_url_is_not_the_audience(node, invoker):
+    """Same admission filter as admitted_peers: a banned row is skipped."""
+    _admit(invoker.node_id, invoker.public_key)
+    with db_session() as db:
+        db.query(PeerNode).filter_by(node_id=SERVER_ID).one(
+            ).integrity_status = 'banned'
+    assert _audience_of_invoke()[0] == ''
+
+
 def test_the_invoker_signs_with_the_nodes_gossip_identity(node, invoker):
     _admit(invoker.node_id, invoker.public_key)
     captured = {}

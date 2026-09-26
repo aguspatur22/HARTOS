@@ -261,27 +261,34 @@ def admitted_peers(limit: int = 8) -> List[Dict[str, str]]:
     not banned, not self. Rows only enter this table through the
     gossip admission gate (guardrail_hash + Ed25519), so presence here
     IS the trust rail. Returns [] on any failure (logged)."""
+    try:
+        from integrations.social.models import db_session
+        with db_session(commit=False) as db:
+            rows = _admitted_query(db).limit(limit).all()
+            return [{'node_id': r.node_id, 'url': r.url}
+                    for r in rows if r.url]
+    except Exception as e:
+        logger.info(f'peer_reuse: peer store unavailable: {e}')
+        return []
+
+
+def _admitted_query(db):
+    """The admitted-peer filter (active, not banned, not self) as a query,
+    so a lookup of ONE peer applies the same rule as the list."""
+    from integrations.social.models import PeerNode
     self_id = None
     try:
         from integrations.social.peer_discovery import gossip
         self_id = getattr(gossip, 'node_id', None)
     except Exception as e:
         logger.debug(f'peer_reuse: gossip node_id unavailable: {e}')
-    try:
-        from integrations.social.models import db_session, PeerNode
-        with db_session(commit=False) as db:
-            q = db.query(PeerNode).filter(
-                PeerNode.status == 'active',
-                PeerNode.integrity_status != 'banned',
-            )
-            if self_id:
-                q = q.filter(PeerNode.node_id != self_id)
-            rows = q.limit(limit).all()
-            return [{'node_id': r.node_id, 'url': r.url}
-                    for r in rows if r.url]
-    except Exception as e:
-        logger.info(f'peer_reuse: peer store unavailable: {e}')
-        return []
+    q = db.query(PeerNode).filter(
+        PeerNode.status == 'active',
+        PeerNode.integrity_status != 'banned',
+    )
+    if self_id:
+        q = q.filter(PeerNode.node_id != self_id)
+    return q
 
 
 # ─── Discovery ───────────────────────────────────────────────────────
@@ -407,10 +414,24 @@ def _peer_node_id_for(peer_url: str) -> str:
     """The node_id this node holds for the peer at ``peer_url`` (the
     audience a signed invoke is bound to), or '' when none is known."""
     want = (peer_url or '').rstrip('/')
-    for p in admitted_peers(limit=1000):
-        if (p.get('url') or '').rstrip('/') == want:
-            return p.get('node_id') or ''
-    return ''
+    if not want:
+        return ''
+    # One lookup by url in SQL, not a scan of the first 1000 admitted rows
+    # (a store past 1000 rows never found a peer beyond them, and the scan
+    # loaded every row to sign one request).  Several identities can share
+    # a url (a node that re-keyed, one-shot identities behind one address):
+    # the one heard from most recently is the node answering there now.
+    try:
+        from integrations.social.models import db_session, PeerNode
+        with db_session(commit=False) as db:
+            row = (_admitted_query(db)
+                   .filter(PeerNode.url.in_([want, want + '/']))
+                   .order_by(PeerNode.last_seen.desc())
+                   .first())
+            return (row.node_id or '') if row else ''
+    except Exception as e:
+        logger.info(f'peer_reuse: peer store unavailable for {want}: {e}')
+        return ''
 
 
 def invoke_peer_agent(peer_url: str, agent_id: str, prompt: str,
