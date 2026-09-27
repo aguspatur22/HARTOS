@@ -48,6 +48,11 @@ from integrations.vlm import local_loop  # noqa: E402
 # attribute while the loop re-imports a fresh copy -- so a test patching
 # activity_stream would patch a module the loop no longer uses.
 from integrations.vlm import activity_stream as act  # noqa: E402
+# Same reason, for the other modules these tests patch or share state with:
+# measured 2026-09-27, the late-finish test patched a stale subprocess_safe
+# and passed with the code it guards disabled.
+from core import subprocess_safe  # noqa: E402
+from hartos.threadlocal import thread_local_data as tld  # noqa: E402
 from integrations.vlm.local_loop import run_local_agentic_loop  # noqa: E402
 
 #: Budget given to the loop in these tests, seconds.
@@ -452,10 +457,10 @@ class TestTheHelperDirectly:
     def test_an_action_that_finishes_just_after_the_deadline_is_done(self):
         """It finished between call_bounded giving up and the loop taking
         the lock: report its real result, and leave its run stamp open."""
-        from core import subprocess_safe
-        from hartos.threadlocal import thread_local_data as tld
+        faked = []
 
         def _late_finish(fn, wait, **_kw):
+            faked.append(1)
             fn()                          # it completes...
             return False, None, None      # ...just after the wait gave up
 
@@ -469,6 +474,7 @@ class TestTheHelperDirectly:
                     safety=True, verify=False, remaining_s=1.0, grace_s=0.0)
         finally:
             tld.clear_activity_run()
+        assert faked == [1], 'the fake never ran: this tested nothing'
         assert (outcome, result) == ('done', {'output': 'Opened'})
         close.assert_not_called()
         assert local_loop.abandoned_actions_in_flight() == 0

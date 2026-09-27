@@ -130,7 +130,9 @@ def test_a_call_with_text_content_has_its_arguments_cut_too(monkeypatch):
 def test_quote_dense_arguments_are_cut_to_fit(monkeypatch):
     """Sized before json.dumps escaping, quote-, backslash- and emoji-dense
     arguments stayed 10k-19k tokens against 7,424."""
-    for dense in ('"q" \ ' * 6000, '\n\t' * 8000, '\U0001F600 ' * 6000):
+    # Quote + backslash, literal backslash escapes, emoji: each is escaped
+    # to more characters by json.dumps than it holds.
+    for dense in ('"q" \\ ' * 6000, '\\n\\t' * 8000, '\U0001F600 ' * 6000):
         with_budget = _trim(_write_shape(None, dense), monkeypatch)
         out, est_after, budget = with_budget
         assert est_after <= budget, (dense[:10], est_after, budget)

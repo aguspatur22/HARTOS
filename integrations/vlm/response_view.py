@@ -184,12 +184,13 @@ def outcome_summary(response):
         return {
             'done': 'Completed in %.0fs after %d step(s).' % (secs, n),
             'timeout': 'Ran out of time after %.0fs (%d step(s)) before '
-                       'finishing.' % (secs, n),
+                       'finishing.' % (secs, n) + unknown,
             'max_iterations': 'Tried %d step(s) without reaching a clear '
                               'completion.' % n,
             'action_error': 'Hit errors on 3 consecutive actions after %d '
                             'step(s) and stopped.' % n,
-            'stopped': 'Stopped at your request after %d step(s).' % n,
+            'stopped': 'Stopped at your request after %d step(s).' % n
+                       + unknown,
             'grounding_failed': 'Could not reliably locate the UI element '
                                 'after %d attempt(s).' % n,
             'consent_required': 'Did not act: the owner has not allowed '

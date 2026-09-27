@@ -103,7 +103,7 @@ class DashboardService:
     WORLD_MODEL_TIMEOUT_S = 2.0
 
     @staticmethod
-    def _world_model_status(timeout_s: float = WORLD_MODEL_TIMEOUT_S) -> Dict:
+    def _world_model_status(timeout_s: Optional[float] = None) -> Dict:
         """HevolveAI world-model status, never holding the poll past timeout_s.
 
         ``{'healthy': False, 'error': 'cold_or_unreachable'}`` when the bridge
@@ -119,6 +119,8 @@ class DashboardService:
         bridge import held shutdown.  call_bounded's worker is a daemon.
         """
         from core.subprocess_safe import call_bounded
+        if timeout_s is None:
+            timeout_s = DashboardService.WORLD_MODEL_TIMEOUT_S
 
         def _collect():
             from integrations.agent_engine.world_model_bridge import (
