@@ -118,6 +118,21 @@ TOPIC_MAP = {
     'recipe.available': RECIPE_AVAILABLE_TOPIC,
 }
 
+# Per-user Crossbar URIs published by URI rather than through a TOPIC_MAP
+# bus topic.  With TOPIC_MAP's {user_id} templates these are the DECLARED
+# per-user URIs: security.edge_privacy.per_user_uri_owner reads both, and a
+# URI is one user's own (not egress) only if it instantiates one of them.
+# Each is measured at its publisher:
+#   chat.new    -- integrations.social.chat_messages.publish_new
+#                  (core.constants.CHAT_TOPIC_NEW + '.' + user_id)
+#   vision      -- hart_intelligence_entry vision consent event
+#   channel.response -- integrations.channels.response.router
+PER_USER_TOPICS_OUTSIDE_BUS = (
+    'com.hertzai.hevolve.chat.new.{user_id}',
+    'com.hertzai.hevolve.vision.{user_id}',
+    'com.hertzai.hevolve.channel.response.{user_id}',
+)
+
 # Reverse lookup: legacy topic prefix → new topic
 # Sorted by prefix length (longest first) so 'com.hertzai.hevolve.chat'
 # matches before the shorter 'com.hertzai.hevolve' (chat.general).

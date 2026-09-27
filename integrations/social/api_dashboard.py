@@ -500,10 +500,12 @@ def _steer(agent_id, verb):
     Each verb writes one ImmutableAuditLog ``agent_steered`` entry.
     Body schema (optional): ``{reason: <str>}``.
 
-    Auth posture matches the rest of the dashboard blueprint — the
-    /agents list endpoint above is also unauthenticated for parity
-    with the existing operator console.  Phase C5 (owner-or-admin)
-    is gated until the dashboard moves behind @require_auth.
+    Every steering route is @require_local_or_auth and passes the caller
+    to dashboard_service.may_steer (via steer_agent / inject_instruction):
+    401 for a remote caller without a token, 403 for a caller who neither
+    owns the goal nor is an admin.  Until 2026-09-27 these three had no
+    identity or ownership check at all (the same hole as inject, c3651a483).
+    ``actor_id`` is a label, never identity.
     """
     from .dashboard_service import steer_agent
     from .models import get_db
@@ -514,8 +516,10 @@ def _steer(agent_id, verb):
     db = get_db()
     try:
         result = steer_agent(db, agent_id, verb,
-                             actor_id=actor_id, reason=reason)
-        status = 200 if result.get('ok') else 400
+                             actor_id=actor_id, reason=reason,
+                             caller=_steering_caller())
+        status = (200 if result.get('ok')
+                  else 403 if result.get('forbidden') else 400)
         return jsonify({'success': result.get('ok'),
                         'data': result}), status
     except Exception as e:
@@ -529,6 +533,7 @@ def _steer(agent_id, verb):
     '/api/social/dashboard/agents/<agent_id>/pause',
     methods=['POST'],
 )
+@require_local_or_auth
 def steer_pause(agent_id):
     """Pause an agent goal.  Idempotent on already-paused."""
     return _steer(agent_id, 'pause')
@@ -538,6 +543,7 @@ def steer_pause(agent_id):
     '/api/social/dashboard/agents/<agent_id>/resume',
     methods=['POST'],
 )
+@require_local_or_auth
 def steer_resume(agent_id):
     """Resume a paused agent goal.  400 if not paused."""
     return _steer(agent_id, 'resume')
@@ -547,6 +553,7 @@ def steer_resume(agent_id):
     '/api/social/dashboard/agents/<agent_id>/cancel',
     methods=['POST'],
 )
+@require_local_or_auth
 def steer_cancel(agent_id):
     """Cancel (archive) an agent goal.  Terminal — cannot resume."""
     return _steer(agent_id, 'cancel')

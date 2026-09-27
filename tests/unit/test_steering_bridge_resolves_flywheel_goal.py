@@ -28,6 +28,13 @@ from integrations.agent_engine.dispatch import prompt_id_for_goal  # noqa: E402
 from integrations.social import dashboard_service as ds  # noqa: E402
 
 
+# These tests pin GroupChat RESOLUTION with a mocked DB, where the person
+# behind an owner id cannot be looked up; an admin is admitted before that
+# lookup.  Who may steer is pinned against a real DB by
+# test_inject_requires_goal_owner.py / test_every_steering_verb_requires_goal_owner.py.
+_ADMIN = ds.SteeringCaller('ops', is_admin=True)
+
+
 def _db_returning(goal):
     db = MagicMock()
     db.query.return_value.filter.return_value.first.return_value = goal
@@ -81,7 +88,7 @@ def test_inject_resolves_flywheel_goal_with_null_prompt_id():
          patch('security.immutable_audit_log.get_audit_log'):
         out = ds.inject_instruction(_db_returning(goal), goal_id,
                                     'Emit the recipe JSON now.', actor_id='claude-copilot',
-                                    caller=ds.SteeringCaller('owner42'))
+                                    caller=_ADMIN)
 
     assert out['ok'] is True, out
     assert out['message_index'] == 0
@@ -117,7 +124,7 @@ def test_inject_still_resolves_human_goal_via_row_prompt_id():
                side_effect=lambda k: gc if k == 'u1_12345' else None), \
          patch('security.immutable_audit_log.get_audit_log'):
         out = ds.inject_instruction(_db_returning(goal), 'agent-x', 'hello', actor_id='admin',
-                                    caller=ds.SteeringCaller('u1'))
+                                    caller=_ADMIN)
     assert out['ok'] is True, out
     assert gc.messages[-1]['content'] == 'hello'
 
@@ -129,13 +136,13 @@ def test_inject_no_live_groupchat_returns_clear_error():
     with patch('hartos.lifecycle_hooks.get_registered_groupchat', return_value=None), \
          patch('security.immutable_audit_log.get_audit_log'):
         out = ds.inject_instruction(_db_returning(goal), 'gid', 'x', actor_id='cp',
-                                    caller=ds.SteeringCaller('o'))
+                                    caller=_ADMIN)
     assert out['ok'] is False
     assert 'no live GroupChat' in (out['error'] or '')
 
 
 def test_inject_empty_instruction_rejected():
     out = ds.inject_instruction(MagicMock(), 'gid', '   ', actor_id='cp',
-                                caller=ds.SteeringCaller('o'))
+                                caller=_ADMIN)
     assert out['ok'] is False
     assert 'empty' in (out['error'] or '').lower()

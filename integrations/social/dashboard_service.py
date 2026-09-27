@@ -910,7 +910,8 @@ def get_a2a_graph(root_agent_id: str, depth: int = 2) -> Dict:
 
 
 def steer_agent(db, agent_id: str, verb: str, actor_id: str = 'system',
-                reason: Optional[str] = None) -> Dict:
+                reason: Optional[str] = None, *,
+                caller: 'SteeringCaller') -> Dict:
     """Apply a steering verb to an AgentGoal: pause / resume / cancel.
 
     Uses the existing ``AgentGoal.status`` column (values: active |
@@ -926,31 +927,19 @@ def steer_agent(db, agent_id: str, verb: str, actor_id: str = 'system',
 
     Returns ``{ok: bool, new_status: str, error: str|None}``.
     Never raises; bad input returns ``{ok: False, error: ...}``.
+
+    ``caller`` is required and is judged by may_steer, the one rule for
+    every steering verb; a refusal is ``forbidden: True`` (the route
+    answers 403).
     """
     out = {'ok': False, 'new_status': None, 'error': None}
     if verb not in ('pause', 'resume', 'cancel'):
         out['error'] = f'unknown verb {verb}'
         return out
 
-    try:
-        from .models import AgentGoal
-    except ImportError:
-        out['error'] = 'AgentGoal model unavailable'
-        return out
-
-    goal = db.query(AgentGoal).filter(AgentGoal.id == str(agent_id)).first()
-    # CodingGoal fallback — same lookup pattern as get_agent_snapshot.
-    # Without this, Pause/Resume/Cancel buttons on the drawer 404 for
-    # any coding-type card (about half the dashboard).
-    if not goal:
-        try:
-            from .models import CodingGoal
-            goal = db.query(CodingGoal).filter(
-                CodingGoal.id == str(agent_id)).first()
-        except Exception:
-            pass
-    if not goal:
-        out['error'] = 'agent not found'
+    goal, refused = _goal_to_steer(db, agent_id, verb, caller, actor_id)
+    if refused:
+        out.update(refused)
         return out
 
     prev_status = goal.status
@@ -1077,8 +1066,9 @@ class SteeringCaller(NamedTuple):
     is_local: bool = False
 
 
-def may_steer(goal, caller: SteeringCaller) -> Optional[str]:
-    """Why ``caller`` may NOT write into ``goal``'s GroupChat, or None.
+def may_steer(db, goal, caller: SteeringCaller) -> Optional[str]:
+    """Why ``caller`` may NOT steer ``goal`` (inject, pause, resume, cancel),
+    or None.  THE rule for every steering verb (_goal_to_steer applies it).
 
     Review of de3f89364 (2026-09-27, CRITICAL): the inject route checked
     nothing, and /api/social/ is exempt from the API gate, so the desktop
@@ -1087,21 +1077,75 @@ def may_steer(goal, caller: SteeringCaller) -> Optional[str]:
       * the goal's owner (core.event_attribution.goal_owner_user_id, the one
         owner precedence) steers it;
       * an admin (integrations.social.auth.holds_central_role) steers any;
-      * a goal with no human owner -- the flywheel's seeded goals, whose
-        author is a machine -- belongs to the machine, so this machine's own
-        callers steer it (the MCP co-pilot does, steer_goal) and a remote
-        non-admin does not.
+      * a goal with no human owner belongs to the machine, so this machine's
+        own callers steer it (the MCP co-pilot does, steer_goal) and a remote
+        non-admin does not.  That is a goal whose author is a machine label
+        (the flywheel's seeded goals) AND a goal run by an agent or system
+        ACCOUNT no person owns -- this node's daemon identity,
+        hevolve_system_agent.  The owner id is resolved to the person behind
+        it by UserService.person_to_notify (the canonical rule: a person is
+        themself, an agent is its human owner, an ownerless agent/system
+        account is nobody), so an agent a person owns is that person's.
     """
     if caller.is_admin:
         return None
     from core.event_attribution import goal_owner_user_id
     owner = goal_owner_user_id(goal)
+    if owner is not None:
+        from .services import UserService
+        owner = UserService.person_to_notify(db, owner)
     if owner is None:
         return None if caller.is_local else (
             'only an admin may steer a goal with no owner from another machine')
     if caller.user_id and str(caller.user_id) == owner:
         return None
     return 'this agent belongs to another user'
+
+
+def _goal_to_steer(db, agent_id: str, verb: str, caller: SteeringCaller,
+                   actor_id: str):
+    """The goal ``caller`` may steer with ``verb``, or why not.
+
+    Returns ``(goal, None)``, or ``(None, fields)`` to merge into the verb's
+    result: ``{'error': 'agent not found'}``, or ``{'error': <reason>,
+    'forbidden': True}`` for a caller may_steer refuses -- logged and
+    audit-logged as ``<verb>_refused`` with the caller's identity.  ONE
+    lookup (AgentGoal, then CodingGoal: without the fallback the drawer's
+    buttons 404 on every coding card) and ONE authorization for every
+    steering verb, so no verb can skip either.
+    """
+    from .models import AgentGoal
+    goal = db.query(AgentGoal).filter(AgentGoal.id == str(agent_id)).first()
+    if not goal:
+        try:
+            from .models import CodingGoal
+            goal = db.query(CodingGoal).filter(
+                CodingGoal.id == str(agent_id)).first()
+        except Exception:
+            logger.debug('CodingGoal lookup unavailable', exc_info=True)
+    if not goal:
+        return None, {'error': 'agent not found'}
+    refusal = may_steer(db, goal, caller)
+    if not refusal:
+        return goal, None
+    logger.warning('%s refused: caller=%s local=%s agent=%s: %s', verb,
+                   caller.user_id, caller.is_local, agent_id, refusal)
+    try:
+        from security.immutable_audit_log import get_audit_log
+        get_audit_log().log_event(
+            event_type='agent_steered',
+            actor_id=str(actor_id or 'admin-ui'),
+            action=f'{verb}_refused',
+            detail={'agent_id': str(agent_id),
+                    'caller_user_id': caller.user_id,
+                    'caller_is_local': caller.is_local,
+                    'reason': refusal},
+            target_id=str(agent_id),
+        )
+    except Exception:
+        logger.exception('%s_refused audit-log write failed for %s', verb,
+                         agent_id)
+    return None, {'error': refusal, 'forbidden': True}
 
 
 def inject_instruction(db, agent_id: str, instruction: str,
@@ -1131,55 +1175,9 @@ def inject_instruction(db, agent_id: str, instruction: str,
         out['error'] = 'empty instruction'
         return out
 
-    try:
-        from .models import AgentGoal
-    except ImportError:
-        out['error'] = 'AgentGoal unavailable'
-        return out
-
-    goal = db.query(AgentGoal).filter(AgentGoal.id == str(agent_id)).first()
-    if not goal:
-        # CodingGoal fallback (same pattern as get_agent_snapshot /
-        # steer_agent).  Without this the inject CTA on the drawer's
-        # Conversation tab silently 400s for any coding agent.
-        try:
-            from .models import CodingGoal
-            cg = db.query(CodingGoal).filter(
-                CodingGoal.id == str(agent_id)).first()
-            if cg:
-                from types import SimpleNamespace
-                goal = SimpleNamespace(
-                    prompt_id=getattr(cg, 'prompt_id', None),
-                    owner_id=getattr(cg, 'owner_id', None) or getattr(cg, 'created_by', None),
-                    created_by=getattr(cg, 'created_by', None),
-                )
-        except Exception:
-            pass
-    if not goal:
-        out['error'] = 'agent not found'
-        return out
-
-    refusal = may_steer(goal, caller)
-    if refusal:
-        out['error'] = refusal
-        out['forbidden'] = True
-        logger.warning('inject refused: caller=%s local=%s agent=%s: %s',
-                       caller.user_id, caller.is_local, agent_id, refusal)
-        try:
-            from security.immutable_audit_log import get_audit_log
-            get_audit_log().log_event(
-                event_type='agent_steered',
-                actor_id=str(actor_id or 'admin-ui'),
-                action='inject_refused',
-                detail={'agent_id': str(agent_id),
-                        'caller_user_id': caller.user_id,
-                        'caller_is_local': caller.is_local,
-                        'reason': refusal},
-                target_id=str(agent_id),
-            )
-        except Exception:
-            logger.exception('inject_refused audit-log write failed for %s',
-                             agent_id)
+    goal, refused = _goal_to_steer(db, agent_id, 'inject', caller, actor_id)
+    if refused:
+        out.update(refused)
         return out
 
     try:
