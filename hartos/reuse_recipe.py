@@ -646,6 +646,27 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
     return f'Message sent successfully to user with request_id: {original_request_id}'
 
 
+def _reuse_answer_off_box(user_id, answer, prompt_id):
+    """The off-box leg for a /chat turn's finished answer, which the caller
+    RETURNS: the return value IS the reply.
+
+    On the desktop the reply is the answer's ONLY delivery.  get_agent_response
+    used to also hand it to send_message_to_user1, which since 57516f078
+    publishes on the local chat topic there, and the web client renders both
+    (Demopage appends every text on com.hertzai.hevolve.chat.{user_id} and
+    appends the HTTP reply as another bubble, each starting TTS): the answer
+    arrived twice.  CREATE never sends its main-loop answer, and REUSE's
+    post-loop extractor never did either; the out-of-band leg is for messages
+    that have no reply to ride on (a mid-turn question from the
+    send_message_to_user tool, timer and visual results, A2A replies).
+
+    Central keeps the off-box leg it has always had for this answer
+    (send_message_to_user1's chatbot_pipeline POST); whether it needs it is
+    tied to that URL, which is left to the owner.
+    """
+    if not is_bundled():
+        send_message_to_user1(user_id, answer, '', prompt_id)
+
 
 def _coerce_instruction_text(value) -> str:
     """Normalize a tool 'instructions' argument to plain text.
@@ -6243,29 +6264,19 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 try:
                     json_obj = retrieve_json(last_message['content'])
                     if json_obj and 'message2userfinal' in json_obj:
-                        send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
                         # RETURN the answer, do not drop it.  This return value IS
                         # the reply: hart_intelligence_entry:10165 assigns it and
                         # hands it to _chat_reply (see the note at :2023, "the
                         # /chat handler checks after chat_agent() returns").
-                        # send_message_to_user1 is a SECOND, off-box leg whose
-                        # URL is pointed at the wrong address (:524).  Measured
-                        # 2026-09-09: it POSTs to aws_rasa.hertzai.com:9890
-                        # (-> 106.51.181.24), which refuses; the service is
-                        # REAL and RUNNING on the LAN box — sathish-linux-deep
-                        # container `chatbot_pipeline` publishes
-                        # 0.0.0.0:8001->9890/tcp, and POST
-                        # http://192.168.0.9:8001/autogen_response answers in
-                        # 35 ms.  9890 is the CONTAINER-INTERNAL port, never
-                        # the published one.  So this leg delivers nothing on
-                        # this deployment, and its failure comes back as a
-                        # string nobody reads.  Address fix tracked in #803;
-                        # it does not change the rule below.
-                        # Returning '' here therefore lost the finished answer
-                        # entirely: Nunba's empty-reply check then rerouted the
-                        # user to the tool-less Tier-2 fallback, which answered
-                        # from training data and contradicted the work this
-                        # agent had just done and saved (#797/D31, #803/D37).
+                        # Returning '' here lost the finished answer entirely:
+                        # Nunba's empty-reply check then rerouted the user to
+                        # the tool-less Tier-2 fallback, which answered from
+                        # training data and contradicted the work this agent
+                        # had just done and saved (#797/D31, #803/D37).  What
+                        # else the answer is sent through, and why the desktop
+                        # gets nothing else: _reuse_answer_off_box.
+                        _reuse_answer_off_box(
+                            user_id, json_obj['message2userfinal'], prompt_id)
                         return json_obj['message2userfinal']
                 except Exception as e:
                     current_app.logger.error(f"Error extracting JSON: {e}")
@@ -6274,9 +6285,9 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 try:
                     json_obj = retrieve_json(last_message['content'])
                     if json_obj and 'message2' in json_obj:
-                        send_message_to_user1(user_id, json_obj['message2'], '', prompt_id)
-                        # Same as the message2userfinal branch above — the
-                        # return value is the reply, the POST is a dead leg.
+                        # Same as the message2userfinal branch above.
+                        _reuse_answer_off_box(
+                            user_id, json_obj['message2'], prompt_id)
                         return json_obj['message2']
                 except Exception as e:
                     current_app.logger.error(f"Error extracting JSON: {e}")
