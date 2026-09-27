@@ -1089,8 +1089,8 @@ def ensure_tool_call_arguments_json(messages):
     the OpenAI/autogen contract ("arguments is a JSON string") rather than any
     engine-specific error text — so it stays engine-neutral.
 
-    Coercion per malformed call: keep it if it is already JSON a STRICT
-    parser accepts (``is_wire_json`` -- Python's ``json.loads`` alone is not
+    Coercion per malformed call: keep it if it is already a JSON OBJECT a
+    STRICT parser accepts (``is_wire_json``'s test -- Python's ``json.loads`` alone is not
     that test: it reads an overflowing number as inf and accepts NaN and a
     lone surrogate escape, all of which llama.cpp refuses with a 500); else
     parse it, or its ``repair_json`` repair, with ``load_wire_json``, which
@@ -1130,8 +1130,18 @@ def ensure_tool_call_arguments_json(messages):
                 continue
             if not isinstance(args, str):
                 args = str(args)
-            if is_wire_json(args):
-                continue  # already strict JSON — leave untouched
+            try:
+                is_object = isinstance(_wire_json_loads(args, _refuse_token),
+                                       dict)
+            except Exception:
+                is_object = False
+            if is_object:
+                # Already a strict JSON object: leave untouched.  Strict JSON
+                # that is not an object ('[1,2]', '"hello"') is not arguments:
+                # the llama.cpp template reads arguments only as a mapping,
+                # so a prior call with '[{"url": ...}]' rendered with no
+                # parameters at all (measured on :8080, review of b0fa4989e).
+                continue
             fixed = '{}'
             # The original text first: repair_json itself turns an
             # overflowing number into Infinity, losing the token.
@@ -3800,8 +3810,46 @@ def get_agent_data_info(prompt_id: int) -> Dict[str, Any]:
 # ========================================================================================
 # AUTOGEN JSON HANDLING ENHANCEMENT
 # ========================================================================================
+def tool_call_shape(arguments):
+    """``(args, kwargs)`` a tool is called with for parsed ``arguments``.
+
+    THE one rule for turning parsed tool-call arguments into a call, read by
+    safe_function_call (which makes the call), the async executor (which
+    awaits a coroutine tool with it) and tool_argument_error (which binds it
+    to the signature first), so the checked call is the call that runs:
+
+      * a dict                      -> ``func(**dict)``
+      * a list whose head is a dict -> ``func(**list[0])`` (retrieve_json
+        often wraps the object in a list; the rest of the list is ignored)
+      * any other list              -> ``func(*list)``
+      * anything else               -> ``func(arguments)``
+    """
+    if isinstance(arguments, dict):
+        return (), arguments
+    if isinstance(arguments, list):
+        if arguments and isinstance(arguments[0], dict):
+            return (), arguments[0]
+        return tuple(arguments), {}
+    return (arguments,), {}
+
+
+def remapped_positional_kwargs(func, arguments):
+    """safe_function_call's recovery for a positional list that did not bind:
+    drop ``['truncated']`` sentinels and name the rest after the signature's
+    parameters, in order.  The kwargs, or None when that does not apply."""
+    if not isinstance(arguments, list) or not hasattr(func, '__annotations__'):
+        return None
+    import inspect
+    param_names = list(inspect.signature(func).parameters.keys())
+    clean_args = [arg for arg in arguments if
+                  not (isinstance(arg, list) and len(arg) == 1 and arg[0] == 'truncated')]
+    if len(clean_args) > len(param_names):
+        return None
+    return dict(zip(param_names, clean_args))
+
+
 def safe_function_call(func, arguments):
-    """Fixed version that handles list with dict properly"""
+    """Call a tool with parsed arguments, shaped by :func:`tool_call_shape`."""
     import logging
 
     logger = logging.getLogger("safe_function_call")
@@ -3812,73 +3860,30 @@ def safe_function_call(func, arguments):
     logger.info(f"   Arguments content: {arguments}")
 
     try:
-        # Try original AutoGen approach first
-        if isinstance(arguments, dict):
-            logger.info("   → Using **kwargs approach")
-            result = func(**arguments)
-            logger.info("    Success with **kwargs")
-            return result
-
-        # Handle list case - FIXED LOGIC
-        elif isinstance(arguments, list):
-            logger.info("   → Analyzing list content")
-
-            # Check if first item is a dict (common pattern from retrieve_json)
-            if len(arguments) >= 1 and isinstance(arguments[0], dict):
-                # The first item is the actual arguments dict
-                actual_args = arguments[0]
-                logger.info(f"   → Found dict in list[0]: {actual_args}")
-                logger.info("   → Using **kwargs approach on extracted dict")
-                result = func(**actual_args)
-                logger.info("    Success with **kwargs from list")
-                return result
-            else:
-                # Fallback to treating as positional args
-                logger.info("   → Using *args approach")
-                result = func(*arguments)
-                logger.info("    Success with *args")
-                return result
-
-        # Handle single argument case
-        else:
-            logger.info("   → Using single argument approach")
-            result = func(arguments)
-            logger.info("    Success with single arg")
-            return result
+        args, kwargs = tool_call_shape(arguments)
+        logger.info(f"   → Calling with {len(args)} positional, keywords {list(kwargs)}")
+        result = func(*args, **kwargs)
+        logger.info("    Success")
+        return result
 
     except TypeError as e:
         logger.error(f"    TypeError: {e}")
         logger.error(f"   TypeError traceback:\n{traceback.format_exc()}")
 
-        # Enhanced intelligent mapping for lists
-        if isinstance(arguments, list):
+        # A positional list that did not bind: try the sentinel-free list
+        # named after the signature (a list headed by a dict already WAS a
+        # keyword call, so retrying it would repeat the same TypeError).
+        if isinstance(arguments, list) and not (
+                arguments and isinstance(arguments[0], dict)):
             logger.info("   → Trying enhanced list handling")
 
             try:
-                # If it's a list with a dict, extract the dict
-                if len(arguments) >= 1 and isinstance(arguments[0], dict):
-                    logger.info("   → Extracting dict from list and retrying")
-                    result = func(**arguments[0])
-                    logger.info("    Success with extracted dict")
+                kwargs = remapped_positional_kwargs(func, arguments)
+                if kwargs is not None:
+                    logger.info(f"   → Mapped to kwargs: {kwargs}")
+                    result = func(**kwargs)
+                    logger.info("    Success with intelligent mapping")
                     return result
-
-                # If it's a simple list, try intelligent parameter mapping
-                elif hasattr(func, '__annotations__'):
-                    import inspect
-                    sig = inspect.signature(func)
-                    param_names = list(sig.parameters.keys())
-                    logger.info(f"   → Function expects parameters: {param_names}")
-
-                    # Filter out truncation indicators
-                    clean_args = [arg for arg in arguments if
-                                  not (isinstance(arg, list) and len(arg) == 1 and arg[0] == 'truncated')]
-
-                    if len(clean_args) <= len(param_names):
-                        kwargs = dict(zip(param_names, clean_args))
-                        logger.info(f"   → Mapped to kwargs: {kwargs}")
-                        result = func(**kwargs)
-                        logger.info("    Success with intelligent mapping")
-                        return result
 
             except Exception as mapping_error:
                 logger.error(f"    Enhanced list handling failed: {mapping_error}")
@@ -3895,12 +3900,19 @@ def safe_function_call(func, arguments):
 
 
 def tool_argument_error(func, func_name, arguments, repaired):
-    """Why ``arguments`` cannot be given to ``func`` as keywords, or None.
+    """Why ``func`` cannot be called with ``arguments``, or None.
 
-    A dict is bound to the tool's own signature (``inspect.signature`` follows
-    the ``__wrapped__`` chain of autogen's and core.tool_logging's wrappers to
-    the real closure).  Lists and scalars keep safe_function_call's handling
-    and are not checked here; neither is a tool whose signature cannot be read.
+    Binds the call the arguments actually become (:func:`tool_call_shape`,
+    the same rule safe_function_call and the async executor call with) to the
+    tool's own signature (``inspect.signature`` follows the ``__wrapped__``
+    chain of autogen's and core.tool_logging's wrappers to the real closure).
+    Until the review of 68377afd2 only a dict was checked, so ``[{...}]`` --
+    run as ``func(**list[0])`` -- reached the tool unchecked.  A positional
+    list is bound as the positional call it becomes; safe_function_call's
+    ``['truncated']`` recovery is not credited, because a live tool is wrapped
+    by core.tool_logging, which answers the first call's TypeError itself, so
+    that recovery never runs for it.  A tool whose signature cannot be read
+    is not checked.
 
     ``repaired`` says the arguments did not parse as JSON and were recovered by
     retrieve_json.  json_repair reads an unquoted string value as a run of
@@ -3911,27 +3923,33 @@ def tool_argument_error(func, func_name, arguments, repaired):
     call that does not bind is reported as broken JSON, with the keys that
     could be read shown as what was received, not as names to fix.
     """
-    if not isinstance(arguments, dict):
-        return None
     import inspect
     try:
         sig = inspect.signature(func)
     except (TypeError, ValueError):
         return None
+    args, kwargs = tool_call_shape(arguments)
     try:
-        sig.bind(**arguments)
+        sig.bind(*args, **kwargs)
         return None
     except TypeError:
         pass
-    params = [p for p in sig.parameters.values()
+    params =[p for p in sig.parameters.values()
               if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)]
     takes_any = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
     names = {p.name for p in params}
+    expected = ', '.join(p.name + (' (required)' if p.default is p.empty else '')
+                         for p in params) or 'none'
+    if args:
+        # Positional values: there are no names to report as unknown.
+        return (f"Error: {func_name} was not run: its arguments were not one "
+                f"JSON object of named values. Expected parameters: "
+                f"{expected}. Call {func_name} again with one JSON object "
+                f"using these names.")
+    arguments = kwargs
     missing = [p.name for p in params
                if p.default is p.empty and p.name not in arguments]
     unknown = [] if takes_any else [k for k in arguments if k not in names]
-    expected = ', '.join(p.name + (' (required)' if p.default is p.empty else '')
-                         for p in params) or 'none'
     if repaired:
         text = (f"Error: the arguments for {func_name} were not valid JSON, so "
                 f"{func_name} was not run. Every string value must be in "
@@ -4070,14 +4088,11 @@ def force_apply_autogen_json_fix():
                     print(f"   Arguments content: {arguments}")
                     import inspect
                     if inspect.iscoroutinefunction(func):
-                        if isinstance(arguments, dict):
-                            content = await func(**arguments)  # Original autogen always uses **kwargs
-                        # Handle list case - convert to positional arguments
-                        elif isinstance(arguments, list):
-                            content = await func(*arguments)  # Original autogen always uses **kwargs
-                        # Handle single argument case
-                        else:
-                            content = await func(arguments)  # Original autogen always uses **kwargs
+                        # The call bind_tool_call_arguments checked, not a
+                        # second rule: [{...}] used to be awaited as
+                        # func({...}), the whole object as one positional.
+                        args, kwargs = tool_call_shape(arguments)
+                        content = await func(*args, **kwargs)
                     else:
                         content = safe_function_call(func, arguments)
                     is_exec_success = True
