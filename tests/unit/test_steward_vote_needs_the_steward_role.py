@@ -189,12 +189,14 @@ def test_the_tool_still_casts_an_ordinary_vote(db):
     from integrations.agent_engine.thought_experiment_tools import (
         cast_experiment_vote)
 
+    # security_guardrail takes no agent votes (VOTER_RULES), so a person.
     e = _experiment(db)
-    agent = _user(db, user_type='agent')
-    out = json.loads(cast_experiment_vote(e.id, agent.id, vote_value=1))
+    person = _user(db)
+    out = json.loads(cast_experiment_vote(e.id, person.id, vote_value=1,
+                                          voter_type='human'))
     db.expire_all()
-    assert out['success'] is True
-    assert db.query(ExperimentVote).filter_by(voter_id=agent.id).count() == 1
+    assert out['success'] is True, out
+    assert db.query(ExperimentVote).filter_by(voter_id=person.id).count() == 1
 
 
 def test_decide_asks_the_same_steward_rule(db):

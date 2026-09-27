@@ -238,7 +238,9 @@ def call_bounded(fn, wait: float, *, name: str = "hart-bounded-call"):
             done.set()
 
     threading.Thread(target=_worker, name=name, daemon=True).start()
-    if not done.wait(max(0.0, float(wait))):
+    # Clamped: past threading.TIMEOUT_MAX (~49.7 days on Windows) wait()
+    # raises OverflowError instead of waiting.
+    if not done.wait(min(max(0.0, float(wait)), threading.TIMEOUT_MAX)):
         return False, None, None
     return True, holder.get("value"), holder.get("error")
 

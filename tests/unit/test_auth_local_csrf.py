@@ -484,3 +484,14 @@ def test_trusted_proxy_remote_client_with_valid_token_accepted(app,
                        headers={'X-Forwarded-For': '203.0.113.55',
                                 'Authorization': 'Bearer secret-token-123'})
     assert resp.status_code == 200
+
+
+def test_a_trusted_loopback_proxy_that_sends_no_header_fails_closed(
+        app, monkeypatch):
+    """A proxy on this machine declared as TRUSTED_PROXY speaks for its
+    clients; one that strips X-Forwarded-For names no client, so its request
+    is not treated as this machine's own (core.auth_local.client_address)."""
+    monkeypatch.setenv('TRUSTED_PROXY', '127.0.0.1')
+    resp = app.test_client().post('/test/local-only',
+                                  environ_base={'REMOTE_ADDR': '127.0.0.1'})
+    assert resp.status_code == 401

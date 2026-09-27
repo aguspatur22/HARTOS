@@ -689,3 +689,8 @@ class TestTheOtherBoundedWaitsDelegate:
                 caplog.at_level(logging.WARNING, logger='hevolve.shell.system'):
             assert mod._run_async_bounded(['tool'], wait=2) == (True, None)
         assert any('PermissionError' in r.getMessage() for r in caplog.records)
+
+    def test_an_enormous_wait_is_clamped_not_an_overflow(self):
+        """Windows raises OverflowError past threading.TIMEOUT_MAX; a caller
+        passing a huge budget (an env-configured ETA) must still get a value."""
+        assert subprocess_safe.call_bounded(lambda: 'v', 1e12) == (True, 'v', None)
