@@ -239,3 +239,49 @@ def test_source_guard_nunba_has_one_client_address_reader():
     bad = _violations('Nunba', NUNBA)
     assert not bad, ('Nunba reads the client address through HARTOS '
                      'core.auth_local (routes.auth delegates):\n' + '\n'.join(bad))
+
+
+# ── Nunba imports no private HARTOS core name ───────────────────────────
+# Review of Nunba ad9ce346 / 48d562f7: tts/backend_venv.py imported
+# core.venv_paths._reset_cache_for_tests and _validate_backend_name.  A
+# private name is free to change in HARTOS without a caller audit (the rule
+# 492a57aab applied to hart_cli), so a Nunba import of one breaks the
+# installed app silently.  core.venv_paths now exports public names; this
+# fails on any `from core[.x] import _name` in Nunba (tests excepted: a test
+# may reach into what it tests).
+
+def _private_core_imports(tree):
+    """(lineno, 'module.name') of each `from core... import _name`."""
+    return [(n.lineno, f'{n.module}.{a.name}')
+            for n in ast.walk(tree)
+            if isinstance(n, ast.ImportFrom) and n.module
+            and (n.module == 'core' or n.module.startswith('core.'))
+            for a in n.names if a.name.startswith('_')]
+
+
+def test_private_import_detector_is_not_vacuous():
+    sample = ast.parse(
+        'from core.venv_paths import _reset_cache_for_tests\n'
+        'from core.venv_paths import venv_root, _validate_backend_name as v\n'
+        'from core import _x\n'
+        'from core.venv_paths import venv_root\n'
+        'from integrations.x import _y\n'
+        'from corex import _z\n')
+    assert [ln for ln, _ in _private_core_imports(sample)] == [1, 2, 3]
+
+
+@pytest.mark.skipif(not os.path.isdir(NUNBA), reason='Nunba checkout absent')
+def test_source_guard_nunba_imports_no_private_core_name():
+    bad, seen = [], 0
+    for path in _py_files(NUNBA):
+        try:
+            tree = ast.parse(open(path, encoding='utf-8').read())
+        except (SyntaxError, UnicodeDecodeError, ValueError):
+            continue
+        seen += 1
+        bad += [f'{os.path.relpath(path, NUNBA)}:{ln} {name}'
+                for ln, name in _private_core_imports(tree)]
+    assert seen > 100, seen
+    assert not bad, ('Nunba imports a private HARTOS core name; make it '
+                     'public in core (keep the old name as an alias):\n'
+                     + '\n'.join(bad))

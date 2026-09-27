@@ -4198,6 +4198,36 @@ def safe_function_call(func, arguments):
         raise e
 
 
+def _is_numeric_annotation(annotation):
+    """True for int / float, also inside Optional / Union / Annotated."""
+    import typing
+    if annotation in (int, float):
+        return True
+    origin = typing.get_origin(annotation)
+    if origin is typing.Annotated:
+        return _is_numeric_annotation(typing.get_args(annotation)[0])
+    if origin is typing.Union:
+        return any(_is_numeric_annotation(a)
+                   for a in typing.get_args(annotation) if a is not type(None))
+    return False
+
+
+def _numbers_out_of_range(params, bound):
+    """Names of number-typed parameters bound to the token of a number no
+    double can hold, or to NaN / Infinity, which the reader keeps as text."""
+    out = []
+    for p in params:
+        value = bound.get(p.name)
+        if not isinstance(value, str) or not _is_numeric_annotation(p.annotation):
+            continue
+        token = value.strip()
+        if token in _NON_FINITE_WORDS:
+            out.append(p.name)
+        elif _BARE_NUMBER.fullmatch(token) and not math.isfinite(float(token)):
+            out.append(p.name)
+    return out
+
+
 def tool_argument_error(func, func_name, arguments, repaired):
     """Why ``func`` cannot be called with ``arguments``, or None.
 
@@ -4255,6 +4285,17 @@ def tool_argument_error(func, func_name, arguments, repaired):
     emptied = ([p.name for p in params
                 if p.default is p.empty and blank(bound.get(p.name))]
                if repaired and bound is not None else [])
+    unholdable = (_numbers_out_of_range(params, bound)
+                  if bound is not None else [])
+    if unholdable:
+        # The reader keeps a number a double cannot hold (or NaN/Infinity
+        # the model wrote) as the token it wrote, a string.  For a parameter
+        # typed as a number that string is not a value the tool can take:
+        # refused, never passed on as text (review of 3a7abe540, item 6).
+        return (f"Error: {func_name} was not run: "
+                f"{', '.join(unholdable)} must be a finite number, and the "
+                f"value given cannot be held as one. Call {func_name} again "
+                f"with a number in range.")
     if bound is not None and not emptied:
         return None
     takes_any = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
@@ -4374,7 +4415,16 @@ def bind_tool_call_arguments(func, func_name, input_string, format_json_str,
     # Python-literal syntax), and what it returns is refused if it carries
     # Infinity / NaN the model never wrote.
     try:
-        arguments, repaired = parse_tool_arguments(format_json_str(input_string))
+        # A strict read of autogen's formatted text first; on failure the
+        # reader repairs the RAW text, the text the history guard reads.
+        # format_json_str drops newlines, so repairing ITS output let a '//'
+        # comment swallow the rest of the arguments (review of 3a7abe540:
+        # '{\n "id": "x", // c\n "n": 2\n}' ran as ('x', 2) before, and was
+        # refused there).
+        try:
+            arguments, repaired = load_wire_json(format_json_str(input_string)), False
+        except ValueError:
+            arguments, repaired = parse_tool_arguments(input_string)
         print(f" ORIGINAL AUTOGEN{where}: parsed arguments for {func_name}"
               f"{' (repaired)' if repaired else ''}")
     except Exception as e:

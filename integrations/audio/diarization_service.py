@@ -138,17 +138,16 @@ class DiarizationService:
         """Launch the diarization server as a subprocess."""
         # In frozen builds (cx_Freeze), sys.executable is Nunba.exe — using it
         # with -m would launch a full GUI instance instead of the module.
-        # Use the bundled python interpreter from python-embed/ instead.
-        python_exe = sys.executable
-        if getattr(sys, 'frozen', False):
-            app_dir = os.path.dirname(sys.executable)
-            embed_python = os.path.join(app_dir, 'python-embed', 'python.exe')
-            if os.path.isfile(embed_python):
-                python_exe = embed_python
-            else:
-                logger.warning(
-                    "python-embed/python.exe not found — "
-                    "diarization sidecar may not start correctly")
+        # core.venv_paths.venv_creator_python is the one answer to "which
+        # python runs a worker" (python-embed beside the resolved app binary
+        # when frozen, sys.executable from source).
+        from core.venv_paths import python_embed_dir, venv_creator_python
+        python_exe = venv_creator_python()
+        if not python_exe:
+            python_exe = sys.executable
+            logger.warning(
+                "no python interpreter under %s — "
+                "diarization sidecar may not start correctly", python_embed_dir())
 
         cmd = [
             python_exe, '-m',

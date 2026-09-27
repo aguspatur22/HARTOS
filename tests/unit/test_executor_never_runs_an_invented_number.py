@@ -182,3 +182,45 @@ class ReviewOf3a7abe540(ExecutorReadsWhatTheModelWrote):
                 self.calls.clear()
                 content = self.run_tool('get_two', text)
                 self.assertEqual(self.calls, [('x', 2)], content)
+
+
+class NumbersATypedParameterCannotHold(ExecutorReadsWhatTheModelWrote):
+    """Review of 3a7abe540, item 6: the reader keeps 1e999 or NaN as the
+    token the model wrote, a string; a float/int parameter then received
+    text ("scaled '1e9991e999'")."""
+
+    def setUp(self):
+        super().setUp()
+
+        @log_tool_execution
+        def scale(x: float, k: int = 1) -> str:
+            self.calls.append((x, k))
+            return 'scaled %r' % (x * k,)
+
+        self.scale = scale
+
+    def run_scale(self, arguments):
+        a = ConversableAgent('a', llm_config=False, human_input_mode='NEVER')
+        ex = ConversableAgent('ex', llm_config=False, human_input_mode='NEVER')
+        ex.register_function({'scale': ex._wrap_function(self.scale)})
+        a.send({'role': 'assistant', 'content': None,
+                'tool_calls': [{'id': 'c1', 'type': 'function',
+                                'function': {'name': 'scale',
+                                             'arguments': arguments}}]},
+               ex, request_reply=False, silent=True)
+        _, reply = ex.generate_tool_calls_reply(sender=a)
+        return reply['tool_responses'][0]['content']
+
+    def test_an_unholdable_number_for_a_number_parameter_is_refused(self):
+        for text in ('{"x": 1e999, "k": 2}', '{"x": NaN}', '{"x": -1e999}'):
+            with self.subTest(text=text):
+                self.calls.clear()
+                content = self.run_scale(text)
+                self.assertEqual(self.calls, [], content)
+                self.assertTrue(tool_reply_failed(content), content)
+                self.assertIn('finite number', content)
+
+    def test_a_number_in_range_still_runs(self):
+        self.calls.clear()
+        content = self.run_scale('{"x": 1.5, "k": 2}')
+        self.assertEqual(self.calls, [(1.5, 2)], content)

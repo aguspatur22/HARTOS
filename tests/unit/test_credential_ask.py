@@ -516,6 +516,22 @@ def test_a_name_the_process_reads_from_env_still_reaches_it(world, monkeypatch):
     assert os.environ['NEWS_API_KEY'] == 'news-DUMMY'
 
 
+def test_a_held_value_is_never_written_to_this_vaults_file(world, monkeypatch):
+    """Review m1 of 86c65e76: hold_credential put the value in the
+    SecretsManager cache, which set_secret writes to secrets.enc whole, so
+    a value Nunba's vault already keeps was persisted a second time.  A
+    held value lives beside the cache, in memory only."""
+    from hartos.ai_key_vault import get_ai_key_vault
+    vault = get_ai_key_vault()
+    vault.hold_credential('SITE_PASSWORD', 'held-DUMMY')
+    sm = vault._secrets_manager()
+    assert 'SITE_PASSWORD' not in sm._cache
+    assert vault.get_tool_key('SITE_PASSWORD') == 'held-DUMMY'
+    vault.store_credential('NEWS_API_KEY', 'news-DUMMY')
+    assert 'SITE_PASSWORD' not in sm._cache
+    monkeypatch.delenv('NEWS_API_KEY', raising=False)
+
+
 @pytest.mark.parametrize('name', ['SITE_PASSWORD', 'NUNBA_CI'])
 def test_a_held_card_value_resolves_without_the_environment(world, card, monkeypatch, name):
     """Nunba's desktop vault keeps what the card stored and hands it to this
