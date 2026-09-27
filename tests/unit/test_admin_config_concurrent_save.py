@@ -61,6 +61,46 @@ def test_concurrent_saves_all_succeed_and_the_file_holds_the_last_state(
     assert left == [], f'temp files left behind: {left}'
 
 
+def test_the_shared_writer_alone_survives_concurrent_writers(tmp_path):
+    """atomic_json_write has other callers (create_recipe) with no lock of
+    their own: each call needs its own temp file, or concurrent writers of
+    one path collide on it."""
+    from core.file_cache import atomic_json_write
+
+    target = str(tmp_path / 'shared.json')
+    threads, rounds = 8, 40
+    start = threading.Barrier(threads)
+    errors = []
+
+    def _writer(n):
+        start.wait()
+        for i in range(rounds):
+            try:
+                atomic_json_write(target, {'writer': n, 'round': i,
+                                           'pad': 'x' * 2000})
+            except Exception as e:  # noqa: BLE001 -- counted, then asserted
+                errors.append(repr(e))
+
+    workers = [threading.Thread(target=_writer, args=(n,))
+               for n in range(threads)]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join(120)
+
+    # On Windows os.replace onto a file another thread is replacing at
+    # that instant can be refused (WinError 5/32): that is the OS, not a
+    # shared temp, and it leaves the target intact.  A shared temp shows
+    # up as FileExistsError / FileNotFoundError on the temp itself.
+    shared = [e for e in errors
+              if 'FileExistsError' in e or 'FileNotFoundError' in e]
+    assert shared == [], f'{len(shared)} writes collided, e.g. {shared[:2]}'
+    data = json.loads(open(target, encoding='utf-8').read())
+    assert set(data) == {'writer', 'round', 'pad'}
+    left = [p.name for p in tmp_path.iterdir() if p.name != 'shared.json']
+    assert left == [], f'temp files left behind: {left}'
+
+
 def test_the_shared_writer_creates_its_temp_with_one_try(tmp_path, monkeypatch):
     """The reason bff95ab44 dropped mkstemp stays fixed in the shared writer:
     a directory that refuses the temp file fails the write at once."""
