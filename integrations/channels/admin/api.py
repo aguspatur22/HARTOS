@@ -144,6 +144,37 @@ class AdminAPI:
         from core.platform_paths import get_agent_data_dir
         return os.path.join(get_agent_data_dir(), "admin_config.json")
 
+    @staticmethod
+    def _legacy_config_path() -> str:
+        """Where the config lived before bff95ab44: agent_data/ beside the
+        package (in the installed app, under Program Files)."""
+        return os.path.join(os.path.dirname(__file__), "..", "..", "..",
+                            "agent_data", "admin_config.json")
+
+    def _adopt_legacy_config(self, config_path: str) -> None:
+        """One-time, non-destructive move to the user data dir: when nothing
+        is at ``config_path`` yet and the pre-bff95ab44 file is, copy its
+        content there.  The old file is never changed or deleted (a rollback
+        or another install may still read it), a file already at the new
+        place is never overwritten, and an old file that is not valid JSON
+        is left behind, not copied.  Without this an upgrade dropped every
+        saved channel, workflow and the agent identity."""
+        legacy = os.path.abspath(self._legacy_config_path())
+        try:
+            if (os.path.exists(config_path) or not os.path.isfile(legacy)
+                    or os.path.normcase(legacy)
+                    == os.path.normcase(os.path.abspath(config_path))):
+                return
+            with open(legacy, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            from core.file_cache import atomic_json_write
+            atomic_json_write(config_path, data, indent=2)
+            logger.info("Copied admin configuration from %s to %s",
+                        legacy, config_path)
+        except Exception as e:
+            logger.warning("Admin config at %s not carried over to %s: %s",
+                           legacy, config_path, e)
+
     def _load_config(self) -> None:
         """Restore persisted admin state (channels + workflows + identity) so it
         survives a restart (#45).  Previously this loaded into self._config —
@@ -151,6 +182,7 @@ class AdminAPI:
         were never persisted, so identity + workflows (and channels) were lost on
         every restart."""
         config_path = self._config_path()
+        self._adopt_legacy_config(config_path)
         try:
             if not os.path.exists(config_path):
                 return
