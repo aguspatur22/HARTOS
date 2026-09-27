@@ -155,3 +155,52 @@ def test_under_pytest_the_old_place_is_not_the_owners_real_one():
     real = os.path.normcase(pp._legacy_documents_root())
     assert not os.path.normcase(pp.legacy_documents_db_path('x.json')).startswith(real)
     assert not os.path.normcase(ul._LEGACY_LANG_PATH).startswith(real)
+
+
+# ── Review of e1a1aa233 (F3) ────────────────────────────────────────────────
+
+def test_an_unusable_old_file_is_asked_about_once_per_process(lang_paths, caplog):
+    # Without the once-per-process flag every /chat re-reads the old file
+    # and warns again.
+    _, old = lang_paths
+    old.parent.mkdir(parents=True, exist_ok=True)
+    old.write_text(json.dumps({'language': 'xx'}), encoding='utf-8')
+
+    with caplog.at_level('WARNING', logger='core.user_lang'):
+        for _ in range(3):
+            assert ul.get_preferred_lang() == 'en'
+
+    warned = [r for r in caplog.records if 'not carried over' in r.getMessage()]
+    assert len(warned) == 1, [r.getMessage() for r in warned]
+
+
+def test_the_old_path_is_the_one_platform_paths_names():
+    # Every other test patches _LEGACY_LANG_PATH; this pins the production
+    # wiring, so pointing it at the new path (the feature silently off)
+    # fails.
+    assert ul._LEGACY_LANG_PATH == pp.legacy_documents_db_path('hart_language.json')
+    assert os.path.normcase(ul._LEGACY_LANG_PATH) != os.path.normcase(ul._HART_LANG_PATH)
+
+
+def test_only_user_lang_names_the_file():
+    """A second reader of hart_language.json skips the carry-over and the
+    data root (Nunba's TTS warm-up did, review of 924b8e9dc).  Nunba's
+    tests/test_preferred_lang_fallback.py scans both repos the same way."""
+    import ast
+    from tests.unit.test_identity_is_hermetic import _docstring_ids, _shipped_sources
+    offenders = []
+    for rel in _shipped_sources():
+        if rel == 'core/user_lang.py':
+            continue
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__)))), rel), encoding='utf-8', errors='replace') as fh:
+            text = fh.read()
+        if 'hart_language.json' not in text:
+            continue
+        tree = ast.parse(text)
+        docs = _docstring_ids(tree)
+        offenders += ['%s:%d' % (rel, n.lineno) for n in ast.walk(tree)
+                      if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                      and id(n) not in docs and 'hart_language.json' in n.value
+                      and not any(c.isspace() for c in n.value)]
+    assert offenders == []

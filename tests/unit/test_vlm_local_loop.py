@@ -22,6 +22,36 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+import contextlib
+
+_MISSING = object()
+
+
+@contextlib.contextmanager
+def _swap_modules(replacements):
+    """Put these sys.modules entries in place, and restore ONLY them.
+
+    Was patch.dict('sys.modules', ...), whose exit restores the WHOLE dict:
+    every module first imported inside it (qwen3vl_backend,
+    activity_stream, ...) is dropped while its stale object stays on its
+    package.  A later `from integrations.vlm import qwen3vl_backend` then
+    returns the stale one, a test patches it, and the loop's call-time
+    import loads a fresh, unpatched copy.  Measured 2026-09-27: after this
+    file, test_vlm_loop_feeds_back_action_output sent real requests to
+    127.0.0.1:8080.
+    """
+    saved = {k: sys.modules.get(k, _MISSING) for k in replacements}
+    sys.modules.update(replacements)
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is _MISSING:
+                sys.modules.pop(key, None)
+            else:
+                sys.modules[key] = value
+
+
 from integrations.vlm.local_loop import (
     _parse_vlm_response,
     _build_action_payload,
@@ -321,12 +351,12 @@ class TestRunLocalAgenticLoop:
         mock_lct.VLM_IMG_W = 1280
         mock_lct.VLM_IMG_H = 720
 
-        with patch.dict('sys.modules', {'integrations.vlm.local_computer_tool': mock_lct}):
+        with _swap_modules({'integrations.vlm.local_computer_tool': mock_lct}):
             with patch('integrations.vlm.qwen3vl_backend.get_qwen3vl_backend',
                        return_value=_unified_backend(done_response)):
                 mock_omni = MagicMock()
                 mock_omni.parse_screen.return_value = {'screen_info': 'Desktop', 'parsed_content_list': []}
-                with patch.dict('sys.modules', {'integrations.vlm.local_omniparser': mock_omni}):
+                with _swap_modules({'integrations.vlm.local_omniparser': mock_omni}):
                     result = run_local_agentic_loop(
                         {"instruction_to_vlm_agent": "Open notepad"},
                         tier='inprocess',
@@ -348,12 +378,12 @@ class TestRunLocalAgenticLoop:
         mock_lct.VLM_IMG_W = 1280
         mock_lct.VLM_IMG_H = 720
 
-        with patch.dict('sys.modules', {'integrations.vlm.local_computer_tool': mock_lct}):
+        with _swap_modules({'integrations.vlm.local_computer_tool': mock_lct}):
             with patch('integrations.vlm.qwen3vl_backend.get_qwen3vl_backend',
                        return_value=_unified_backend(action_response)):
                 mock_omni = MagicMock()
                 mock_omni.parse_screen.return_value = {'screen_info': '', 'parsed_content_list': []}
-                with patch.dict('sys.modules', {'integrations.vlm.local_omniparser': mock_omni}):
+                with _swap_modules({'integrations.vlm.local_omniparser': mock_omni}):
                     with patch('integrations.vlm.local_loop.time.sleep'):
                         result = run_local_agentic_loop(
                             {"instruction_to_vlm_agent": "Keep clicking"},
@@ -372,10 +402,10 @@ class TestRunLocalAgenticLoop:
         mock_lct.VLM_IMG_W = 1280
         mock_lct.VLM_IMG_H = 720
 
-        with patch.dict('sys.modules', {'integrations.vlm.local_computer_tool': mock_lct}):
+        with _swap_modules({'integrations.vlm.local_computer_tool': mock_lct}):
             mock_omni = MagicMock()
             mock_omni.parse_screen.return_value = {'screen_info': '', 'parsed_content_list': []}
-            with patch.dict('sys.modules', {'integrations.vlm.local_omniparser': mock_omni}):
+            with _swap_modules({'integrations.vlm.local_omniparser': mock_omni}):
                 result = run_local_agentic_loop(
                     {
                         "instruction_to_vlm_agent": "Long task",
@@ -398,12 +428,12 @@ class TestRunLocalAgenticLoop:
         mock_lct.VLM_IMG_W = 1280
         mock_lct.VLM_IMG_H = 720
 
-        with patch.dict('sys.modules', {'integrations.vlm.local_computer_tool': mock_lct}):
+        with _swap_modules({'integrations.vlm.local_computer_tool': mock_lct}):
             with patch('integrations.vlm.qwen3vl_backend.get_qwen3vl_backend',
                        return_value=_unified_backend(action_response)):
                 mock_omni = MagicMock()
                 mock_omni.parse_screen.return_value = {'screen_info': '', 'parsed_content_list': []}
-                with patch.dict('sys.modules', {'integrations.vlm.local_omniparser': mock_omni}):
+                with _swap_modules({'integrations.vlm.local_omniparser': mock_omni}):
                     with patch('integrations.vlm.local_loop.time.sleep'):
                         result = run_local_agentic_loop(
                             {"instruction_to_vlm_agent": "Test errors"},
@@ -421,9 +451,9 @@ class TestRunLocalAgenticLoop:
         mock_lct.VLM_IMG_W = 1280
         mock_lct.VLM_IMG_H = 720
 
-        with patch.dict('sys.modules', {'integrations.vlm.local_computer_tool': mock_lct}):
+        with _swap_modules({'integrations.vlm.local_computer_tool': mock_lct}):
             mock_omni = MagicMock()
-            with patch.dict('sys.modules', {'integrations.vlm.local_omniparser': mock_omni}):
+            with _swap_modules({'integrations.vlm.local_omniparser': mock_omni}):
                 with patch('integrations.vlm.local_loop.time.sleep'):
                     result = run_local_agentic_loop(
                         {"instruction_to_vlm_agent": "Test crash"},
@@ -444,12 +474,12 @@ class TestRunLocalAgenticLoop:
         mock_lct.VLM_IMG_W = 1280
         mock_lct.VLM_IMG_H = 720
 
-        with patch.dict('sys.modules', {'integrations.vlm.local_computer_tool': mock_lct}):
+        with _swap_modules({'integrations.vlm.local_computer_tool': mock_lct}):
             with patch('integrations.vlm.qwen3vl_backend.get_qwen3vl_backend',
                        return_value=_unified_backend(done_response)):
                 mock_omni = MagicMock()
                 mock_omni.parse_screen.return_value = {'screen_info': '', 'parsed_content_list': []}
-                with patch.dict('sys.modules', {'integrations.vlm.local_omniparser': mock_omni}):
+                with _swap_modules({'integrations.vlm.local_omniparser': mock_omni}):
                     result = run_local_agentic_loop(
                         {"instruction_to_vlm_agent": "Quick task"},
                         tier='inprocess',
@@ -466,12 +496,12 @@ class TestRunLocalAgenticLoop:
         mock_lct.VLM_IMG_W = 1280
         mock_lct.VLM_IMG_H = 720
 
-        with patch.dict('sys.modules', {'integrations.vlm.local_computer_tool': mock_lct}):
+        with _swap_modules({'integrations.vlm.local_computer_tool': mock_lct}):
             with patch('integrations.vlm.qwen3vl_backend.get_qwen3vl_backend',
                        return_value=_unified_backend(done_response)):
                 mock_omni = MagicMock()
                 mock_omni.parse_screen.return_value = {'screen_info': '', 'parsed_content_list': []}
-                with patch.dict('sys.modules', {'integrations.vlm.local_omniparser': mock_omni}):
+                with _swap_modules({'integrations.vlm.local_omniparser': mock_omni}):
                     result = run_local_agentic_loop(
                         {"instruction_to_vlm_agent": "test"},
                         tier='http',
@@ -487,7 +517,7 @@ class TestRunLocalAgenticLoop:
         mock_lct.VLM_IMG_W = 1280
         mock_lct.VLM_IMG_H = 720
 
-        with patch.dict('sys.modules', {'integrations.vlm.local_computer_tool': mock_lct}):
+        with _swap_modules({'integrations.vlm.local_computer_tool': mock_lct}):
             backend = _unified_backend(done_response)
             # Bound to the BACKEND, not to the patched factory: `as mock_vlm`
             # would name the function that returns it, whose `_call_api` is a
@@ -496,7 +526,7 @@ class TestRunLocalAgenticLoop:
                        return_value=backend):
                 mock_omni = MagicMock()
                 mock_omni.parse_screen.return_value = {'screen_info': '', 'parsed_content_list': []}
-                with patch.dict('sys.modules', {'integrations.vlm.local_omniparser': mock_omni}):
+                with _swap_modules({'integrations.vlm.local_omniparser': mock_omni}):
                     run_local_agentic_loop(
                         {
                             "instruction_to_vlm_agent": "basic",

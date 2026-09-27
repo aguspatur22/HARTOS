@@ -73,7 +73,8 @@ def _adopt_legacy_file() -> None:
     new path is never overwritten; an old file that does not parse or names
     no supported language is left, not copied; a failure is logged, never
     raised.  Asked once per process: this sits under the /chat hot path.
-    On Windows the two paths are the same file, so it does nothing."""
+    On Windows the two paths are the same file, so "new missing" already
+    means "old missing" and it does nothing."""
     global _legacy_checked
     with _legacy_lock:
         if _legacy_checked:
@@ -81,9 +82,7 @@ def _adopt_legacy_file() -> None:
         _legacy_checked = True
         new, old = _HART_LANG_PATH, _LEGACY_LANG_PATH
         try:
-            if (os.path.exists(new) or not os.path.isfile(old)
-                    or os.path.normcase(os.path.abspath(old))
-                    == os.path.normcase(os.path.abspath(new))):
+            if os.path.exists(new) or not os.path.isfile(old):
                 return
             with open(old, encoding='utf-8') as f:
                 data = json.load(f) or {}

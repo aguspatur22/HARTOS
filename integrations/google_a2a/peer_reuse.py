@@ -562,8 +562,14 @@ def invoke_peer_agent(peer_url: str, agent_id: str, prompt: str,
         return task
     task_id = task.get('id')
     interval = _POLL_INTERVAL_S
-    while time.monotonic() + interval < deadline:
-        time.sleep(interval)
+    while True:
+        # The last sleep is cut to what is left, so the budget is spent
+        # before the cancel: the loop used to stop a whole backed-off
+        # interval (up to 2 s) early.
+        left = deadline - time.monotonic()
+        if left <= _POLL_INTERVAL_S / 5:
+            break
+        time.sleep(min(interval, left))
         # Back off: 0.25 s, then up to 2 s, so a 30 s wait is ~20 signed
         # reads, not 120 (review of a4ea04651).
         interval = min(interval * 2, _POLL_INTERVAL_MAX_S)

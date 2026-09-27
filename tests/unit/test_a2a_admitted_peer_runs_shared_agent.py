@@ -1023,9 +1023,11 @@ def test_the_poll_backs_off(monkeypatch):
         'message/get': [{'id': 't1', 'state': 'working'}],
         'task/cancel': [{'success': True}]})
     started = time.monotonic()
-    assert peer_reuse.invoke_peer_agent(PEER_URL, AGENT, 'x', timeout=6,
+    assert peer_reuse.invoke_peer_agent(PEER_URL, AGENT, 'x', timeout=6.9,
                                         peer_node_id=SERVER_ID) is None
-    assert time.monotonic() - started >= 5.5
+    # The whole budget is spent before the cancel: the last sleep is cut to
+    # what is left, not skipped (a backed-off 2 s step would stop at ~5.8).
+    assert time.monotonic() - started >= 6.7
     assert calls.count('message/get') <= 8, calls
     assert calls[-1] == 'task/cancel' or calls[-2] == 'task/cancel', calls
 

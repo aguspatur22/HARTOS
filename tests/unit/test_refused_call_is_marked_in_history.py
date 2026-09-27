@@ -239,5 +239,143 @@ class GroupChatSeesTheMark(unittest.TestCase):
                              UNQUOTED, seat)
 
 
+def _production_transforms(peers):
+    """The chain every production pipeline attaches to its seats
+    (create_recipe / reuse_recipe: history_limiter + token_limiter +
+    ToolMessageHandler).  autogen's TransformMessages hook deep-copies the
+    history before any reply function runs, so the executor is handed a COPY
+    of the stored call, never the stored dict itself."""
+    from autogen.agentchat.contrib.capabilities import transform_messages
+    from core.constants import (AUTOGEN_HISTORY_LIMIT,
+                                AUTOGEN_MESSAGE_TOKEN_BUDGET,
+                                AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE)
+    from hartos.helper import history_limiter, token_limiter
+    return transform_messages.TransformMessages(transforms=[
+        history_limiter(max_messages=AUTOGEN_HISTORY_LIMIT,
+                        keep_first_message=True),
+        token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET,
+                      max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE,
+                      min_tokens=0),
+        ToolMessageHandler(peer_agents=peers),
+    ], verbose=False)
+
+
+class ProductionTransformsKeepTheMark(unittest.TestCase):
+    """Review of 7d07c0a2d: with the production TransformMessages attached,
+    the executor gets a deep copy (transform_messages.py:64), so marking the
+    dict it was handed marked nothing the conversation keeps, and every later
+    request showed json_repair's split dict again.  The mark has to land on
+    the records the conversation keeps."""
+
+    def setUp(self):
+        orig = (ConversableAgent.execute_function,
+                ConversableAgent.a_execute_function)
+
+        def restore():
+            (ConversableAgent.execute_function,
+             ConversableAgent.a_execute_function) = orig
+        self.addCleanup(restore)
+        self.assertTrue(force_apply_autogen_json_fix())
+        ctx = Flask(__name__).app_context()
+        ctx.push()
+        self.addCleanup(ctx.pop)
+        self.calls = []
+
+        def send_message_to_user(text: str) -> str:
+            self.calls.append(text)
+            return 'sent'
+        self.tool = send_message_to_user
+
+    def _group_chat(self, transform_seats):
+        from autogen import GroupChat, GroupChatManager
+        user = ConversableAgent('user', llm_config=False,
+                                human_input_mode='NEVER', default_auto_reply='')
+        assistant = ConversableAgent('assistant', llm_config=False,
+                                     human_input_mode='NEVER')
+        turns = []
+
+        def reply(recipient, messages=None, sender=None, config=None):
+            turns.append(1)
+            if len(turns) == 1:
+                return True, {'role': 'assistant', 'content': None,
+                              'tool_calls': [{
+                                  'id': 'call_1', 'type': 'function',
+                                  'function': {'name': 'send_message_to_user',
+                                               'arguments': UNQUOTED}}]}
+            return True, 'TERMINATE'
+        assistant.register_reply([ConversableAgent, None], reply, position=0)
+        executor = ConversableAgent('executor', llm_config=False,
+                                    human_input_mode='NEVER')
+        executor.register_function({'send_message_to_user':
+                                    executor._wrap_function(self.tool)})
+        seats = {'assistant': assistant, 'executor': executor}
+        chain = _production_transforms([assistant, executor])
+        for name in transform_seats:
+            chain.add_to_agent(seats[name])
+        chat = GroupChat(agents=[user, assistant, executor], messages=[],
+                         max_round=4, speaker_selection_method='round_robin')
+        manager = GroupChatManager(chat, llm_config=False)
+        user.initiate_chat(manager, message='report', silent=True)
+        return {'assistant': assistant._oai_messages[manager],
+                'executor': executor._oai_messages[manager],
+                'groupchat': chat.messages}
+
+    def _assert_every_seat_marked(self, views):
+        self.assertEqual(self.calls, [])
+        for seat, history in views.items():
+            sent = [tc['function']['arguments'] for m in history
+                    for tc in (m.get('tool_calls') or [])]
+            self.assertEqual(len(sent), 1, seat)
+            parsed = json.loads(sent[0])
+            self.assertEqual(parsed.get(REFUSED_ARGUMENTS_KEY), UNQUOTED, seat)
+            self.assertNotIn('Consulting', parsed, seat)
+
+    def test_group_chat_with_production_transforms_on_every_seat(self):
+        self._assert_every_seat_marked(
+            self._group_chat(('assistant', 'executor')))
+
+    def test_group_chat_with_the_transform_on_the_executor_only(self):
+        self._assert_every_seat_marked(self._group_chat(('executor',)))
+
+    def _pairwise(self, run_async):
+        assistant = ConversableAgent('assistant', llm_config=False,
+                                     human_input_mode='NEVER')
+        executor = ConversableAgent('executor', llm_config=False,
+                                    human_input_mode='NEVER')
+        executor.register_function({'send_message_to_user':
+                                    executor._wrap_function(self.tool)})
+        _production_transforms([assistant, executor]).add_to_agent(executor)
+        assistant.send(
+            {'role': 'assistant', 'content': None,
+             'tool_calls': [{'id': 'call_1', 'type': 'function',
+                             'function': {'name': 'send_message_to_user',
+                                          'arguments': UNQUOTED}}]},
+            executor, request_reply=False, silent=True)
+        if run_async:
+            reply = asyncio.run(executor.a_generate_reply(sender=assistant))
+        else:
+            reply = executor.generate_reply(sender=assistant)
+        self.assertIn('not valid JSON', str(reply))
+        return {'assistant': assistant._oai_messages[executor],
+                'executor': executor._oai_messages[assistant]}
+
+    def test_pairwise_reply_through_the_transform_hook(self):
+        self._assert_every_seat_marked(self._pairwise(run_async=False))
+
+    def test_pairwise_async_reply_through_the_transform_hook(self):
+        self._assert_every_seat_marked(self._pairwise(run_async=True))
+
+    def test_the_next_request_carries_the_stand_in(self):
+        # What the assistant's next LLM request is built from: its history
+        # through the same production chain.
+        views = self._pairwise(run_async=False)
+        out = _production_transforms([])._transform_messages(
+            views['assistant'])
+        sent = [tc['function']['arguments'] for m in out
+                for tc in (m.get('tool_calls') or [])]
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(json.loads(sent[0])[REFUSED_ARGUMENTS_KEY], UNQUOTED)
+
+
 if __name__ == '__main__':
     unittest.main()

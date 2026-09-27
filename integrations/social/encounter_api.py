@@ -53,6 +53,10 @@ Invariants enforced server-side (the blocking privacy gates):
   6. All pubkeys are rotating (scheme rotates every
      ENCOUNTER_PUBKEY_ROTATION_SEC on the phone); server stores only
      the rotating value, never the user's master identity.
+  7. A user's vibe_tags reach anyone else only while their
+     interests_discoverable is true (icebreaker_service.
+     vibe_tags_others_may_see); consent flags are parsed strictly
+     (_flags), so the string 'false' is never a yes.
 """
 from __future__ import annotations
 
@@ -82,6 +86,7 @@ from core.constants import (
 )
 
 from .auth import require_auth
+from .icebreaker_service import vibe_tags_others_may_see
 from .models import (
     DiscoverablePref,
     Encounter,
@@ -131,6 +136,36 @@ def _clean_tags(raw) -> Optional[list[str]]:
         return None
     return [str(t)[:ENCOUNTER_PERSONA_TAG_MAX_CHARS]
             for t in raw[:ENCOUNTER_PERSONA_MAX_TAGS]]
+
+
+_FLAG_STRINGS = {'true': True, 'false': False}
+
+
+def _flags(body: dict, defaults: dict[str, Optional[bool]]):
+    """Read the named yes/no flags from a request body, strictly.
+
+    A flag is a JSON boolean or exactly the string 'true' / 'false'; a key
+    the body does not name takes its default.  Anything else ('False',
+    'yes', 1, null, ...) is refused, never guessed: these are consent
+    flags, and bool('false') is True.  Returns (values, None) or
+    (None, error message).  The codebase's other parsers
+    (api_compute_earnings._parse_bool, compute_config._parse_bool,
+    video_orchestrator._to_bool, core.platform.config._convert_bool) map
+    unknown input to a value instead of refusing it, so they do not fit.
+    """
+    out = {}
+    for key, default in defaults.items():
+        if key not in body:
+            out[key] = default
+            continue
+        raw = body[key]
+        if isinstance(raw, bool):
+            out[key] = raw
+        elif isinstance(raw, str) and raw in _FLAG_STRINGS:
+            out[key] = _FLAG_STRINGS[raw]
+        else:
+            return None, f'{key} must be true or false'
+    return out, None
 
 
 def _new_id(prefix: str) -> str:
@@ -301,12 +336,16 @@ def set_discoverable():
     if uid is None:
         return _err('unauthenticated', 401)
     body = _json()
-    enable = bool(body.get('enabled', False))
+    flags, bad = _flags(body, {'enabled': False, 'age_claim_18': False,
+                               'face_visible': False})
+    if bad:
+        return _err(bad)
+    enable = flags['enabled']
     ttl = int(body.get('ttl_sec', ENCOUNTER_DISCOVERABLE_TTL_SEC))
     if ttl <= 0 or ttl > ENCOUNTER_DISCOVERABLE_TTL_SEC:
         ttl = ENCOUNTER_DISCOVERABLE_TTL_SEC
-    age_claim = bool(body.get('age_claim_18', False))
-    face_visible = bool(body.get('face_visible', False))
+    age_claim = flags['age_claim_18']
+    face_visible = flags['face_visible']
     avatar_style = str(body.get('avatar_style', 'studio_ghibli'))[:64]
     # vibe_tags is also written by PUT /encounter/persona, so a toggle that
     # does not name them leaves the user's tags alone (it used to reset
@@ -404,6 +443,9 @@ def set_persona():
         tags = _clean_tags(body.get('vibe_tags') or [])
         if tags is None:
             return _err('vibe_tags must be a list of strings')
+    flags, bad = _flags(body, {'interests_discoverable': None})
+    if bad:
+        return _err(bad)
 
     pref = g.db.query(DiscoverablePref).filter_by(user_id=uid).first()
     if pref is None:
@@ -417,8 +459,8 @@ def set_persona():
             :ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS]
     if tags is not None:
         pref.vibe_tags = tags
-    if 'interests_discoverable' in body:
-        pref.interests_discoverable = bool(body.get('interests_discoverable'))
+    if flags['interests_discoverable'] is not None:
+        pref.interests_discoverable = flags['interests_discoverable']
     g.db.commit()
     return _ok(_persona_dict(pref))
 
@@ -485,7 +527,9 @@ def report_sighting():
         'sighting_id': sighting.id,
         'peer_anon_id': peer_pubkey[:12],
         'avatar_style': peer_pref.avatar_style or 'studio_ghibli',
-        'vibe_tags': peer_pref.vibe_tags or [],
+        # A stranger's card: tags only if the peer said yes to sharing
+        # interests.  Being discoverable is not that yes.
+        'vibe_tags': vibe_tags_others_may_see(peer_pref),
         'face_visible': bool(peer_pref.face_visible),
         'expires_at': sighting.expires_at.isoformat(),
     })

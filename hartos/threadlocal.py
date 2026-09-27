@@ -108,6 +108,36 @@ class ThreadLocalData:
         for key, value in (snapshot or {}).items():
             setattr(self._local, key, value)
 
+    def detached(self):
+        """Context manager: run a block with NO request state on this thread,
+        then put this thread's state back exactly as it was.
+
+        For work that is no request's turn but runs on a thread a request
+        used.  The /chat handler sets this state and never clears it, so a
+        reused worker thread still carries the last chat's prompt_id,
+        user_id, request_id, user_role, activity run and model override;
+        measured 2026-09-27, an MCP tool saw them (mcp_http_bridge._invoke_
+        tool is the caller).  Inside the block every getter answers its
+        default.  The saved values are put back by reference, not copied,
+        so an object the thread shares (a run the VLM loop may close) stays
+        the same object.
+        """
+        import contextlib
+
+        @contextlib.contextmanager
+        def _cm():
+            saved = dict(vars(self._local))
+            for key in saved:
+                delattr(self._local, key)
+            try:
+                yield
+            finally:
+                for key in list(vars(self._local)):
+                    delattr(self._local, key)
+                for key, value in saved.items():
+                    setattr(self._local, key, value)
+        return _cm()
+
     # --- Computer-use run context (set by integrations.vlm.local_loop) ---
     # The run a desktop action belongs to, so a tool that executes DURING a
     # run can announce itself as a step of that run instead of inventing its

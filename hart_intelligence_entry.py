@@ -8725,6 +8725,11 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
         payload — semantically identical to the old inline
         ``return jsonify({'response': response_text, **payload})``.
     """
+    # An elided-text pointer a model copied into its answer is never shown
+    # to the user, spoken or stored as the reply (owner ruling 2026-09-27;
+    # core.llm_outbound_logger.strip_elided_pointers).
+    from core.llm_outbound_logger import strip_elided_pointers
+    response_text = strip_elided_pointers(response_text)
     if response_text:
         # media_mode honor: the Nunba adapter has forwarded the user's
         # chosen mode ('audio'|'video'|'text') in the /chat body all

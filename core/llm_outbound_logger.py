@@ -916,6 +916,21 @@ def parse_elided_pointers(text: str) -> list:
             for m in _ELIDED_POINTER_RE.finditer(str(text or ''))]
 
 
+def strip_elided_pointers(text):
+    """``text`` with every pointer removed, and the space it leaves closed.
+
+    For text that leaves for the USER (publish_agent_message, the /chat
+    reply): a model can copy a pointer from its context into its answer,
+    and a pointer is never an answer (owner ruling, 2026-09-27).  Non-text
+    is returned as it is."""
+    if not isinstance(text, str) or ELIDED_KEY_PREFIX not in text:
+        return text
+    import re as _re
+    pat = _re.compile(r'[ \t]*\[' + _re.escape(ELIDED_KEY_PREFIX)
+                      + r'[0-9a-f]{12} \d+ chars of [a-z ]+\]')
+    return pat.sub('', text)
+
+
 def _elided_id(text: str) -> str:
     import hashlib
     return hashlib.sha256(
@@ -1263,14 +1278,13 @@ def _drop_units(messages: list) -> dict:
 def _strip_pointers(msg: dict) -> dict:
     """``msg`` with every pointer removed (the plain WIRE_TRIM_MARKER stays),
     for a body whose elided text could not be saved."""
-    import re as _re
-    pat = _re.compile(r'\[' + _re.escape(ELIDED_KEY_PREFIX)
-                      + r'[0-9a-f]{12} \d+ chars of [a-z ]+\]' + '\n?')
+    # The one pointer format, removed by the one stripper.
+    sub = strip_elided_pointers
     out = dict(msg)
     if isinstance(out.get('content'), str):
-        out['content'] = pat.sub('', out['content'])
+        out['content'] = sub(out['content'])
     elif isinstance(out.get('content'), list):
-        out['content'] = [{**p, 'text': pat.sub('', p['text'])}
+        out['content'] = [{**p, 'text': sub(p['text'])}
                           if isinstance(p, dict) and isinstance(p.get('text'), str)
                           else p for p in out['content']]
     if out.get('tool_calls'):
@@ -1282,8 +1296,8 @@ def _strip_pointers(msg: dict) -> dict:
                     obj = json.loads(fn['arguments'])
                     if isinstance(obj, dict) and isinstance(
                             obj.get('trimmed_arguments'), str):
-                        obj['trimmed_arguments'] = pat.sub(
-                            '', obj['trimmed_arguments'])
+                        obj['trimmed_arguments'] = sub(
+                            obj['trimmed_arguments'])
                         tc = {**tc, 'function': {**fn, 'arguments': json.dumps(obj)}}
                 except ValueError:
                     pass

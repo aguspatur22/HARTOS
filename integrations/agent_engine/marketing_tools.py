@@ -684,6 +684,14 @@ def detect_goal_tags(prompt) -> list:
     if _mentions(lower, media_keywords):
         tags.append('media')
 
+    # goal_manager maps 'thought_experiment' to its tool tag, which unlocks
+    # the agent's own vote (thought_experiment_tools.ExperimentVoteTool).
+    thought_experiment_keywords = [
+        'thought experiment', 'thought-experiment',
+    ]
+    if _mentions(lower, thought_experiment_keywords):
+        tags.append('thought_experiment')
+
     return tags
 
 

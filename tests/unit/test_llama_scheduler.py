@@ -202,7 +202,7 @@ def test_a_timeout_racing_a_grant_does_not_leak_the_slot(monkeypatch):
     monkeypatch.setattr(ls._Req, '__init__', init)
     tok = s.acquire('late', 'daemon', timeout=0.1)
     monkeypatch.setattr(ls._Req, '__init__', real)
-    assert tok is not None, 'the grant landed in time; it is the caller's'
+    assert tok is not None, 'the grant landed in time: the caller owns it'
     s.release(tok)
     assert s.stats()['in_flight'] == 0, s.inflight()
     assert s.acquire('next', 'daemon', timeout=1.0) is not None

@@ -2683,6 +2683,9 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         AceStepTool.register()    # port 8001
         SeoAuditTool.register()   # native in-process (no port)
         GhPrTool.register()       # native in-process (no port)
+        from integrations.agent_engine.thought_experiment_tools import (
+            ExperimentVoteTool)
+        ExperimentVoteTool.register()  # native: the agent's own vote
         service_tool_registry.load_config()  # load any user-added tools from service_tools.json
 
         svc_tools = service_tool_registry.get_all_tool_functions()

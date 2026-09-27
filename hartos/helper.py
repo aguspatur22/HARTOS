@@ -1236,6 +1236,57 @@ def refused_arguments_json(text):
     })
 
 
+def call_functions(msg):
+    """The function dicts a message's tool calls carry: each
+    ``tool_calls[].function`` and a legacy ``function_call``, in order.  The
+    dicts themselves, not copies, so a caller may write into them."""
+    if not isinstance(msg, dict):
+        return []
+    fns = [tc['function'] for tc in (msg.get('tool_calls') or [])
+           if isinstance(tc, dict) and isinstance(tc.get('function'), dict)]
+    if isinstance(msg.get('function_call'), dict):
+        fns.append(msg['function_call'])
+    return fns
+
+
+def wire_tool_arguments(args):
+    """``(text, coerced)``: the arguments text the TOOL-ARGS-GUARD sends for
+    one call written with ``args`` (see ensure_tool_call_arguments_json), and
+    whether it had to change what was written to get it.  Pure: the guard
+    writes it, and the executor uses it to find the record a guarded copy
+    came from (stored_call_records)."""
+    if isinstance(args, dict):
+        # Some code paths store the arguments as an object already — the
+        # wire wants a string, so serialize.  A float inf / nan in it
+        # serializes as Infinity / NaN, so it is checked below like any
+        # other string.
+        args = json.dumps(args)
+        if is_wire_json(args):
+            return args, False
+    if args is None:
+        return '{}', True
+    if not isinstance(args, str):
+        args = str(args)
+    try:
+        is_object = isinstance(_wire_json_loads(args, _refuse_token), dict)
+    except Exception:
+        is_object = False
+    if is_object:
+        # Already a strict JSON object: leave untouched.  Strict JSON that is
+        # not an object ('[1,2]', '"hello"') is not arguments: the llama.cpp
+        # template reads arguments only as a mapping, so a prior call with
+        # '[{"url": ...}]' rendered with no parameters at all (measured on
+        # :8080, review of b0fa4989e).
+        return args, False
+    try:
+        obj, _ = parse_tool_arguments(args)
+        if isinstance(obj, dict):
+            return json.dumps(obj), True
+    except ValueError:
+        pass
+    return refused_arguments_json(args), True
+
+
 def ensure_tool_call_arguments_json(messages):
     """Coerce every tool_call / function_call ``arguments`` field to a valid
     JSON-object string, in place, and return the same list.
@@ -1271,64 +1322,28 @@ def ensure_tool_call_arguments_json(messages):
     it: review of 86e580b99).  ``None`` arguments, where nothing was written,
     still become ``"{}"``.
 
+    The per-call rule is :func:`wire_tool_arguments`.
+
     This guard has no tool signatures, so its repair cannot tell a benign fix
     (a trailing comma) from json_repair splitting an unquoted value into
-    keys.  The executor can: a call it refused as broken JSON is already
-    marked refused in the conversation (bind_tool_call_arguments, ``call``),
-    and a strict JSON object is kept here as it is.
+    keys.  The executor can, and it reads the call as the model wrote it:
+    every production seat runs this guard in its TransformMessages chain
+    BEFORE any reply function, so the executor is handed this guard's
+    repair, not the model's text; it finds the conversation's stored record
+    of the call (stored_call_records) and parses that.  A call it refused
+    as broken JSON is marked refused in that record, and a strict JSON
+    object is kept here as it is.
     """
     if not messages:
         return messages
     coerced = 0
     for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        fns = []
-        for tc in (msg.get('tool_calls') or []):
-            if isinstance(tc, dict) and isinstance(tc.get('function'), dict):
-                fns.append(tc['function'])
-        if isinstance(msg.get('function_call'), dict):
-            fns.append(msg['function_call'])
-        for fn in fns:
+        for fn in call_functions(msg):
             args = fn.get('arguments')
-            if isinstance(args, dict):
-                # Some code paths store the arguments as an object already —
-                # the wire wants a string, so serialize.  A float inf / nan in
-                # it serializes as Infinity / NaN, so it is checked below
-                # like any other string.
-                args = json.dumps(args)
-                if is_wire_json(args):
-                    fn['arguments'] = args
-                    continue
-            if args is None:
-                fn['arguments'] = '{}'
-                coerced += 1
-                continue
-            if not isinstance(args, str):
-                args = str(args)
-            try:
-                is_object = isinstance(_wire_json_loads(args, _refuse_token),
-                                       dict)
-            except Exception:
-                is_object = False
-            if is_object:
-                # Already a strict JSON object: leave untouched.  Strict JSON
-                # that is not an object ('[1,2]', '"hello"') is not arguments:
-                # the llama.cpp template reads arguments only as a mapping,
-                # so a prior call with '[{"url": ...}]' rendered with no
-                # parameters at all (measured on :8080, review of b0fa4989e).
-                continue
-            fixed = None
-            try:
-                obj, _ = parse_tool_arguments(args)
-                if isinstance(obj, dict):
-                    fixed = json.dumps(obj)
-            except ValueError:
-                pass
-            if fixed is None:
-                fixed = refused_arguments_json(args)
-            fn['arguments'] = fixed
-            coerced += 1
+            fixed, changed = wire_tool_arguments(args)
+            if fixed != args:
+                fn['arguments'] = fixed
+            coerced += changed
     if coerced:
         try:
             current_app.logger.info(
@@ -4245,18 +4260,57 @@ def tool_argument_error(func, func_name, arguments, repaired):
             f"with one JSON object using these names.")
 
 
-def mark_call_refused(call, input_string):
+def stored_call_records(agent, func_call):
+    """``(as_written, records)`` for the call ``func_call`` an executor was
+    handed: the arguments as the model wrote them, and the function dicts in
+    ``agent``'s own conversations (``_oai_messages``) that record the call
+    with that text.
+
+    Review of 7d07c0a2d, measured: every production pipeline attaches
+    TransformMessages to its seats, and autogen 0.2.37 deep-copies the
+    history before any reply function runs (transform_messages.py:64), then
+    runs the TOOL-ARGS-GUARD on the copy.  So the executor was handed the
+    guard's repair of a copy: json_repair's split dict read as strict JSON
+    ("Unknown argument(s): Consulting", a naming mistake), '{"text":' ran
+    the tool with text '' as {"text": ""}, and marking the handed dict
+    marked nothing the conversation keeps.  A stored record matches when its
+    name is the call's and its arguments are the handed ones, or are what
+    the guard makes of them (wire_tool_arguments); the most recent match is
+    the text the model wrote.  No match: the handed arguments and no
+    records."""
+    handed = func_call.get('arguments', '{}')
+    name = func_call.get('name', '')
+    found = []
+    for conversation in list((getattr(agent, '_oai_messages', None) or {}).values()):
+        for msg in conversation or []:
+            for fn in call_functions(msg):
+                if fn.get('name') != name:
+                    continue
+                raw = fn.get('arguments')
+                if raw is handed or raw == handed or (
+                        isinstance(raw, str)
+                        and wire_tool_arguments(raw)[0] == handed):
+                    found.append(fn)
+    if not found:
+        return handed, []
+    as_written = found[-1].get('arguments')
+    return as_written, [fn for fn in found if fn.get('arguments') == as_written]
+
+
+def mark_call_refused(records, input_string):
     """Write the refused stand-in (refused_arguments_json: what the model
-    wrote, marked refused, and why) into ``call``, the conversation's own
-    record of a tool call whose arguments were not valid JSON and were
-    refused.  A no-op when there is no record to mark."""
-    if isinstance(call, dict):
-        call['arguments'] = refused_arguments_json(
-            input_string if isinstance(input_string, str) else str(input_string))
+    wrote, marked refused, and why) into each of ``records``, the
+    conversation's own records of a tool call whose arguments were not valid
+    JSON and were refused (stored_call_records).  A no-op when there is no
+    record to mark."""
+    text = input_string if isinstance(input_string, str) else str(input_string)
+    for record in records or ():
+        if isinstance(record, dict):
+            record['arguments'] = refused_arguments_json(text)
 
 
 def bind_tool_call_arguments(func, func_name, input_string, format_json_str,
-                             where='', call=None):
+                             where='', records=()):
     """Parse a tool call's arguments and check them against the tool.
 
     Returns ``(arguments, None)`` when the tool may be called with them and
@@ -4266,12 +4320,14 @@ def bind_tool_call_arguments(func, func_name, input_string, format_json_str,
     ``tool_argument_error`` on whatever came back, including the ``{}``
     used when nothing could be recovered.
 
-    ``call`` is the conversation's own record of the call: autogen hands the
-    executor the very function dict of the stored message
-    (generate_tool_calls_reply: ``tool_call.get("function")`` of
-    ``messages[-1]``), and every copy of that message shares it.  When
-    arguments that were not valid JSON are refused, it is marked refused
-    (mark_call_refused).  Log RCA defect 14, leftover: the TOOL-ARGS-GUARD
+    ``input_string`` is the call as the model wrote it and ``records`` the
+    conversation's own records of it (stored_call_records: with the
+    production TransformMessages the executor is handed a guarded deep copy,
+    so neither the handed text nor the handed dict will do).  The seats of
+    a conversation share those function dicts (autogen broadcasts the one
+    message object), so when arguments that were not valid JSON are
+    refused, marking the records (mark_call_refused) marks every seat's
+    history.  Log RCA defect 14, leftover: the TOOL-ARGS-GUARD
     (ensure_tool_call_arguments_json), which has no tool signatures, repaired
     the same text on its own and wrote json_repair's split dict back into
     every later request, so the model saw its broken call as a well-formed
@@ -4301,14 +4357,14 @@ def bind_tool_call_arguments(func, func_name, input_string, format_json_str,
                 arguments, _ = parse_tool_arguments(arguments)
         except Exception as fallback_error:
             print(f" FALLBACK{where} FAILED: {fallback_error}")
-            mark_call_refused(call, input_string)
+            mark_call_refused(records, input_string)
             return None, f"Error: {e}\n The argument must be in JSON format."
         print(f" FALLBACK{where} PARSED: arguments for {func_name}: {arguments}")
         repaired = True
     if _invents_a_constant(arguments, input_string):
         print(f" ARGUMENTS REFUSED{where}: {func_name} not run: a value the "
               f"model never wrote (Infinity/NaN)")
-        mark_call_refused(call, input_string)
+        mark_call_refused(records, input_string)
         return None, (f"Error: {func_name} was not run: its arguments could "
                       f"not be read without turning a number into Infinity. "
                       f"Write a long number or id as a string in double "
@@ -4317,7 +4373,7 @@ def bind_tool_call_arguments(func, func_name, input_string, format_json_str,
     if error is not None:
         print(f" ARGUMENTS REFUSED{where}: {func_name} not run: {error}")
         if repaired:
-            mark_call_refused(call, input_string)
+            mark_call_refused(records, input_string)
         return None, error
     return arguments, None
 
@@ -4344,10 +4400,13 @@ def force_apply_autogen_json_fix():
         if func is not None:
             # ========== PRESERVE ORIGINAL AUTOGEN LOGIC ==========
             # Extract arguments from a json-like string and put it into a dict.
-            input_string = func_call.get("arguments", "{}")
+            # The call as the model wrote it, from the conversation's own
+            # record: the handed func_call is the guard's copy under the
+            # production TransformMessages (stored_call_records).
+            input_string, records = stored_call_records(self, func_call)
             arguments, content = bind_tool_call_arguments(
                 func, func_name, input_string, self._format_json_str,
-                call=func_call)
+                records=records)
 
             # ========== PRESERVE ORIGINAL EXECUTION LOGIC ==========
             if arguments is not None:
@@ -4394,10 +4453,10 @@ def force_apply_autogen_json_fix():
 
         is_exec_success = False
         if func is not None:
-            input_string = func_call.get("arguments", "{}")
+            input_string, records = stored_call_records(self, func_call)
             arguments, content = bind_tool_call_arguments(
                 func, func_name, input_string, self._format_json_str,
-                where=' ASYNC', call=func_call)
+                where=' ASYNC', records=records)
 
             if arguments is not None:
                 iostream.print(f"\n>>>>>>>> EXECUTING ASYNC FUNCTION {func_name}...", flush=True)

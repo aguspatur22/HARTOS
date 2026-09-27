@@ -379,6 +379,147 @@ def test_persona_rejects_non_list_tags(client):
     assert r.status_code == 400
 
 
+def _sight(client, viewer, pk):
+    return client.post(
+        '/api/social/encounter/sighting',
+        json={'peer_pubkey': pk, 'rssi_peak': -40, 'dwell_sec': 4},
+        headers=_as_user(viewer))
+
+
+def test_sighting_card_shows_tags_only_with_interests_discoverable(client):
+    """PRIVACY: turning the BLE broadcast on must not hand a stranger the
+    tags on the persona card.  They reach others only while the owner's
+    interests_discoverable is true, and stop again when it goes false."""
+    pk = 'abcd1234' * 4
+    client.put('/api/social/encounter/persona',
+               json={'vibe_tags': ['chess', 'jazz']}, headers=_as_user(40))
+    client.post('/api/social/encounter/discoverable',
+                json={'enabled': True, 'age_claim_18': True},
+                headers=_as_user(40))
+    _register_pubkey(client, 40, pk)
+
+    r = _sight(client, 41, pk)
+    assert r.status_code == 200
+    assert r.get_json()['data']['vibe_tags'] == []
+
+    client.put('/api/social/encounter/persona',
+               json={'interests_discoverable': True}, headers=_as_user(40))
+    assert _sight(client, 41, pk).get_json()['data']['vibe_tags'] == \
+        ['chess', 'jazz']
+
+    client.put('/api/social/encounter/persona',
+               json={'interests_discoverable': False}, headers=_as_user(40))
+    assert _sight(client, 41, pk).get_json()['data']['vibe_tags'] == []
+    # The owner still sees their own tags.
+    own = client.get('/api/social/encounter/persona',
+                     headers=_as_user(40)).get_json()['data']
+    assert own['vibe_tags'] == ['chess', 'jazz']
+
+
+@pytest.mark.parametrize('raw,stored', [(True, True), (False, False),
+                                        ('true', True), ('false', False)])
+def test_persona_consent_flag_accepts_booleans_and_exact_strings(
+        client, raw, stored):
+    # Start from the opposite value so a write that did nothing fails.
+    client.put('/api/social/encounter/persona',
+               json={'interests_discoverable': not stored},
+               headers=_as_user(50))
+    r = client.put('/api/social/encounter/persona',
+                   json={'interests_discoverable': raw}, headers=_as_user(50))
+    assert r.status_code == 200
+    data = client.get('/api/social/encounter/persona',
+                      headers=_as_user(50)).get_json()['data']
+    assert data['interests_discoverable'] is stored
+
+
+_NOT_A_FLAG = ['False', 'TRUE', ' true', 'yes', '1', '0', '', 1, 0, None,
+               [], {}, 'on']
+
+
+@pytest.mark.parametrize('raw', _NOT_A_FLAG)
+def test_persona_consent_flag_rejects_anything_else(client, raw):
+    client.put('/api/social/encounter/persona',
+               json={'bio': 'before', 'interests_discoverable': False},
+               headers=_as_user(51))
+    r = client.put('/api/social/encounter/persona',
+                   json={'bio': 'after', 'interests_discoverable': raw},
+                   headers=_as_user(51))
+    assert r.status_code == 400
+    assert 'interests_discoverable' in r.get_json()['error']
+    # A refused body writes nothing, not even its valid fields.
+    data = client.get('/api/social/encounter/persona',
+                      headers=_as_user(51)).get_json()['data']
+    assert data['interests_discoverable'] is False
+    assert data['bio'] == 'before'
+
+
+@pytest.mark.parametrize('key', ['enabled', 'age_claim_18', 'face_visible'])
+@pytest.mark.parametrize('raw', _NOT_A_FLAG)
+def test_discoverable_flags_reject_anything_else(client, key, raw):
+    body = {'enabled': False, 'age_claim_18': True, key: raw}
+    r = client.post('/api/social/encounter/discoverable', json=body,
+                    headers=_as_user(52))
+    assert r.status_code == 400
+    assert key in r.get_json()['error']
+    state = client.get('/api/social/encounter/discoverable',
+                       headers=_as_user(52)).get_json()['data']
+    assert state['toggle_count_24h'] == 0     # a refusal spends no toggle
+
+
+def test_discoverable_string_false_is_false(client):
+    """bool('false') is True: an age claim or face-visible sent as the
+    string 'false' must not be recorded as a yes."""
+    r = client.post('/api/social/encounter/discoverable',
+                    json={'enabled': 'true', 'age_claim_18': 'false'},
+                    headers=_as_user(53))
+    assert r.status_code == 403
+    r = client.post('/api/social/encounter/discoverable',
+                    json={'enabled': 'true', 'age_claim_18': 'true',
+                          'face_visible': 'false'},
+                    headers=_as_user(53))
+    assert r.status_code == 200
+    state = client.get('/api/social/encounter/discoverable',
+                       headers=_as_user(53)).get_json()['data']
+    assert state['enabled'] is True
+    assert state['face_visible'] is False
+
+
+def test_source_guard_recognize_me_limit_is_the_constant():
+    """DRY: the recognize_me column width in the local model and in the
+    v59 DDL is ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS, not a second 280
+    that can drift from the cap encounter_api applies.  (Behaviour cannot
+    tell them apart while the values are equal, so this reads the AST.)"""
+    import ast
+    import inspect as _inspect
+
+    from integrations.social import _models_local, migrations
+
+    limit = C.ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS
+    model_src = _inspect.getsource(_models_local.DiscoverablePref)
+    mig_src = _inspect.getsource(migrations)
+    mig_tree = ast.parse(mig_src)
+    persona_ddl = next(
+        n for n in ast.walk(mig_tree)
+        if isinstance(n, ast.Assign)
+        and any(getattr(t, 'id', None) == '_V59_PERSONA_COLUMNS'
+                for t in n.targets))
+    for label, node in (('model', ast.parse(model_src)),
+                        ('v59 DDL', persona_ddl)):
+        literals = [c.value for c in ast.walk(node)
+                    if isinstance(c, ast.Constant) and c.value == limit]
+        texts = [c.value for c in ast.walk(node)
+                 if isinstance(c, ast.Constant) and isinstance(c.value, str)
+                 and str(limit) in c.value]
+        assert not literals and not texts, \
+            f'{label} writes {limit} inline; use the constant'
+    assert 'ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS' in model_src
+    # And the values the two places produce really are the constant.
+    assert _models_local.DiscoverablePref.__table__.c.recognize_me.type.length \
+        == limit
+    assert dict(migrations._V59_PERSONA_COLUMNS)['recognize_me'] == \
+        f'VARCHAR({limit})'
+
+
 def test_v59_adds_persona_columns_to_an_existing_table():
     from sqlalchemy import create_engine, inspect, text
     from integrations.social.migrations import _v59_persona_card
@@ -447,6 +588,8 @@ def test_sighting_rejects_self(client):
 def test_sighting_returns_swipe_card(client):
     pk = 'feedface' * 4
     _make_discoverable(client, 20, tags=['indie_film'])
+    client.put('/api/social/encounter/persona',
+               json={'interests_discoverable': True}, headers=_as_user(20))
     _register_pubkey(client, 20, pk)
     resp = client.post(
         '/api/social/encounter/sighting',
