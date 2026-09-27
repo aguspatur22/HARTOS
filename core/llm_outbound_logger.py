@@ -862,6 +862,40 @@ def _task_turn(messages: list):
                  and m.get('name') == speaker), None)
 
 
+def _drop_units(messages: list) -> dict:
+    """``id(message) -> the messages the drop must remove along with it``.
+
+    An assistant message that carries ``tool_calls`` and the role='tool'
+    messages answering it are one unit: removing the call and keeping a
+    result leaves an answer to a call the model never sees.  Measured on the
+    live llama-server (b10330, Qwen3.5-4B template, 2026-09-26): such a body
+    is accepted with 200 and renders the result as a bare ``<tool_response>``
+    user turn, no ``<tool_call>`` before it.  A result pairs with the NEAREST
+    earlier message announcing its ``tool_call_id``, since a model may reuse
+    ids across turns.  Only the top-level ``tool_call_id`` is read: autogen's
+    ``tool_responses`` bundle is split into one message per call before the
+    wire (0 of 1,111 logged wire bodies carried it, 2026-09-26).  A message
+    outside any unit is absent from the map and drops alone.
+    """
+    units = {}
+    announcer = {}  # call id -> the nearest earlier message announcing it
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        if m.get('role') == 'assistant' and isinstance(m.get('tool_calls'), list):
+            for tc in m['tool_calls']:
+                if isinstance(tc, dict) and isinstance(tc.get('id'), str):
+                    announcer[tc['id']] = m
+        elif (m.get('role') == 'tool'
+              and isinstance(m.get('tool_call_id'), str)):
+            parent = announcer.get(m['tool_call_id'])
+            if parent is not None:
+                unit = units.setdefault(id(parent), [parent])
+                unit.append(m)
+                units[id(m)] = unit
+    return units
+
+
 def _trim_to_budget(body: dict) -> tuple:
     """Return ``(trimmed_body, n_dropped, n_truncated_chars, est_before,
     est_after, budget)``.
@@ -873,6 +907,9 @@ def _trim_to_budget(body: dict) -> tuple:
          until the remaining set fits.  Never dropped: the system message,
          the most-recent message, the newest role='user' message and the
          task turn (:func:`_task_turn`, the initiator's newest turn).
+         An assistant message carrying tool_calls drops together with the
+         results answering it (:func:`_drop_units`), and is kept with them
+         when one of them is never dropped.
       4. If still over, left-truncate the messages step 3 could not drop,
          one at a time, until the set fits: the most-recent message first
          when nothing protects it, then the protected ones, largest first.
@@ -1016,16 +1053,25 @@ def _trim_to_budget(body: dict) -> tuple:
     protected = [m for m in (anchor, task) if m is not None]
     start = 1 if has_system else 0
     n_dropped = 0
+    # A tool call and its results leave together or not at all (see
+    # _drop_units): review of 9ddc8b92d, probed, [system, User task,
+    # assistant tool_calls, StatusVerifier, tool] trimmed to [system, user,
+    # user, tool] -- the result kept, the call it answers dropped.
+    units = _drop_units(messages)
+    must_stay = protected + messages[-1:]
     while True:
         # Leftmost message that is not the system prompt, not protected and
-        # not the newest message -- the same "keep system + newest" floor.
-        drop_idx = next((i for i in range(start, len(messages) - 1)
-                         if not any(messages[i] is p for p in protected)),
-                        None)
-        if drop_idx is None:
+        # not the newest message -- the same "keep system + newest" floor --
+        # taken with the rest of its unit.  A unit holding a message that
+        # must stay (a call whose result is the newest message) stays whole.
+        drop = next((unit for unit in (units.get(id(messages[i]), [messages[i]])
+                                       for i in range(start, len(messages)))
+                     if not any(m is k for m in unit for k in must_stay)),
+                    None)
+        if drop is None:
             break
-        messages.pop(drop_idx)
-        n_dropped += 1
+        messages[:] = [m for m in messages if not any(m is d for d in drop)]
+        n_dropped += len(drop)
         if count_tokens_for_messages(messages, model) <= budget:
             break
 
@@ -1039,7 +1085,8 @@ def _trim_to_budget(body: dict) -> tuple:
 
     n_truncated_chars = 0
 
-    # The drop above never removes a protected message or the newest one, so
+    # The drop above never removes a protected message or the newest one (nor
+    # a tool call whose result is the newest; that call is not cut), so
     # when one of those is the oversized component, cutting its content is
     # the only way to fit.  The cut once reached only messages[-1], and in the
     # autogen.reuse conversations the anchor sits mid-list behind
@@ -1126,7 +1173,8 @@ def _trim_to_budget(body: dict) -> tuple:
 
     # ─── Post-trim acceptance test — the trim is best-effort, so CHECK it ───
     # Trimming can be structurally unable to reach the budget: every message
-    # it cuts keeps at least 64 tokens.  On 2026-08-29, when the trim could
+    # it cuts keeps at least 64 tokens, and a tool call kept because its
+    # result is the newest message is not cut at all.  On 2026-08-29, when the trim could
     # not yet cut the system message, that produced est 795 against a budget
     # of 351 — over by 2.3x — and the request was sent anyway because `we
     # truncated something` was treated as success.  llama-server then

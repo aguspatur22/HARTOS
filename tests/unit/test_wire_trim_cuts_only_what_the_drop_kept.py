@@ -13,6 +13,9 @@ raise.  The branch was removed; a candidate that ever does go missing now
 raises instead of being skipped in silence, and this test is what would see
 it.
 
+The same corpus pins that the trim leaves no tool result without the call
+it answers (see test_wire_trim_keeps_tool_calls_with_results.py).
+
 Behavioural: the real ``_trim_to_budget`` on seeded random bodies (system or
 not, named and unnamed user turns, assistant replies, tool calls and their
 results), with only the per-slot budget pinned.
@@ -57,6 +60,17 @@ def _random_body(rnd):
     return msgs
 
 
+def _unanswered_results(messages):
+    """tool_call_ids of role='tool' messages no earlier message announced."""
+    announced, orphans = set(), set()
+    for m in messages:
+        for tc in (m.get('tool_calls') or []):
+            announced.add(tc['id'])
+        if m['role'] == 'tool' and m['tool_call_id'] not in announced:
+            orphans.add(m['tool_call_id'])
+    return orphans
+
+
 def test_the_cut_pass_never_misses_a_message(monkeypatch):
     rnd = random.Random(20260926)
     trimmed = 0
@@ -74,5 +88,9 @@ def test_the_cut_pass_never_misses_a_message(monkeypatch):
         assert est_after == count_tokens_for_messages(kept, 'llama')
         assert kept[-1]['role'] == newest_role, 'the newest message was dropped'
         assert any(m['role'] == 'user' for m in kept), 'no user turn left'
+        # No tool result loses the call it answers to the trim (a result
+        # that had no call on the way in is not the trim's doing).
+        assert _unanswered_results(kept) <= _unanswered_results(msgs), (
+            [m.get('tool_call_id') or m['role'] for m in kept])
     # The corpus has to exercise the trim, not just the early return.
     assert trimmed > 100, trimmed
