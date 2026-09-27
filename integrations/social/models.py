@@ -236,17 +236,37 @@ def db_session(commit=True):
     return _session_cm()
 
 
-#: Where a session keeps the effects waiting for its commit (after_commit).
+#: Where a session keeps the effects waiting for its commit (after_commit):
+#: a list of (transaction the effect was queued in, effect).
 _AFTER_COMMIT_KEY = 'hevolve.after_commit'
 
 
+def _queued_in(db):
+    """The transaction an effect queued now belongs to: the innermost open
+    one (a savepoint when one is open), or None before the session has
+    begun, when the effect belongs to whatever outer transaction begins."""
+    return db.get_nested_transaction() or db.get_transaction()
+
+
 def _run_after_commit(session) -> None:
-    """after_commit: run what the committed transaction queued, in order.
-    One failing effect is logged and the rest still run; nothing raises out
-    of the caller's commit, which has already succeeded.  The queue is
-    emptied by _drop_uncommitted, which SQLAlchemy calls right after this
-    one when the outer transaction ends, so each effect runs once."""
-    for effect in list(session.info.get(_AFTER_COMMIT_KEY) or ()):
+    """after_commit: when the OUTERMOST transaction commits, run its queue in
+    order, including effects an effect queues while the queue runs.  One
+    failing effect is logged and the rest still run; nothing raises out of
+    the caller's commit, which has already succeeded.  Each effect is taken
+    off the queue before it runs, so it runs once.
+
+    SQLAlchemy 2.0 also fires after_commit when a SAVEPOINT is released
+    (SessionTransaction.commit: ``if self._parent is None or self.nested``),
+    while that savepoint is still the session's nested transaction.  A
+    release is not durable: the outer transaction can still roll back, and
+    until it ends its flushed rows hold SQLite's write lock.  So a release
+    runs nothing; what it queued stays queued for the outer commit (or is
+    dropped by a rollback around it, _drop_rolled_back)."""
+    if session.in_nested_transaction():
+        return
+    pending = session.info.get(_AFTER_COMMIT_KEY)
+    while pending:
+        _, effect = pending.pop(0)
         try:
             effect()
         except Exception:
@@ -255,13 +275,32 @@ def _run_after_commit(session) -> None:
                 "effect after commit failed", exc_info=True)
 
 
+def _drop_rolled_back(session, previous_transaction) -> None:
+    """after_soft_rollback: drop what was queued inside the transaction that
+    rolled back, or inside any savepoint within it, released or not: its
+    rows are gone.  A savepoint rolling back leaves the outer transaction
+    alive, so what was queued before the savepoint stays queued."""
+    pending = session.info.get(_AFTER_COMMIT_KEY)
+    if not pending:
+        return
+
+    def _inside(tx):
+        while tx is not None:
+            if tx is previous_transaction:
+                return True
+            tx = tx.parent
+        return False
+
+    pending[:] = [(tx, e) for tx, e in pending if not _inside(tx)]
+
+
 def _drop_uncommitted(session, transaction) -> None:
     """after_transaction_end: empty the queue when the OUTERMOST transaction
     ends.  After a commit its effects have just run (_run_after_commit);
-    after a rollback, or a close without a commit, the rows never reached
-    disk, so nothing may act on them, and a later commit of the same session
-    must not run them either.  A savepoint ending is not the outer
-    transaction ending, so what was queued stays queued."""
+    after a rollback, or a close without a commit (which fires no rollback
+    event), the rows never reached disk, so nothing may act on them, and a
+    later commit of the same session must not run them either.  A savepoint
+    ending is not the outer transaction ending."""
     if transaction.parent is not None:
         return
     pending = session.info.get(_AFTER_COMMIT_KEY)
@@ -270,8 +309,9 @@ def _drop_uncommitted(session, transaction) -> None:
 
 
 def after_commit(db, effect) -> None:
-    """Run ``effect()`` once ``db``'s transaction has committed; never if it
-    rolls back or the session closes without committing.
+    """Run ``effect()`` once ``db``'s outermost transaction has committed;
+    never if the work it follows rolls back or the session closes without
+    committing.
 
     For work that must follow a durable row and must not run inside its
     transaction: a live push, a broadcast, starting a feed.  Two reasons.
@@ -282,14 +322,20 @@ def after_commit(db, effect) -> None:
     locked').  Measured live 2026-09-25: a consent grant whose feed start
     never returned left the database unwritable for about 41 minutes.
 
-    Effects run in the order they were queued, each once.  The session's own
+    Effects run in the order they were queued, each once, and only when the
+    OUTERMOST transaction commits.  Savepoints (begin_nested): releasing one
+    runs nothing (SQLAlchemy fires after_commit for it too); an effect
+    queued inside one that rolls back, or inside one released within a
+    savepoint that rolls back, is dropped.  An effect may queue another
+    while the queue runs; it runs in the same pass.  The session's own
     commit is the one place that knows the row is durable, so a caller that
     commits (a request session, a db_session block) gets this unchanged.
 
-    Not on after_rollback: measured on SQLAlchemy 2.0.16, that also fires
-    when a savepoint rolls back, which leaves the outer transaction alive;
-    and a close without a commit fires only after_transaction_end.  So the
-    queue is dropped on after_transaction_end of the outermost transaction.
+    Measured on SQLAlchemy 2.0.16: after_rollback also fires when a
+    savepoint rolls back, and a close without a commit fires only
+    after_transaction_end.  So a rollback drops the rolled-back
+    transaction's share of the queue (after_soft_rollback, which names that
+    transaction), and the end of the outermost transaction drops the rest.
     A bare ``event.listen(db, 'after_commit', fn, once=True)`` gets this
     wrong: the listener outlives a rollback and fires on the session's next,
     unrelated commit.
@@ -298,8 +344,9 @@ def after_commit(db, effect) -> None:
     if pending is None:
         pending = db.info[_AFTER_COMMIT_KEY] = []
         event.listen(db, 'after_commit', _run_after_commit)
+        event.listen(db, 'after_soft_rollback', _drop_rolled_back)
         event.listen(db, 'after_transaction_end', _drop_uncommitted)
-    pending.append(effect)
+    pending.append((_queued_in(db), effect))
 
 
 def init_db():
