@@ -492,6 +492,84 @@ def test_discoverable_string_false_is_false(client):
     assert state['enabled'] is False
 
 
+def _write_routes():
+    from flask import Flask
+    from integrations.social import encounter_api
+    a = Flask('routes')
+    a.register_blueprint(encounter_api.encounter_bp)
+    return sorted((m, r.rule) for r in a.url_map.iter_rules()
+                  for m in r.methods - {'GET', 'HEAD', 'OPTIONS'})
+
+
+@pytest.mark.parametrize('method,path', _write_routes())
+@pytest.mark.parametrize('body', [['bio'], ['x'], 'bio', 7, True])
+def test_non_object_json_body_is_400_on_every_write_route(
+        client, method, path, body):
+    """A JSON body that is not an object (a list, a string, a number)
+    crashed every write handler with a 500 (body.get on a list); PUT
+    /persona crashed only when the list held a field name.  Every write
+    route answers 400 instead.  Routes come from the url_map, so a new
+    one is covered without editing this test."""
+    r = client.open(path, method=method, json=body, headers=_as_user(60))
+    assert r.status_code == 400, (method, path, r.status_code)
+    assert 'JSON object' in r.get_json()['error']
+
+
+def test_non_object_body_still_needs_auth(client):
+    r = client.put('/api/social/encounter/persona', json=['bio'])
+    assert r.status_code == 401
+
+
+@pytest.mark.parametrize('field', ['bio', 'recognize_me'])
+@pytest.mark.parametrize('raw', [None, 7, 1.5, True, ['a'], {'k': 'v'}])
+def test_persona_text_must_be_a_string(client, field, raw):
+    """Non-string text used to be stored as its str() form ("None",
+    "{'k': 'v'}").  Refuse it with 400 and write nothing."""
+    client.put('/api/social/encounter/persona',
+               json={'bio': 'kept', 'recognize_me': 'kept too'},
+               headers=_as_user(61))
+    r = client.put('/api/social/encounter/persona',
+                   json={field: raw, 'vibe_tags': ['new']},
+                   headers=_as_user(61))
+    assert r.status_code == 400
+    assert field in r.get_json()['error']
+    data = client.get('/api/social/encounter/persona',
+                      headers=_as_user(61)).get_json()['data']
+    assert data['bio'] == 'kept' and data['recognize_me'] == 'kept too'
+    assert data['vibe_tags'] == []
+
+
+def test_persona_text_empty_string_clears(client):
+    client.put('/api/social/encounter/persona', json={'bio': 'x'},
+               headers=_as_user(62))
+    r = client.put('/api/social/encounter/persona', json={'bio': ''},
+                   headers=_as_user(62))
+    assert r.status_code == 200
+    assert r.get_json()['data']['bio'] == ''
+
+
+@pytest.mark.parametrize('route', ['persona', 'discoverable'])
+@pytest.mark.parametrize('tags', [[None], ['ok', 7], [{'a': 1}], [['x']],
+                                  [True], None])
+def test_tags_must_be_a_list_of_strings(client, route, tags):
+    """Non-string tags were stored as "None" / "{'a': 1}".  Both writers
+    of vibe_tags refuse them (and null for the list) with 400."""
+    client.put('/api/social/encounter/persona',
+               json={'vibe_tags': ['chess']}, headers=_as_user(63))
+    if route == 'persona':
+        r = client.put('/api/social/encounter/persona',
+                       json={'vibe_tags': tags}, headers=_as_user(63))
+    else:
+        r = client.post('/api/social/encounter/discoverable',
+                        json={'enabled': False, 'vibe_tags': tags},
+                        headers=_as_user(63))
+    assert r.status_code == 400
+    assert 'vibe_tags' in r.get_json()['error']
+    data = client.get('/api/social/encounter/persona',
+                      headers=_as_user(63)).get_json()['data']
+    assert data['vibe_tags'] == ['chess']
+
+
 def test_source_guard_recognize_me_limit_is_the_constant():
     """DRY: the recognize_me column width in the local model and in the
     v59 DDL is ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS, not a second 280

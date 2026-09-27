@@ -105,8 +105,38 @@ encounter_bp = Blueprint('encounter', __name__, url_prefix='/api/social')
 from .api_common import _ok, _err  # single-sourced envelope helpers (#97)
 
 
+class _BodyNotAnObject(Exception):
+    """The request body is JSON but not an object (a list, a string, a
+    number).  Every handler reads fields with body.get, so it answers 400
+    here instead of crashing with a 500."""
+
+
 def _json() -> dict[str, Any]:
-    return request.get_json(force=True, silent=True) or {}
+    """The request's JSON object; {} for no body or a body that is not
+    JSON.  Raises _BodyNotAnObject (answered 400 by the blueprint) for
+    JSON that is not an object.  Handlers call it after @require_auth, so
+    an unauthenticated caller still gets 401 first."""
+    body = request.get_json(force=True, silent=True)
+    if body is None:
+        return {}
+    if not isinstance(body, dict):
+        raise _BodyNotAnObject()
+    return body
+
+
+@encounter_bp.errorhandler(_BodyNotAnObject)
+def _body_not_an_object(_exc):
+    return _err('request body must be a JSON object')
+
+
+def _text(body: dict, key: str, cap: int):
+    """A free-text field from the body, capped: (value, None), or
+    (None, error) when the value is not a string.  Never str() of
+    whatever arrived (that stored "None" and "{'k': 'v'}")."""
+    raw = body[key]
+    if not isinstance(raw, str):
+        return None, f'{key} must be a string'
+    return raw[:cap], None
 
 
 def _now_dt() -> datetime:
@@ -131,8 +161,9 @@ def _user_id() -> Optional[str]:
 
 def _clean_tags(raw) -> Optional[list[str]]:
     """The user's interest tags, capped the one way every writer caps them.
-    None when the value is not a list (the caller answers 400)."""
-    if not isinstance(raw, list):
+    None when the value is not a list of strings (the caller answers 400);
+    a non-string tag is refused, never stored as its str() form."""
+    if not isinstance(raw, list) or not all(isinstance(t, str) for t in raw):
         return None
     return [str(t)[:ENCOUNTER_PERSONA_TAG_MAX_CHARS]
             for t in raw[:ENCOUNTER_PERSONA_MAX_TAGS]]
@@ -352,7 +383,7 @@ def set_discoverable():
     # them to []).
     vibe_tags = None
     if 'vibe_tags' in body:
-        vibe_tags = _clean_tags(body.get('vibe_tags') or [])
+        vibe_tags = _clean_tags(body['vibe_tags'])
         if vibe_tags is None:
             return _err('vibe_tags must be a list of strings')
 
@@ -440,23 +471,29 @@ def set_persona():
     body = _json()
     tags = None
     if 'vibe_tags' in body:
-        tags = _clean_tags(body.get('vibe_tags') or [])
+        tags = _clean_tags(body['vibe_tags'])
         if tags is None:
             return _err('vibe_tags must be a list of strings')
     flags, bad = _flags(body, {'interests_discoverable': None})
     if bad:
         return _err(bad)
+    texts = {}
+    for key, cap in (('bio', ENCOUNTER_PERSONA_BIO_MAX_CHARS),
+                     ('recognize_me', ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS)):
+        if key in body:
+            texts[key], bad = _text(body, key, cap)
+            if bad:
+                return _err(bad)
 
     pref = g.db.query(DiscoverablePref).filter_by(user_id=uid).first()
     if pref is None:
         pref = DiscoverablePref(user_id=uid, toggle_window_start=_now_dt(),
                                 toggle_count_24h=0)
         g.db.add(pref)
-    if 'bio' in body:
-        pref.bio = str(body.get('bio') or '')[:ENCOUNTER_PERSONA_BIO_MAX_CHARS]
-    if 'recognize_me' in body:
-        pref.recognize_me = str(body.get('recognize_me') or '')[
-            :ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS]
+    if 'bio' in texts:
+        pref.bio = texts['bio']
+    if 'recognize_me' in texts:
+        pref.recognize_me = texts['recognize_me']
     if tags is not None:
         pref.vibe_tags = tags
     if flags['interests_discoverable'] is not None:

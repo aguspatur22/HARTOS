@@ -985,8 +985,8 @@ def _evict_elided() -> None:
                 try:
                     st = entry.stat()
                     items.append((st.st_mtime, st.st_size, entry.path))
-                except OSError:
-                    pass
+                except OSError as e:
+                    logger.debug("wire-trim: elided item unreadable: %s", e)
         items.sort()
         now = time.time()
         excess = max(0, len(items) - _ELIDED_MAX_ITEMS)
@@ -997,8 +997,8 @@ def _evict_elided() -> None:
                 try:
                     os.remove(path)
                     total -= size
-                except OSError:
-                    pass
+                except OSError as e:
+                    logger.debug("wire-trim: elided item not evicted: %s", e)
     except Exception as e:
         logger.debug("wire-trim: elided eviction skipped: %s", e)
     finally:
@@ -1305,8 +1305,9 @@ def _strip_pointers(msg: dict) -> dict:
                         obj['trimmed_arguments'] = sub(
                             obj['trimmed_arguments'])
                         tc = {**tc, 'function': {**fn, 'arguments': json.dumps(obj)}}
-                except ValueError:
-                    pass
+                except ValueError as e:
+                    # Arguments that are not JSON carry no pointer to strip.
+                    logger.debug("wire-trim: call arguments not JSON: %s", e)
             calls.append(tc)
         out['tool_calls'] = calls
     return out

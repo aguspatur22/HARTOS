@@ -1095,8 +1095,8 @@ def parse_tool_arguments(text):
     tool with id=inf while the guard showed the model the id it wrote."""
     try:
         return load_wire_json(text), False
-    except ValueError:
-        pass
+    except ValueError as e:
+        _fallback_logger.debug(f"tool arguments not strict JSON, repairing: {e}")
     value = load_wire_json(repair_json(_quote_overflowing_numbers(text)))
     if _invents_a_constant(value, text):
         raise ValueError('repair would send a value the model never wrote')
@@ -1337,8 +1337,8 @@ def wire_tool_arguments(args):
         obj, _ = parse_tool_arguments(args)
         if isinstance(obj, dict):
             return json.dumps(obj), True
-    except ValueError:
-        pass
+    except ValueError as e:
+        _fallback_logger.debug(f"TOOL-ARGS-GUARD: arguments refused: {e}")
     return refused_arguments_json(args), True
 
 
@@ -4237,31 +4237,98 @@ def safe_function_call(func, arguments):
 
 def _is_numeric_annotation(annotation):
     """True for int / float, also inside Optional / Union / Annotated."""
+    return any(t in (int, float) for t in _annotation_types(annotation))
+
+
+def _annotation_types(annotation):
+    """The plain types an annotation admits: Annotated unwrapped, Optional /
+    Union flattened (None dropped)."""
     import typing
-    if annotation in (int, float):
-        return True
     origin = typing.get_origin(annotation)
     if origin is typing.Annotated:
-        return _is_numeric_annotation(typing.get_args(annotation)[0])
+        return _annotation_types(typing.get_args(annotation)[0])
     if origin is typing.Union:
-        return any(_is_numeric_annotation(a)
-                   for a in typing.get_args(annotation) if a is not type(None))
-    return False
+        return [t for a in typing.get_args(annotation) if a is not type(None)
+                for t in _annotation_types(a)]
+    return [annotation]
+
+
+def _list_element_annotation(annotation):
+    """The element annotation of a List[X] / list[X] parameter, else None."""
+    import typing
+    for t in _annotation_types(annotation):
+        if typing.get_origin(t) is list and typing.get_args(t):
+            return typing.get_args(t)[0]
+    return None
+
+
+def _unholdable_token(value):
+    """True for a string the reader kept for a number no double can hold, or
+    for NaN / Infinity."""
+    if not isinstance(value, str):
+        return False
+    token = value.strip()
+    return token in _NON_FINITE_WORDS or bool(
+        _BARE_NUMBER.fullmatch(token) and not math.isfinite(float(token)))
+
+
+def _exact_int_token(value):
+    """The exact int for a whole-number token a double cannot hold (Python
+    ints are exact), else None."""
+    if isinstance(value, str) and re.fullmatch(r'-?\d+', value.strip()):
+        return int(value.strip())
+    return None
 
 
 def _numbers_out_of_range(params, bound):
     """Names of number-typed parameters bound to the token of a number no
-    double can hold, or to NaN / Infinity, which the reader keeps as text."""
+    double can hold, or to NaN / Infinity, which the reader keeps as text.
+
+    Review of dbfef4360: a parameter that also accepts text (Union[int, str],
+    Optional[str]) takes the token as the text it is; an int parameter takes
+    an exact whole number (see _exact_int_arguments); and a List[float]
+    element is checked like a single value."""
     out = []
     for p in params:
         value = bound.get(p.name)
-        if not isinstance(value, str) or not _is_numeric_annotation(p.annotation):
+        types = _annotation_types(p.annotation)
+        if str in types:
             continue
-        token = value.strip()
-        if token in _NON_FINITE_WORDS:
-            out.append(p.name)
-        elif _BARE_NUMBER.fullmatch(token) and not math.isfinite(float(token)):
-            out.append(p.name)
+        element = _list_element_annotation(p.annotation)
+        if isinstance(value, list) and element is not None:
+            if (_is_numeric_annotation(element)
+                    and any(_unholdable_token(v) for v in value)):
+                out.append(p.name)
+            continue
+        if not _is_numeric_annotation(p.annotation) or not _unholdable_token(value):
+            continue
+        if int in types and _exact_int_token(value) is not None:
+            continue
+        out.append(p.name)
+    return out
+
+
+def _exact_int_arguments(func, arguments):
+    """``arguments`` with each int-typed parameter's whole-number token (one
+    a double could not hold) turned into the exact int.  Anything else, and
+    arguments that are not a dict, as they are."""
+    import inspect
+    if not isinstance(arguments, dict):
+        return arguments
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return arguments
+    out = dict(arguments)
+    for name, value in arguments.items():
+        p = params.get(name)
+        if p is None or not _unholdable_token(value):
+            continue
+        types = _annotation_types(p.annotation)
+        if int in types and str not in types:
+            exact = _exact_int_token(value)
+            if exact is not None:
+                out[name] = exact
     return out
 
 
@@ -4492,7 +4559,9 @@ def bind_tool_call_arguments(func, func_name, input_string, format_json_str,
         if repaired:
             mark_call_refused(records, input_string)
         return None, error
-    return arguments, None
+    # An int parameter gets an exact whole number a double could not hold
+    # as the int it is, not the token text (review of dbfef4360).
+    return _exact_int_arguments(func, arguments), None
 
 
 def force_apply_autogen_json_fix():

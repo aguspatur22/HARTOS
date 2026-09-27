@@ -224,3 +224,83 @@ class NumbersATypedParameterCannotHold(ExecutorReadsWhatTheModelWrote):
         self.calls.clear()
         content = self.run_scale('{"x": 1.5, "k": 2}')
         self.assertEqual(self.calls, [(1.5, 2)], content)
+
+
+class ReviewOfDbfef4360(ExecutorReadsWhatTheModelWrote):
+    """Review of dbfef4360 (rv3a7/cases3.py, probe3.py)."""
+
+    def setUp(self):
+        super().setUp()
+        from typing import Annotated, List, Optional, Union
+
+        @log_tool_execution
+        def search(q: str, id: str = '') -> str:
+            self.calls.append((q, id))
+            return 'found ' + q
+
+        @log_tool_execution
+        def lookup(id: Union[int, str]) -> str:
+            self.calls.append((id,))
+            return 'looked'
+
+        @log_tool_execution
+        def bigint(n: int) -> str:
+            self.calls.append((n,))
+            return 'n'
+
+        @log_tool_execution
+        def many(xs: List[float]) -> str:
+            self.calls.append((xs,))
+            return 'many'
+
+        @log_tool_execution
+        def opt(x: Optional[Annotated[float, "a number"]] = None) -> str:
+            self.calls.append((x,))
+            return 'opt'
+
+        self.tools = {'search': search, 'lookup': lookup, 'bigint': bigint,
+                      'many': many, 'opt': opt}
+
+    def run_tool(self, name, arguments):
+        a = ConversableAgent('a', llm_config=False, human_input_mode='NEVER')
+        ex = ConversableAgent('ex', llm_config=False, human_input_mode='NEVER')
+        ex.register_function({name: ex._wrap_function(self.tools[name])})
+        a.send({'role': 'assistant', 'content': None,
+                'tool_calls': [{'id': 'c1', 'type': 'function',
+                                'function': {'name': name,
+                                             'arguments': arguments}}]},
+               ex, request_reply=False, silent=True)
+        _, reply = ex.generate_tool_calls_reply(sender=a)
+        return reply['tool_responses'][0]['content']
+
+    def test_infinity_inside_a_longer_string_is_not_written(self):
+        for text in ('{"q": "to Infinity, and beyond", "id": 1e999e}',
+                     '{"q": "say \'Infinity\' now", "id": 1e999e}',
+                     '{"q": Infinity war, "id": 1e999e}'):
+            with self.subTest(text=text):
+                self.calls.clear()
+                content = self.run_tool('search', text)
+                self.assertEqual(self.calls, [], content)
+                self.assertTrue(tool_reply_failed(content), content)
+
+    def test_a_parameter_that_accepts_text_gets_the_token(self):
+        self.calls.clear()
+        content = self.run_tool('lookup', '{"id": 620e51403072992921}')
+        self.assertEqual(self.calls, [('620e51403072992921',)], content)
+
+    def test_an_exact_big_integer_reaches_an_int_parameter_as_an_int(self):
+        big = '9' * 400
+        self.calls.clear()
+        content = self.run_tool('bigint', '{"n": %s}' % big)
+        self.assertEqual(self.calls, [(int(big),)], content)
+
+    def test_an_unholdable_number_inside_a_list_of_floats_is_refused(self):
+        self.calls.clear()
+        content = self.run_tool('many', '{"xs": [1.5, 1e999]}')
+        self.assertEqual(self.calls, [], content)
+        self.assertTrue(tool_reply_failed(content), content)
+
+    def test_optional_annotated_float_still_refuses(self):
+        self.calls.clear()
+        content = self.run_tool('opt', '{"x": 1e999}')
+        self.assertEqual(self.calls, [], content)
