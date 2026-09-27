@@ -121,6 +121,13 @@ WIRE_TRIM_SAFETY_MARGIN_TOKENS: int = 2816       # 256 base + ~2560 template-ren
 # Put where the wire trim elided the MIDDLE of a message (head and tail kept:
 # core.llm_outbound_logger._truncate_msg_content).
 WIRE_TRIM_MARKER: str = '\n...[truncated middle]...\n'
+# Where a REUSE dispatch turn's head (the action marker and the user's words)
+# ends and its recipe steps begin.  Written by
+# reuse_recipe._build_reuse_action_message; read by the wire trim, which
+# keeps everything before it whole and elides only inside the steps (live
+# 2026-09-27, liveprobe_reuse_1: a fixed half/half cut lost the middle of
+# the user's words).
+ACTION_STEPS_SEPARATOR: str = '\n follow these steps: '
 # Seed injected at the wire when an outbound body carries no role='user'
 # turn.  llama-server's Qwen3 chat template raises a hard 500 "No user
 # query found in messages." whenever the messages array reaches it without

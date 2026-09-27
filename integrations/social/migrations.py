@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 57
+SCHEMA_VERSION = 58
 
 
 # Tables that hold tenant-scoped user content. v40 adds a nullable
@@ -164,6 +164,29 @@ def _rekey_legacy_consent_flag(engine) -> tuple:
         logger.info("consent re-key: %d goal(s) moved to require_consent",
                     renamed)
     return renamed, remaining
+
+
+def _v58_consent_reopened_at(engine) -> bool:
+    """Add user_consents.reopened_at if absent.  True when it exists
+    afterwards (inspector check, v57 style)."""
+    from sqlalchemy import inspect as sa_inspect
+
+    def _has():
+        insp = sa_inspect(engine)
+        if 'user_consents' not in insp.get_table_names():
+            return False
+        return 'reopened_at' in {c['name'] for c in insp.get_columns('user_consents')}
+
+    if not _has():
+        try:
+            with engine.connect() as conn:
+                conn.execute(text(
+                    "ALTER TABLE user_consents ADD COLUMN reopened_at DATETIME"))
+                conn.commit()
+        except Exception as e:
+            logger.warning("v58 migration: ADD COLUMN user_consents.reopened_at "
+                           "failed: %s", e)
+    return _has()
 
 
 def _v57_requester_user_id(engine) -> bool:
@@ -2121,6 +2144,19 @@ def run_migrations():
         else:
             logger.warning("v57 migration: metered_api_usage.requester_user_id "
                            "is still missing; retrying on the next boot")
+
+    if current < 58:
+        # v58 (2026-09-27): user_consents.reopened_at.  "Allow asking again"
+        # (ConsentService.reopen) used to erase revoked_at, losing when the
+        # owner said no.  The no's time stays; the reopen's time goes here,
+        # and a row is declined only while revoked_at is newer.  Nullable,
+        # NULL on every existing row, so every existing no still stands.
+        logger.info("HevolveSocial: migrating to v58 (user_consents.reopened_at)")
+        if _v58_consent_reopened_at(engine):
+            set_schema_version(engine, 58)
+        else:
+            logger.warning("v58 migration: user_consents.reopened_at is still "
+                           "missing; retrying on the next boot")
 
     # v56's DATA repair, deliberately OUTSIDE the version gate above.
     #

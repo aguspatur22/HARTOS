@@ -117,6 +117,10 @@ def _row_to_dict(row: UserConsent) -> dict[str, Any]:
         'granted': bool(row.granted),
         'granted_at': row.granted_at.isoformat() if row.granted_at else None,
         'revoked_at': row.revoked_at.isoformat() if row.revoked_at else None,
+        # A no taken back ("Allow asking again") keeps its revoked_at; the
+        # row is declined only while revoked_at is newer than this.
+        'reopened_at': (row.reopened_at.isoformat()
+                        if getattr(row, 'reopened_at', None) else None),
     }
     if row.consent_type == 'device_access':
         out['label'] = row.label
@@ -299,8 +303,7 @@ def decline_consent():
         return _err('consent_type required')
 
     try:
-        row = ConsentService.revoke_consent(
-            g.db, uid, consent_type, scope, agent_id)
+        row = ConsentService.decline(g.db, uid, consent_type, scope, agent_id)
     except ValueError as e:
         return _err(str(e))  # unknown consent_type -> 400
     if row is None:

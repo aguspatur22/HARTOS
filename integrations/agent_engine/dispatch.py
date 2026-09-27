@@ -923,9 +923,9 @@ def _notify_watchdog_llm_start():
                 wd.mark_in_llm_call(source)
                 return
         except Exception:
-            pass
+            logger.debug('watchdog task-source lookup failed', exc_info=True)
     except Exception:
-        pass
+        logger.debug('watchdog LLM-start marker failed', exc_info=True)
 
 
 def _notify_watchdog_llm_end():

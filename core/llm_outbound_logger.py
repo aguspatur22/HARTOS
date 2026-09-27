@@ -465,7 +465,7 @@ def _send_and_feed(orig_send, client, request, kwargs):
     return response
 
 
-# ─── Hard left-trim to fit n_ctx (zero-tolerance context overflow) ───
+# ─── Hard trim to fit n_ctx (zero-tolerance context overflow) ───
 # Architecture note (2026-05-23): autogen and langchain both build
 # their own OpenAI clients from config; we cannot route them through a
 # caller-side ``llm_client.llm_call`` because their internal call sites
@@ -796,10 +796,15 @@ def _truncate_msg_content(msg: dict, target_chars: int, marker: str,
     (6 of 77 calls); the reply was off-topic.  A tool result's head is where
     its status and failure text sit, and a system message's head is the
     persona, so every kind of message keeps both ends.  The head gets the
-    larger half.
+    larger half -- and never less than :func:`_must_keep_head`: a REUSE
+    dispatch turn keeps its marker and the user's words whole, and only the
+    steps after ``ACTION_STEPS_SEPARATOR`` are elided (review of 111c458b0,
+    probed: a fixed half/half split cut the words to 250 chars).
 
     Returns ``(new_msg, n_cut_chars)`` — ``(msg, 0)`` when it already fits.
-    Multimodal-aware: rebuilds list-shaped content preserving image parts.
+    Multimodal-aware: the text parts are replaced by ONE part holding the cut
+    text (they were joined to measure it; keeping the later ones as well
+    would send their text twice), image parts are kept.
     The ONE truncation implementation; ``_trim_to_budget`` calls it for both
     of its cuts: the pass over the messages the drop could not remove, and
     the system-message last resort.
@@ -808,17 +813,28 @@ def _truncate_msg_content(msg: dict, target_chars: int, marker: str,
     if len(text) <= target_chars:
         return msg, 0
     new_msg = dict(msg)
-    tail_chars = max(0, target_chars) // 2
-    head_chars = max(0, target_chars) - tail_chars
+    target_chars = max(0, target_chars)
+    tail_chars = target_chars // 2
+    head_chars = target_chars - tail_chars
+    keep = _must_keep_head(text)
+    if keep > head_chars:
+        # The words stay whole even past target_chars: a request over its
+        # budget is reported by the caller; a request without the user's
+        # words is off-topic (liveprobe_reuse_1).
+        head_chars = keep
+        tail_chars = max(0, target_chars - head_chars)
+    if head_chars + tail_chars >= len(text):
+        return msg, 0  # nothing left to elide without cutting the head
     new_text = (text[:head_chars] + marker
                 + (text[-tail_chars:] if tail_chars else ''))
     if isinstance(new_msg.get('content'), list):
         new_parts = []
         replaced = False
         for p in new_msg['content']:
-            if isinstance(p, dict) and p.get('type') == 'text' and not replaced:
-                new_parts.append({**p, 'text': new_text})
-                replaced = True
+            if isinstance(p, dict) and p.get('type') == 'text':
+                if not replaced:
+                    new_parts.append({**p, 'text': new_text})
+                    replaced = True
             else:
                 new_parts.append(p)
         if not replaced:
@@ -826,7 +842,28 @@ def _truncate_msg_content(msg: dict, target_chars: int, marker: str,
         new_msg['content'] = new_parts
     else:
         new_msg['content'] = new_text
-    return new_msg, len(text) - target_chars
+    return new_msg, len(text) - len(new_text) + len(marker)
+
+
+def _chars_for_tokens(text: str, tokens: int, model=None) -> int:
+    """How many characters of ``text`` hold about ``tokens`` tokens, at the
+    text's OWN chars/token -- dense JSON runs ~2.5, prose ~4, so one fixed
+    ratio either over- or under-cuts.  Falls back to 3.5 for empty text."""
+    from core.token_utils import count_tokens_for_text
+    n = count_tokens_for_text(text, model) if text else 0
+    ratio = (len(text) / n) if n else 3.5
+    # 10% under: a cut's two ends tokenize a little worse than the average
+    # (measured: 2-17 tokens over a 700-token room without it).
+    return int(max(0, tokens) * ratio * 0.9)
+
+
+def _must_keep_head(text: str) -> int:
+    """How many leading characters of ``text`` no cut may take: a REUSE
+    dispatch turn's marker and the user's words, up to and including
+    ``ACTION_STEPS_SEPARATOR``.  0 for any other message."""
+    from core.constants import ACTION_STEPS_SEPARATOR
+    at = text.find(ACTION_STEPS_SEPARATOR)
+    return at + len(ACTION_STEPS_SEPARATOR) if at >= 0 else 0
 
 
 def ensure_user_turn(messages: list) -> bool:
@@ -962,8 +999,9 @@ def _trim_to_budget(body: dict) -> tuple:
          one at a time, until the set fits: the most-recent message first
          when nothing protects it, then the protected ones, largest first.
          Each is cut only as far as the others at their current size
-         require, never below 64 tokens, and its content is prefixed with
-         ``WIRE_TRIM_MARKER`` so the LLM sees the truncation.
+         require, never below 64 tokens nor below a dispatch turn's marker
+         and words (:func:`_must_keep_head`), with ``WIRE_TRIM_MARKER`` where
+         its middle was so the LLM sees the truncation.
       5. If STILL over, cut the middle of the system message the same way.
       A cut keeps each message's head and tail (_truncate_msg_content).
       A body that is still over after step 5 is sent as is and logged as
@@ -1144,9 +1182,10 @@ def _trim_to_budget(body: dict) -> tuple:
     # message, so it was floored while the 15k-char task was what needed
     # cutting (review of 520c95e28, probed: anchor 2822 -> 247 chars, task
     # cut anyway, est 569 of budget 740).  Deduplicated by identity: the
-    # newest message is often the anchor itself.  Room uses the same
-    # chars/token ratio the fallback uses (3.5): conservative with tiktoken,
-    # and over-cutting only shrinks the payload.
+    # newest message is often the anchor itself.  Room converts to chars at
+    # the message's own measured chars/token (_chars_for_tokens): a fixed 3.5
+    # over-counted dense text (JSON steps run ~2.5), so the cut left the
+    # message over its room.
     #
     # UNPROTECTED BEFORE PROTECTED.  When the newest message is protected by
     # nothing (an assistant reply), it is cut before any protected message,
@@ -1174,8 +1213,14 @@ def _trim_to_budget(body: dict) -> tuple:
         overhead_tokens = (count_tokens_for_messages(others, model)
                            + _TOKENS_PER_MSG
                            + marker_tokens)
+        p_text = _content_to_text(p.get('content'))
+        # A dispatch turn keeps its marker and words whatever its room
+        # (_truncate_msg_content / _must_keep_head): sized against a
+        # full-size tool result it went to the 64-token floor and lost them
+        # (review of 111c458b0).  The candidates after it are sized against
+        # what it kept.
         room_for_p = max(64, budget - overhead_tokens)
-        target_chars = int(room_for_p * 3.5)
+        target_chars = _chars_for_tokens(p_text, room_for_p, model)
         new_p, n_cut = _truncate_msg_content(
             p, target_chars, WIRE_TRIM_MARKER, _content_to_text)
         if n_cut:
@@ -1197,7 +1242,9 @@ def _trim_to_budget(body: dict) -> tuple:
         overhead_tokens = (count_tokens_for_messages(others, model)
                            + _TOKENS_PER_MSG + marker_tokens)
         room_for_system = max(64, budget - overhead_tokens)
-        target_chars = int(room_for_system * 3.5)
+        target_chars = _chars_for_tokens(
+            _content_to_text(messages[0].get('content')), room_for_system,
+            model)
         new_sys, n_cut = _truncate_msg_content(
             messages[0], target_chars, WIRE_TRIM_MARKER, _content_to_text)
         if n_cut:
@@ -1274,7 +1321,7 @@ def _apply_trim_to_request(httpx_module, request, body: dict) -> tuple:
             pass
         if n_dropped or n_truncated:
             logger.warning(
-                "[TRIM] left-trimmed %d msg(s) + %d char(s) — est tokens "
+                "[TRIM] trimmed %d msg(s) + %d char(s) — est tokens "
                 "%d→%d, budget %d (n_ctx/%s slots, max_tokens=%s)",
                 n_dropped, n_truncated, est_before, est_after, budget,
                 os.environ.get('HEVOLVE_LLAMA_SLOTS', '1'),

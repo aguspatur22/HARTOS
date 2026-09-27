@@ -71,6 +71,15 @@ def _platform_default_data_dir() -> str:
 _pytest_data_dir = None
 
 
+def under_test() -> bool:
+    """Is this a test process?  The ONE test predicate: the data-root guard
+    below, the background-services default (config_cache.
+    should_start_background_services) and the real-hive guard
+    (superadmins.real_centrals_allowed) all read it.  "pytest is imported";
+    see the residual noted in _off_the_real_root_under_test."""
+    return 'pytest' in sys.modules
+
+
 def _off_the_real_root_under_test(data_dir: str) -> str:
     """`data_dir`, or a per-process temp dir when a test would use the owner's
     real data root.
@@ -101,7 +110,7 @@ def _off_the_real_root_under_test(data_dir: str) -> str:
     module is not covered.
     """
     global _pytest_data_dir
-    if 'pytest' not in sys.modules:
+    if not under_test():
         return data_dir
     real = os.path.normcase(os.path.abspath(_platform_default_data_dir()))
     if os.path.normcase(os.path.abspath(data_dir)) != real:
@@ -401,4 +410,30 @@ def cleanup_old_logs(max_age_days: int = 7, max_total_mb: int = 50):
             total_bytes -= sz
             deleted += 1
         except OSError:
-    
+            pass
+
+    if deleted:
+        import logging
+        logging.getLogger('hevolve.platform').info(
+            f"Log cleanup: deleted {deleted} old log files from {log_dir}")
+
+
+def ensure_data_dirs():
+    """Create all standard data directories if they don't exist.
+
+    Also runs log cleanup on startup to prevent unbounded log accumulation.
+    """
+    for d in [get_db_dir(), get_agent_data_dir(), get_prompts_dir(),
+              get_log_dir(), get_memory_graph_dir(), get_simplemem_dir()]:
+        os.makedirs(d, exist_ok=True)
+    # Clean old logs on every startup (safe — worst case is a no-op)
+    try:
+        cleanup_old_logs(max_age_days=7, max_total_mb=50)
+    except Exception:
+        pass
+
+
+def reset_cache():
+    """Reset the cached data dir (useful for testing)."""
+    global _cached_data_dir
+    _cached_data_dir = None

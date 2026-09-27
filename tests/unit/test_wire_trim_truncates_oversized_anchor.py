@@ -146,7 +146,7 @@ class WireTrimTruncatesOversizedAnchor(unittest.TestCase):
         self.assertIn(WIRE_TRIM_MARKER, a_text,
                         'truncated anchor must carry the wire-trim marker')
         self.assertIn('TASK TAIL.', a_text,
-                      'left-truncation must preserve the tail of the task')
+                      'the middle cut must preserve the tail of the task')
         self.assertGreater(n_chars, 0)
 
     def test_small_anchor_is_left_untouched(self):
@@ -174,8 +174,8 @@ class WireTrimTruncatesOversizedAnchor(unittest.TestCase):
         on its own.  Dropping and truncating other messages can never fix
         that, so every such turn was sent doomed and rejected.  As a LAST
         resort (everything else already trimmed), the system content gets
-        the same left-truncation: the boilerplate head is cut, the
-        actionable recipe tail survives."""
+        the same cut (of the middle, since 111c458b0): the persona head and
+        the actionable recipe tail survive."""
         messages = [
             {'role': 'system',
              'content': 'CULTURAL BOILERPLATE. ' + ('wisdom ' * 4000)
@@ -192,7 +192,7 @@ class WireTrimTruncatesOversizedAnchor(unittest.TestCase):
         sys_text = trimmed['messages'][0]['content']
         self.assertIn(WIRE_TRIM_MARKER, sys_text)
         self.assertIn('ACTIONABLE TAIL.', sys_text,
-                      'left-truncation must keep the system tail')
+                      'the middle cut must keep the system tail')
 
     def test_small_system_is_never_touched(self):
         """System stays intact whenever anything else can absorb the cut."""

@@ -318,23 +318,47 @@ def test_a_percent_encoded_value_is_masked():
             == 'url={{secret:URL_PASSWORD}}'
 
 
-def test_masking_does_not_read_the_consent_table(monkeypatch):
-    """Grants gate resolution only, so a tool call with no alias costs no
-    consent query."""
-    from integrations.social.consent_service import ConsentService
+def test_a_granted_value_never_resolved_is_masked(tool_log):
+    """P7: the card's value reaches tool output another way (an env dump,
+    a page echoing it back) without ever going through an alias."""
     from core.tool_logging import log_tool_execution
-
-    reads = []
-
-    def counting(*a, **k):
-        reads.append(a)
-        return []
-    monkeypatch.setattr(ConsentService, 'list_consents', staticmethod(counting))
+    _granted_site_password()
 
     @log_tool_execution
-    def noop(x: str) -> str:
-        return 'ok ' + x
+    def show_env(q: str) -> str:
+        return 'env dump: SITE_PASSWORD=' + os.environ['SITE_PASSWORD']
 
-    assert noop('hello') == 'ok hello'
-    assert _vault().mask_secrets('plain') == 'plain'
-    assert reads == []
+    out = show_env('x')
+    assert SECRET not in out and '{{secret:SITE_PASSWORD}}' in out
+    assert SECRET not in tool_log.getvalue()
+
+
+def test_a_re_entered_value_masks_both_old_and_new():
+    """P8: the owner re-enters the value on the card; the old one was
+    resolved, the new one not yet."""
+    _granted_site_password()
+    vault = _vault()
+    assert vault.resolve_aliases('{{secret:SITE_PASSWORD}}') == SECRET
+    new = 'NewValue-DUMMY-77-re-entered'
+    os.environ['SITE_PASSWORD'] = new
+    assert vault.mask_secrets(f'a {SECRET} b {new}')         == 'a {{secret:SITE_PASSWORD}} b {{secret:SITE_PASSWORD}}'
+
+
+def test_a_failed_grant_read_never_shrinks_the_mask(monkeypatch):
+    """A name seen granted stays masked when a later read fails, and when
+    the grant is revoked: masking never shrinks within the process."""
+    from integrations.social.consent_service import ConsentService
+    _granted_site_password()
+    vault = _vault()
+    assert vault.mask_secrets(SECRET) == '{{secret:SITE_PASSWORD}}'
+
+    def locked(*a, **k):
+        raise RuntimeError('database is locked')
+    monkeypatch.setattr(ConsentService, 'list_consents', staticmethod(locked))
+    assert vault.mask_secrets('x ' + SECRET) == 'x {{secret:SITE_PASSWORD}}'
+    monkeypatch.undo()
+
+    with db_session(commit=True) as db:
+        ConsentService.revoke_consent(db, OWNER, 'credential',
+                                      'secret:SITE_PASSWORD')
+    assert vault.mask_secrets('y ' + SECRET) == 'y {{secret:SITE_PASSWORD}}'

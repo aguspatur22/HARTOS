@@ -296,6 +296,15 @@ def _emit(topic: str, data: dict, msg_id: str = None):
                  bus, note_sent, msg_id)
 
 
+def _standing_revocation():
+    """SQL filter: a row whose no still stands -- revoked, and not reopened
+    since (ConsentService.reopen keeps revoked_at and records reopened_at)."""
+    from sqlalchemy import or_
+    return (UserConsent.revoked_at.isnot(None)
+            & or_(UserConsent.reopened_at.is_(None),
+                  UserConsent.reopened_at < UserConsent.revoked_at))
+
+
 def _validate_consent_type(consent_type: str):
     if consent_type not in CONSENT_TYPES:
         raise ValueError(
@@ -611,7 +620,7 @@ class ConsentService:
                 UserConsent.scope == scope,
                 UserConsent.agent_id == agent_id,
                 or_(UserConsent.granted == True,
-                    UserConsent.revoked_at.isnot(None)),
+                    _standing_revocation()),
             ).first()
             if decided is None or (reask and not ConsentService.declined(
                     db, user_id, consent_type, scope, agent_id)):
@@ -716,33 +725,61 @@ class ConsentService:
         return consent_type
 
     @staticmethod
+    def decline(db, user_id: str, consent_type: str, scope: str = '*',
+                agent_id=None):
+        """Say no to an ask (the consent card's "Don't allow"; consent_api
+        decline_consent).  revoke_consent on the ask's own combination, so a
+        no to one agent leaves other agents' asks open.
+
+        For a 'credential' ask the no also ends the saved value's grants
+        (agent None, which the card's Accept writes): the owner saying no on
+        the card that came back after a rejected login means "stop using
+        what I entered", for every agent, whichever agent asked.  Before,
+        an ask with no agent did that and agent 42's did not, so agent 42
+        was still told the rejected value "is stored".  Returns the ask's
+        row, or None when there is no ask."""
+        row = ConsentService.revoke_consent(db, user_id, consent_type,
+                                            scope, agent_id)
+        if (consent_type == 'credential' and agent_id is not None
+                and ConsentService.active_grant(db, user_id, consent_type,
+                                                scope) is not None):
+            ConsentService.revoke_consent(db, user_id, consent_type, scope)
+        return row
+
+    @staticmethod
     def reopen(db, user_id: str, consent_type: str, scope: str = '*'):
-        """Take back a "no": every revoked row for (user, type, scope), for
-        any agent, becomes undecided again, so declined() is False and the
-        next request_consent shows the card.  Returns how many rows.
+        """Take back a "no": every standing revocation for (user, type,
+        scope), for any agent, is marked reopened now, so declined() is
+        False and the next request_consent shows the card.  Returns how many
+        rows.
 
         The way back for an ask with no on/off card to grant from (a
         credential: the privacy page's "Allow asking again").  It is not a
-        yes: each row is left ungranted (granted=False), so check_consent,
-        active_grant and the owner-credential list do not count it.  The
-        grant history stays (granted_at is never touched) and the audit log
-        records the reopen.
+        yes and it rewrites no history: granted, granted_at and revoked_at
+        (when the no was given) stay as they were; reopened_at records the
+        reopen, and a later no (a newer revoked_at) stands again.  Every
+        surface hears consent.reopened, after the commit, as it hears
+        consent.granted and consent.revoked.
         """
         _validate_consent_type(consent_type)
         rows = db.query(UserConsent).filter(
             UserConsent.user_id == user_id,
             UserConsent.consent_type == consent_type,
             UserConsent.scope == scope,
-            UserConsent.revoked_at.isnot(None),
+            _standing_revocation(),
         ).all()
+        if not rows:
+            return 0
+        now = datetime.utcnow()
         for row in rows:
-            row.granted = False
-            row.revoked_at = None
-        if rows:
-            db.flush()
-            _audit('consent', actor_id=user_id,
-                   action=f'consent.reopened:{consent_type}',
-                   detail={'scope': scope, 'rows': len(rows)})
+            row.reopened_at = now
+        db.flush()
+        _audit('consent', actor_id=user_id,
+               action=f'consent.reopened:{consent_type}',
+               detail={'scope': scope, 'rows': len(rows)})
+        data = {'user_id': user_id, 'consent_type': consent_type,
+                'scope': scope, 'agent_id': None}
+        after_commit(db, lambda: _emit('consent.reopened', data))
         return len(rows)
 
     @staticmethod
@@ -765,7 +802,7 @@ class ConsentService:
             UserConsent.consent_type == consent_type,
             UserConsent.scope == scope,
             UserConsent.agent_id == agent_id,
-            UserConsent.revoked_at.isnot(None),
+            _standing_revocation(),
         ).first() is not None
 
     @staticmethod

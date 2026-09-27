@@ -3190,6 +3190,10 @@ class UserConsent(Base):
     # phone signed into its first ask.  Self-asserted, a hint beside the
     # key's fingerprint, never identity (v55, #111).
     label = Column(String(100), nullable=True)
+    # When the owner took a "no" back ("Allow asking again",
+    # ConsentService.reopen).  revoked_at keeps the time of the no; the row
+    # is declined only while its revocation is newer than this (v58).
+    reopened_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

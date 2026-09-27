@@ -6922,7 +6922,9 @@ def _build_reuse_action_message(user_prompt, action_id, user_words=None):
     head = f"{_REUSE_ACTION_MESSAGE_PREFIX}{action_id}:{action_message}"
     if user_words:
         head = f"{head}\n\n{user_words}"
-    return f"{head}\n follow these steps: {steps}"
+    # The separator the wire trim reads: everything before it stays whole.
+    from core.constants import ACTION_STEPS_SEPARATOR
+    return f"{head}{ACTION_STEPS_SEPARATOR}{steps}"
 
 
 # A registry tool name as `attach_for_names` compares it.  MOVED to

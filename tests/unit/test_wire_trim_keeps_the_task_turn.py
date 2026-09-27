@@ -171,7 +171,7 @@ def test_the_mirror_case_keeps_the_smaller_task_whole(monkeypatch):
 
 def test_an_oversized_task_turn_is_truncated_not_left_over_budget(monkeypatch):
     """Protecting the task must not make the trim unable to fit: a task that
-    alone exceeds the budget is left-truncated with the marker, as the
+    alone exceeds the budget is cut, with the marker, as the
     newest-user anchor already is."""
     sys_m, verdict = _sys(), _verdict()
     huge = _task('HEAD ' + 'word ' * 3000 + ' TAIL 83 cyclists')

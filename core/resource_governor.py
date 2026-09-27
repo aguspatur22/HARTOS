@@ -1105,8 +1105,9 @@ class ResourceGovernor:
              **no_window_kwargs())
             if result.returncode == 0:
                 return float(result.stdout.strip())
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug('xprintidle unavailable (%s); trying the input-alive '
+                         'marker', e)
         # Wayland: the compositor's input-alive marker (see the docstring).
         marker = os.environ.get('HART_INPUT_ALIVE_MARKER', '').strip()
         if not marker:

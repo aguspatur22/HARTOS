@@ -350,7 +350,7 @@ def test_re_asks_after_a_rejection_are_bounded(world):
     world.clear()
     out = request_credential(REJECTED, agent_id='42')
     assert [t for t, _ in world if t == 'consent.request'] == []
-    assert f'{MAX_CREDENTIAL_ENTRIES} times' in out
+    assert f'{MAX_CREDENTIAL_ENTRIES} values' in out
     assert 'tell the user' in out.lower()
     assert SECRET not in out
 
@@ -378,6 +378,185 @@ def test_the_bound_counts_this_credential_only(world):
             ConsentService.grant_consent(db, OWNER, 'credential', 'secret:OTHER_KEY')
     world.clear()
     assert 'Asked the owner' in request_credential(REJECTED, agent_id='42')
+
+
+def test_the_bound_counts_entered_values_not_asks(world):
+    """Asks are rows too (one pending row per asking agent).  Only values the
+    owner typed count: three agents asking plus one entry is one entry."""
+    from hartos.ai_key_vault import request_credential
+    for agent in ('1', '2', '3'):
+        request_credential(ASK, agent_id=agent)
+    _grant_times(1)
+    world.clear()
+    assert 'Asked the owner' in request_credential(REJECTED, agent_id='1')
+
+
+def test_the_stop_says_rolling_day_and_the_way_back(world):
+    """After the stop the user is told where to go instead of waiting a day:
+    Privacy settings, "Allow asking again"."""
+    from hartos.ai_key_vault import MAX_CREDENTIAL_ENTRIES, request_credential
+    request_credential(ASK, agent_id='42')
+    _grant_times(MAX_CREDENTIAL_ENTRIES)
+    out = request_credential(REJECTED, agent_id='42')
+    assert 'last 24 hours' in out
+    assert 'today' not in out
+    assert 'Allow asking again' in out and 'Privacy settings' in out
+
+
+def test_allow_asking_again_ends_the_stop(world, card):
+    """The way back after the stop is the same button as after a no: reopen,
+    and the next rejected login asks the owner on the card again."""
+    from hartos.ai_key_vault import MAX_CREDENTIAL_ENTRIES, request_credential
+    request_credential(ASK, agent_id='42')
+    _grant_times(MAX_CREDENTIAL_ENTRIES)
+    assert 'Asked the owner' not in request_credential(REJECTED, agent_id='42')
+    assert card('/reopen', {'consent_type': 'credential',
+                            'scope': 'secret:SITE_PASSWORD'}).status_code == 200
+    world.clear()
+    assert 'Asked the owner' in request_credential(REJECTED, agent_id='42')
+    assert len([t for t, _ in world if t == 'consent.request']) == 1
+
+
+def test_the_stop_is_not_dodged_by_asking_without_rejected(world):
+    from hartos.ai_key_vault import MAX_CREDENTIAL_ENTRIES, request_credential
+    request_credential(ASK, agent_id='42')
+    _grant_times(MAX_CREDENTIAL_ENTRIES)
+    request_credential(REJECTED, agent_id='42')
+    world.clear()
+    request_credential(ASK, agent_id='42')
+    assert [t for t, _ in world if t == 'consent.request'] == []
+
+
+# ── A name the process already holds is not a credential ───────────
+
+@pytest.mark.parametrize('name', ['PATH', 'HTTPS_PROXY', 'NUNBA_CI'])
+def test_a_setting_of_this_computer_is_never_asked_for(world, monkeypatch, name):
+    """Review of Nunba 670aed3f: asking for PATH put a card up, the grant made
+    PATH an owner credential, and {{secret:PATH}} resolved to the system
+    value.  A name the process holds that the owner never entered is refused
+    before any card."""
+    from hartos.ai_key_vault import request_credential
+    monkeypatch.setenv(name, 'system-value')
+    out = request_credential('{"key_name": "%s", "label": "x"}' % name, agent_id='42')
+    assert 'not asked for' in out
+    assert 'system-value' not in out
+    assert [t for t, _ in world if t == 'consent.request'] == []
+    assert [a for a in _asks() if a[1] == 'secret:' + name] == []
+
+
+def test_a_credential_the_owner_entered_before_is_still_asked_again(world, monkeypatch):
+    """The card's first entry puts SITE_PASSWORD in the environment (Nunba
+    export_to_env); a rejected login must still reach the card."""
+    from hartos.ai_key_vault import request_credential
+    request_credential(ASK, agent_id='42')
+    _grant_times(1)
+    monkeypatch.setenv('SITE_PASSWORD', 'what-the-owner-typed')
+    world.clear()
+    assert 'Asked the owner' in request_credential(REJECTED, agent_id='42')
+
+
+def test_store_credential_never_replaces_a_setting(world, monkeypatch):
+    """/api/credentials/submit (store_credential) set os.environ for any
+    name.  It now refuses a name the process holds that it did not store."""
+    from hartos.ai_key_vault import get_ai_key_vault
+    monkeypatch.setenv('PATH_TEST_SETTING', 'system-value')
+    with pytest.raises(ValueError):
+        get_ai_key_vault().store_credential('PATH_TEST_SETTING', 'typed')
+    assert os.environ['PATH_TEST_SETTING'] == 'system-value'
+    assert 'PATH_TEST_SETTING' not in get_ai_key_vault().owner_credential_names()
+
+
+def test_store_credential_replaces_its_own_value(world):
+    from hartos.ai_key_vault import get_ai_key_vault
+    vault = get_ai_key_vault()
+    vault.store_credential('site_password', 'wrong')
+    vault.store_credential('site_password', 'right')
+    assert os.environ['SITE_PASSWORD'] == 'right'
+
+
+# ── A no on a re-ask card wins for every agent ─────────────────────
+
+@pytest.mark.parametrize('agent', ['42', None])
+def test_a_no_on_a_re_ask_card_ends_the_saved_value_for_every_agent(world, card, agent):
+    """Review finding 3: with no agent the no revoked the saved value; for
+    agent 42 the rejected value stayed saved and the agent was told it "is
+    stored".  The owner's no now wins the same way for both."""
+    from hartos.ai_key_vault import get_ai_key_vault, request_credential
+    request_credential(ASK, agent_id=agent)
+    get_ai_key_vault()._stored.discard('SITE_PASSWORD')
+    os.environ['SITE_PASSWORD'] = SECRET          # what the card's vault exports
+    card('', {'consent_type': 'credential', 'scope': 'secret:SITE_PASSWORD'})
+    assert 'is stored' in request_credential(ASK, agent_id=agent)
+    request_credential(REJECTED, agent_id=agent)
+
+    assert card('/decline', {'consent_type': 'credential',
+                             'scope': 'secret:SITE_PASSWORD',
+                             'agent_id': agent}).status_code == 200
+    world.clear()
+    out = request_credential(ASK, agent_id=agent)
+    assert 'said no' in out
+    assert get_ai_key_vault().resolve_aliases('{{secret:SITE_PASSWORD}}') \
+        == '{{secret:SITE_PASSWORD}}'
+    assert [t for t, _ in world if t == 'consent.request'] == []
+
+
+def test_a_no_for_one_agent_wins_over_a_value_entered_for_another(world, card):
+    """Review m1: agent 42 was told no, then the owner entered the value on
+    agent 7's card.  The no still stands for 42 (and the privacy page keeps
+    listing it); 7 gets the alias."""
+    from hartos.ai_key_vault import request_credential
+    request_credential(ASK, agent_id='42')
+    card('/decline', {'consent_type': 'credential',
+                      'scope': 'secret:SITE_PASSWORD', 'agent_id': '42'})
+    request_credential(ASK, agent_id='7')
+    os.environ['SITE_PASSWORD'] = SECRET
+    card('', {'consent_type': 'credential', 'scope': 'secret:SITE_PASSWORD'})
+
+    assert 'said no' in request_credential(ASK, agent_id='42')
+    assert 'is stored' in request_credential(ASK, agent_id='7')
+
+
+# ── Reopen keeps the history and tells the other pages ─────────────
+
+def test_reopen_keeps_when_the_no_was_given(world, card):
+    """Review m4: reopen used to erase revoked_at.  The no's time stays and
+    the reopen's time is recorded beside it, visible in the listing."""
+    from hartos.ai_key_vault import request_credential
+    request_credential(ASK, agent_id='42')
+    card('/decline', {'consent_type': 'credential',
+                      'scope': 'secret:SITE_PASSWORD', 'agent_id': '42'})
+    card('/reopen', {'consent_type': 'credential', 'scope': 'secret:SITE_PASSWORD'})
+    with db_session() as db:
+        row = db.query(UserConsent).filter_by(
+            user_id=OWNER, scope='secret:SITE_PASSWORD', agent_id='42').one()
+        assert row.revoked_at is not None
+        assert row.reopened_at is not None and row.reopened_at >= row.revoked_at
+
+
+def test_reopen_is_announced(world, card):
+    """Other open privacy pages refresh on the same consent event stream the
+    grant and revoke use."""
+    from hartos.ai_key_vault import request_credential
+    request_credential(ASK, agent_id='42')
+    card('/decline', {'consent_type': 'credential',
+                      'scope': 'secret:SITE_PASSWORD', 'agent_id': '42'})
+    world.clear()
+    card('/reopen', {'consent_type': 'credential', 'scope': 'secret:SITE_PASSWORD'})
+    reopened = [d for t, d in world if t == 'consent.reopened']
+    assert len(reopened) == 1
+    assert reopened[0]['scope'] == 'secret:SITE_PASSWORD'
+    assert reopened[0]['agent_id'] is None
+
+
+def test_a_no_after_a_reopen_is_a_no_again(world, card):
+    from hartos.ai_key_vault import request_credential
+    request_credential(ASK, agent_id='42')
+    body = {'consent_type': 'credential', 'scope': 'secret:SITE_PASSWORD', 'agent_id': '42'}
+    card('/decline', body)
+    card('/reopen', {'consent_type': 'credential', 'scope': 'secret:SITE_PASSWORD'})
+    request_credential(ASK, agent_id='42')
+    assert card('/decline', body).status_code == 200
+    assert 'said no' in request_credential(ASK, agent_id='42')
 
 
 def test_with_no_owner_nothing_is_filed(world, monkeypatch):

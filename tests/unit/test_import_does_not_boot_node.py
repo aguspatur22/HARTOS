@@ -159,7 +159,12 @@ class TestThePredicateItself:
     the production answer so this change cannot alter a real node."""
 
     def test_defaults_to_true_so_production_is_unchanged(self, monkeypatch):
+        """A real node (not a test process) still starts its daemons.  Under
+        pytest the default is off (task #98, test_tests_never_reach_the_real_
+        hive), so the production answer is read with under_test() False."""
+        from core import platform_paths
         from core.config_cache import should_start_background_services
+        monkeypatch.setattr(platform_paths, 'under_test', lambda: False)
         monkeypatch.delenv(FLAG, raising=False)
         assert should_start_background_services() is True
 
@@ -181,7 +186,9 @@ class TestThePredicateItself:
         This matters more here than for most flags — a typo must never be
         the reason a desktop stops gossiping.
         """
+        from core import platform_paths
         from core.config_cache import should_start_background_services
+        monkeypatch.setattr(platform_paths, 'under_test', lambda: False)
         monkeypatch.setenv(FLAG, 'maybe')
         assert should_start_background_services() is True
 

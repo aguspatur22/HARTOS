@@ -97,12 +97,16 @@ class AIKeyVault:
         # HEVOLVE_MASTER_KEY the value lives only in os.environ, so the
         # vault cache alone cannot say which env vars are user credentials.
         self._stored: set = set()
-        # Every value resolve_aliases handed a tool this process -> its name.
-        # Keyed by VALUE and never pruned: once a value has left the vault it
-        # is masked for the life of the process, whatever the grant, the
-        # consent table or the env says later (a revoke during the call, a
-        # locked database, an owner who re-enters a different value).
+        # Every credential value this process has known -> its name: each
+        # value resolve_aliases handed a tool and each value mask_secrets
+        # masked.  Keyed by VALUE and never pruned, so masking never shrinks:
+        # a revoke during the call, a locked database or an owner who
+        # re-enters a different value leaves the old value masked.  A revoked
+        # credential's value therefore stays in this process's memory until
+        # restart (it was already in os.environ, where the card put it).
         self._resolved: Dict[str, str] = {}
+        # Every name ever read as granted; never pruned, for the same reason.
+        self._granted_seen: set = set()
 
     @classmethod
     def get_instance(cls) -> 'AIKeyVault':
@@ -169,6 +173,16 @@ class AIKeyVault:
             if channel_type else key_name.upper()
 
         with self._lock:
+            # Replace the process value only when it is ours: unset, or the
+            # value this vault stored.  /api/credentials/submit takes any
+            # name, and PATH, HTTPS_PROXY or NUNBA_CI must not be replaced.
+            current = os.environ.get(resolved)
+            ours = (resolved in self._stored
+                    or current == self._secrets_manager()._cache.get(resolved))
+            if current and not ours:
+                raise ValueError(
+                    f"{resolved} is a setting of this computer, not a "
+                    f"credential; it was not stored")
             # Persist to encrypted vault
             try:
                 self._secrets_manager().set_secret(resolved, value)
@@ -247,23 +261,33 @@ class AIKeyVault:
         a tool URL.  A consent lookup that fails counts no grants.
         """
         names = set(self._stored)
-        owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
-        if not owner:
-            return names
         try:
-            from integrations.social.consent_service import (
-                CREDENTIAL_SCOPE_PREFIX, ConsentService)
-            from integrations.social.models import db_session
-            with db_session(commit=False) as db:
-                for row in ConsentService.list_consents(db, owner, 'credential'):
-                    scope = row.scope or ''
-                    if (row.granted and row.revoked_at is None
-                            and scope.startswith(CREDENTIAL_SCOPE_PREFIX)):
-                        names.add(scope[len(CREDENTIAL_SCOPE_PREFIX):])
+            names |= self._granted_names()
         except Exception:
             logger.warning("credential grants could not be read; only "
                            "credentials stored this session resolve",
                            exc_info=True)
+        return names
+
+    def _granted_names(self) -> set:
+        """The names the owner granted on the consent card, as the consent
+        table says now.  Raises when it cannot be read; each name read is
+        also added to _granted_seen, which mask_secrets keeps masking."""
+        owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+        if not owner:
+            return set()
+        from integrations.social.consent_service import (
+            CREDENTIAL_SCOPE_PREFIX, ConsentService)
+        from integrations.social.models import db_session
+        names = set()
+        with db_session(commit=False) as db:
+            for row in ConsentService.list_consents(db, owner, 'credential'):
+                scope = row.scope or ''
+                if (row.granted and row.revoked_at is None
+                        and scope.startswith(CREDENTIAL_SCOPE_PREFIX)):
+                    names.add(scope[len(CREDENTIAL_SCOPE_PREFIX):])
+        with self._lock:
+            self._granted_seen |= names
         return names
 
     def owner_credential(self, name: str, names=None) -> str:
@@ -313,19 +337,35 @@ class AIKeyVault:
     def mask_secrets(self, value):
         """Replace every credential value in ``value`` with its alias.
 
-        Covers every value resolve_aliases handed a tool this process
-        (remembered, so a grant revoked since or a consent table that cannot
-        be read changes nothing), what store_credential stored, and the
-        encrypted vault's own.  It never asks the consent table: grants gate
-        resolution, not masking.  Every spelling in _spellings is matched,
-        longest first so a credential that contains another is masked whole.
+        "Every credential value" is the union of:
+          - every value this process has known (_resolved): each value
+            resolve_aliases handed a tool and each value masked before;
+          - the current value of every name the owner granted, now or at any
+            earlier read (_granted_seen), so a card value that reaches tool
+            output without an alias (an env dump, a page echoing it) and a
+            re-entered value not yet resolved are masked too;
+          - what store_credential stored, and the encrypted vault's own.
+        The grant read is best-effort: when it fails, only names never seen
+        before are missed, and nothing masked before stops being masked.
+        Grants gate resolution; masking never shrinks.  Every spelling in
+        _spellings is matched, longest first so a credential that contains
+        another is masked whole.
         """
+        try:
+            self._granted_names()
+        except Exception:
+            logger.warning("credential grants could not be read; masking "
+                           "the credentials already known", exc_info=True)
         with self._lock:
-            known = dict(self._resolved)
-        for name in set(self._stored) | set(self._secrets_manager()._cache):
+            names = (set(self._granted_seen) | set(self._stored)
+                     | set(self._secrets_manager()._cache))
+        for name in names:
             real = self.get_tool_key(name)
             if real:
-                known.setdefault(real, name)
+                with self._lock:
+                    self._resolved.setdefault(real, name)
+        with self._lock:
+            known = dict(self._resolved)
         pairs = []
         for real, name in known.items():
             if len(real) >= MIN_MASKED_SECRET_LEN:
@@ -461,16 +501,26 @@ def _parse_resource_request(text) -> dict:
     return {'label': text[:100], 'description': text}
 
 
-def _recent_entries(consent_service, db, owner, scope) -> int:
+def _reopened(row) -> bool:
+    """A row the owner took back with "Allow asking again"
+    (ConsentService.reopen): reopened since its last revocation."""
+    reopened = getattr(row, 'reopened_at', None)
+    return (reopened is not None and row.revoked_at is not None
+            and reopened >= row.revoked_at)
+
+
+def _recent_entries(rows) -> int:
     """How many values the owner typed for this credential in the last
-    CREDENTIAL_ENTRY_WINDOW_S: the card's Accept writes one granted
-    'credential' row per value (consent_api.grant_consent, append-only), so
-    those rows are the count; no second counter is kept."""
+    CREDENTIAL_ENTRY_WINDOW_S (a rolling window): the card's Accept writes
+    one granted 'credential' row per value (consent_api.grant_consent,
+    append-only), so those rows are the count; no second counter is kept.
+    Asks (rows never granted) are not entries, and entries the owner took
+    back with "Allow asking again" (_reopened) no longer count."""
     from datetime import datetime, timedelta
     since = datetime.utcnow() - timedelta(seconds=CREDENTIAL_ENTRY_WINDOW_S)
-    return sum(1 for row in consent_service.list_consents(db, owner, 'credential')
-               if row.scope == scope and row.granted_at is not None
-               and row.granted_at >= since)
+    return sum(1 for row in rows
+               if row.granted_at is not None and row.granted_at >= since
+               and not _reopened(row))
 
 
 def request_credential(resource_description, agent_id=None) -> str:
@@ -500,21 +550,24 @@ def request_credential(resource_description, agent_id=None) -> str:
     # The site refused the stored value: never hand it back, ask again.
     rejected = req.get('rejected') is True
 
-    # Only an owner-entered credential is "stored": answering for any
-    # environment variable told the agent which ones exist.
-    if vault.owner_credential(name) and not rejected:
-        return f"'{label}' is stored on this computer. To use it, {use}"
+    stored_answer = f"'{label}' is stored on this computer. To use it, {use}"
 
-    # The pending list behind /api/credentials/pending.
-    vault.add_pending_request(
-        key_name=name, resource_type=req.get('resource_type') or 'api_key',
-        label=label, description=str(req.get('description') or ''),
-        used_by=used_by)
+    def _pending():
+        # The pending list behind /api/credentials/pending.
+        vault.add_pending_request(
+            key_name=name, resource_type=req.get('resource_type') or 'api_key',
+            label=label, description=str(req.get('description') or ''),
+            used_by=used_by)
 
     # Whose vault the value goes into: this computer's owner, as for every
     # other ask of this machine (vlm.safety, capability_setup).
     owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
     if not owner:
+        # Only an owner-entered credential is "stored": answering for any
+        # environment variable told the agent which ones exist.
+        if vault.owner_credential(name) and not rejected:
+            return stored_answer
+        _pending()
         logger.warning("credential %s not asked: HEVOLVE_OWNER_USER_ID is not set",
                        name)
         return (f"Could not ask for '{label}': nobody is signed in on this "
@@ -535,15 +588,42 @@ def request_credential(resource_description, agent_id=None) -> str:
         # Only reached with no usable value (missing, or rejected), so an
         # earlier Accept does not settle it: ask again unless the owner said
         # no.  request_consent keeps one row, so the card is still one card.
+        held = exhausted = False
+        entries = 0
         with db_session(commit=True) as db:
+            # The owner's no wins: an agent told no is not handed the value
+            # even when the owner entered it for another agent since.
             declined = ConsentService.declined(db, owner, 'credential',
                                                scope=scope, agent_id=agent)
-            # A rejection re-asks, but not for ever: every value the owner
-            # typed is a grant row, so the rows say how often they tried.
-            entries = (_recent_entries(ConsentService, db, owner, scope)
-                       if rejected and not declined else 0)
+            # Only an owner-entered credential is "stored": answering for
+            # any environment variable told the agent which ones exist.
+            stored = (not declined and not rejected
+                      and bool(vault.owner_credential(name)))
+            if declined or stored:
+                return (f"The owner of this computer said no to providing "
+                        f"'{label}'. They can choose \"Allow asking again\" "
+                        f"in Privacy settings." if declined else stored_answer)
+            rows = [r for r in ConsentService.list_consents(db, owner, 'credential')
+                    if r.scope == scope]
+            # A name this process already holds that the owner never entered
+            # (PATH, HTTPS_PROXY, NUNBA_CI...) is a setting, not a credential:
+            # a card for it would make the grant name it an owner credential
+            # and {{secret:NAME}} would resolve to the system value.
+            held = (bool(os.environ.get(name))
+                    and name not in vault._stored
+                    and not any(r.granted_at is not None for r in rows))
+            # Asking again is bounded: every value the owner typed is a
+            # grant row, so the rows say how often they tried.
+            entries = 0 if held else _recent_entries(rows)
             exhausted = entries >= MAX_CREDENTIAL_ENTRIES
-            if not declined and not exhausted:
+            if exhausted and ConsentService.active_grant(
+                    db, owner, 'credential', scope) is not None:
+                # The value the site refused MAX times stops resolving, and
+                # the credential shows on the privacy page, where "Allow
+                # asking again" (reopen) is the way back.
+                ConsentService.revoke_consent(db, owner, 'credential', scope)
+            if not (held or exhausted):
+                _pending()
                 ConsentService.request_consent(db, owner, 'credential',
                                                scope=scope, agent_id=agent,
                                                reason=reason, reask=True)
@@ -552,17 +632,22 @@ def request_credential(resource_description, agent_id=None) -> str:
         return (f"Could not ask for '{label}': the permission system is "
                 f"unavailable.")
 
-    if declined:
-        return (f"The owner of this computer said no to providing '{label}'. "
-                f"They can choose \"Allow asking again\" in Privacy settings.")
+    if held:
+        logger.warning("credential %s not asked: the process already holds it "
+                       "and the owner never entered it", name)
+        return (f"'{label}' was not asked for: {name} is a setting of this "
+                f"computer, not a credential the owner entered, so it cannot "
+                f"be used through {alias}. Use a different key_name.")
     if exhausted:
         logger.info("credential %s: rejected after %d entries, not asked again",
                     name, entries)
-        return (f"'{label}' was rejected every time: the owner has entered it "
-                f"{entries} times in the last day and {used_by} refused each "
-                f"one. It will not be asked for again today. Stop trying to "
-                f"sign in and tell the user that {label} keeps being "
-                f"rejected, so they can check it themselves.")
+        return (f"'{label}' was rejected every time: the owner entered "
+                f"{entries} values for it in the last 24 hours and {used_by} "
+                f"refused each one, so it is not asked for again until 24 "
+                f"hours after the first of them. Stop trying to sign in and "
+                f"tell the user that {label} keeps being rejected; when they "
+                f"want to try again sooner, they choose \"Allow asking "
+                f"again\" for it in Privacy settings.")
     return (f"Asked the owner of this computer for '{label}' on the consent "
             f"card. Once they enter it, {use}")
 

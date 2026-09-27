@@ -1568,11 +1568,16 @@ try:
         if not key_name or not value:
             return jsonify({'error': 'key_name and value are required'}), 400
         vault = _VaultCls.get_instance()
-        resolved = vault.store_credential(
-            key_name=key_name,
-            value=value,
-            channel_type=data.get('channel_type', ''),
-        )
+        try:
+            resolved = vault.store_credential(
+                key_name=key_name,
+                value=value,
+                channel_type=data.get('channel_type', ''),
+            )
+        except ValueError as e:
+            # A name the process holds that this vault did not store
+            # (PATH, HTTPS_PROXY...) is a setting, not a credential.
+            return jsonify({'error': str(e)}), 400
         return jsonify({'success': True, 'key_name': resolved})
 
     @app.route('/api/credentials/pending', methods=['GET'])
