@@ -442,7 +442,11 @@ def pooled_post(url: str, timeout=DEFAULT_TIMEOUT, **kwargs) -> requests.Respons
     if rid and isinstance(_body, dict) and not _body.get('user'):
         _body['user'] = rid                       # carry the rid on the wire
     session = _llama_session_for(kind)
-    from core.llama_scheduler import TurnCancelled
+    try:
+        from core.llama_scheduler import TurnCancelled
+    except ImportError:          # a stand-in scheduler: nothing is cancelled
+        class TurnCancelled(Exception):
+            pass
     try:
         from core.llama_scheduler import get_scheduler
         with get_scheduler().slot(rid, kind,
