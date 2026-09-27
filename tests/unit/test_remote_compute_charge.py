@@ -428,6 +428,19 @@ class TestComputeMeshExit:
         assert 'error' in out
         assert _rows(db_factory) == []
 
+    def test_the_peer_is_not_told_who_the_requester_is(self, db_factory):
+        """The requester's id is for this node's ledger; the peer is not
+        theirs (owner ruling 2026-09-26) and its /mesh/infer never reads it."""
+        _seed(db_factory, requester_spark=100)
+        with patch('core.http_pool.pooled_post',
+                   return_value=_resp(200, {'response': 'ok'})) as post:
+            self._mesh().offload_inference(
+                SERVING_NODE, 'llm', 'p', {'user_id': REQUESTER, 'timeout': 5})
+        sent = post.call_args.kwargs['json']
+        assert 'user_id' not in sent['options']
+        assert sent['options'] == {'timeout': 5}
+        assert len(_rows(db_factory)) == 1   # and it was still charged
+
     def test_error_body_charges_nothing(self, db_factory):
         _seed(db_factory, requester_spark=100)
         with patch('core.http_pool.pooled_post',
@@ -435,6 +448,68 @@ class TestComputeMeshExit:
             self._mesh().offload_inference(
                 SERVING_NODE, 'llm', 'p' * 4000, {'user_id': REQUESTER})
         assert _rows(db_factory) == []
+
+
+class TestMeshCallersNameTheRequester:
+    """A mesh offload is charged to options['user_id']; a caller that knows
+    the user must pass it, or the work runs on someone's node for free."""
+
+    def test_generate_video_ltx2_offload_names_the_user(self, monkeypatch):
+        from tests.unit.test_core_tools_uuid_user_id import _ctx, _tool, UUID_USER
+
+        def _down(*a, **k):
+            raise OSError('local LTX-2 / ComfyUI not running')
+        monkeypatch.setattr('core.agent_tools.pooled_get', _down)
+        monkeypatch.setattr(
+            'integrations.agent_engine.compute_config.get_compute_policy',
+            lambda *a, **k: {'compute_policy': 'any'})
+        mesh = MagicMock()
+        mesh.offload_to_best_peer.return_value = {
+            'response': 'http://peer/v.mp4', 'offloaded_to': SERVING_NODE}
+        monkeypatch.setattr(
+            'integrations.agent_engine.compute_mesh_service.get_compute_mesh',
+            lambda: mesh)
+        out = _tool(_ctx(UUID_USER), 'Generate_video')('a cat', 0, True, 'ltx2')
+        assert 'hive peer' in out
+        opts = mesh.offload_to_best_peer.call_args.kwargs['options']
+        assert opts['user_id'] == UUID_USER
+
+    def test_parse_visual_context_offload_names_the_user(self, tmp_path,
+                                                         monkeypatch):
+        """hart_intelligence_entry cannot be imported from source here, so the
+        real function is compiled out of the file and run with its module
+        globals stubbed (the pattern of test_liquid_ui_entry_emitters_reach_
+        service).  Local VLM tiers are down, so the turn reaches the mesh."""
+        import ast
+        import logging
+        import numpy as np
+        from pathlib import Path
+        from PIL import Image
+        entry = Path(__file__).resolve().parents[2] / 'hart_intelligence_entry.py'
+        tree = ast.parse(entry.read_text(encoding='utf-8'))
+        fn = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+              and n.name == 'parse_visual_context']
+        assert len(fn) == 1
+        mesh = MagicMock()
+        mesh.offload_to_best_peer.return_value = {'response': 'a desk'}
+        monkeypatch.setattr(
+            'integrations.agent_engine.compute_mesh_service.get_compute_mesh',
+            lambda: mesh)
+        tl = MagicMock()
+        tl.get_user_id.return_value = 'u-vision'
+        tl.get_request_id.return_value = 'r1'
+        down = MagicMock()
+        down.post.side_effect = OSError('no local VLM')
+        ns = {'thread_local_data': tl, 'app': MagicMock(), 'os': os,
+              'Image': Image, 'requests': down, 'logging': logging,
+              'GPT_API': 'http://127.0.0.1:1/v1/chat/completions',
+              'LLM_MODEL_NAME': 'm', 'LLM_AUTH_HEADERS': {},
+              'get_frame': lambda uid: np.zeros((4, 4, 3), dtype=np.uint8)}
+        exec(compile(ast.Module(body=fn, type_ignores=[]), str(entry), 'exec'), ns)
+        monkeypatch.chdir(tmp_path)
+        assert ns['parse_visual_context']('what is on my desk?') == 'a desk'
+        opts = mesh.offload_to_best_peer.call_args.kwargs['options']
+        assert opts['user_id'] == 'u-vision'
 
 
 # ─── settlement has a scheduled caller ───

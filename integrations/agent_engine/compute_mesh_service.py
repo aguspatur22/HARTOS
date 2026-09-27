@@ -234,10 +234,13 @@ class ComputeMeshService:
             age = int(time.monotonic() - peer.last_seen_mono)
             return {'error': f'Peer {peer_id} is stale (last seen {age}s ago)'}
 
+        # user_id names who this node charges (_charged); the peer is not the
+        # user's and its /mesh/infer never reads it, so it stays here.
         payload = {
             'model_type': model_type,
             'prompt': prompt,
-            'options': options or {},
+            'options': {k: v for k, v in (options or {}).items()
+                        if k != 'user_id'},
             'source_device': self._device_id,
         }
 

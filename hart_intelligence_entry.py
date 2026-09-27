@@ -7099,9 +7099,12 @@ def parse_visual_context(inp: str):
         try:
             from integrations.agent_engine.compute_mesh_service import get_compute_mesh
             mesh = get_compute_mesh()
+            # user_id: the person this peer's compute is charged to
+            # (ComputeMeshService._charged).
             result = mesh.offload_to_best_peer(
                 model_type='vision', prompt=prompt_text,
-                options={'image_path': image_path, 'timeout': 60},
+                options={'image_path': image_path, 'timeout': 60,
+                         'user_id': str(user_id or '')},
             )
             if result and 'error' not in result:
                 return result.get('response', str(result))

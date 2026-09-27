@@ -2282,10 +2282,13 @@ def build_core_tool_closures(ctx):
                 if policy.get('compute_policy') != 'local_only':
                     from integrations.agent_engine.compute_mesh_service import get_compute_mesh
                     mesh = get_compute_mesh()
+                    # user_id: the person this peer's compute is charged to
+                    # (ComputeMeshService._charged).
                     result = mesh.offload_to_best_peer(
                         model_type=ModelType.VIDEO_GEN,
                         prompt=text,
-                        options={'model': 'ltx2', 'timeout': 300},
+                        options={'model': 'ltx2', 'timeout': 300,
+                                 'user_id': str(user_id or '')},
                     )
                     if result and 'error' not in result:
                         video_url = result.get('response', result.get('video_url', ''))
