@@ -40,6 +40,11 @@ from integrations.social.thought_experiment_service import (  # noqa: E402
 
 TURN = 'Vote on the thought experiment about cache warmup'
 
+# autogen registers a tool schema only on an agent with an llm_config; no
+# model is ever called here.
+_NO_CALL_LLM = {'config_list': [{'model': 'none', 'api_key': 'none',
+                                 'base_url': 'http://127.0.0.1:9'}]}
+
 
 @pytest.fixture
 def db(tmp_path, monkeypatch):
@@ -129,7 +134,7 @@ def test_an_agent_votes_in_its_own_turn_end_to_end(db, registry, turn):
 
     ExperimentVoteTool.register()
     tools = _gated_tools(registry, TURN)
-    helper = autogen.ConversableAgent('helper', llm_config=False)
+    helper = autogen.ConversableAgent('helper', llm_config=_NO_CALL_LLM)
     executor = autogen.ConversableAgent('executor', llm_config=False,
                                         human_input_mode='NEVER')
     for name, fn in tools.items():
@@ -166,7 +171,7 @@ def test_in_a_turn_the_model_cannot_name_someone_else(db, registry, turn):
     person = _user(db)
     ExperimentVoteTool.register()
     fn = _gated_tools(registry, TURN)['cast_experiment_vote']
-    helper = autogen.ConversableAgent('helper', llm_config=False)
+    helper = autogen.ConversableAgent('helper', llm_config=_NO_CALL_LLM)
     executor = autogen.ConversableAgent('executor', llm_config=False,
                                         human_input_mode='NEVER')
     register_dual(helper, executor, fn, 'cast_experiment_vote', 'vote')

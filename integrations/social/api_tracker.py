@@ -854,6 +854,27 @@ def verify_pledge(escrow_id):
 # ── Hive View Endpoints (extend tracker, no separate blueprint) ──────
 
 
+def _agent_for_post(post_id, verb):
+    """``(goal, None)`` when the caller may act on this experiment's agent,
+    else ``(None, refusal response)``.
+
+    The agent is found by post, then judged by dashboard_service.may_steer
+    through goal_to_steer, the gate every goal route uses.  Review of
+    924b8e9dc: these routes checked only that a token existed, so user B
+    wrote into A's agent's memory, ran A's agent as A (/interview posts
+    /chat with the OWNER's user_id), and cloned A's goal into new goals owned
+    by A (/dual-context).  No agent and not-yours get the same 403.
+    """
+    from .dashboard_service import goal_to_steer, steering_caller
+    goal = _get_goal_for_post(g.db, post_id)
+    goal, refused = goal_to_steer(g.db, f'post:{post_id}', verb,
+                                  steering_caller(), g.user_id, goal=goal)
+    if refused:
+        return None, (jsonify({'success': False, 'data': refused}), 403)
+    return goal, None
+
+
+
 @tracker_bp.route('/experiments/<post_id>/inject', methods=['POST'])
 @require_auth
 def inject_variable(post_id):
@@ -865,9 +886,9 @@ def inject_variable(post_id):
     if not variable:
         return _err('variable is required', 400)
 
-    goal = _get_goal_for_post(g.db, post_id)
-    if not goal:
-        return _err('No active agent for this experiment', 404)
+    goal, refused = _agent_for_post(post_id, 'tracker_inject')
+    if refused:
+        return refused
 
     try:
         from integrations.channels.memory.memory_graph import MemoryGraph
@@ -913,9 +934,9 @@ def interview_agent(post_id):
     if not question:
         return _err('question is required', 400)
 
-    goal = _get_goal_for_post(g.db, post_id)
-    if not goal:
-        return _err('No agent for this experiment', 404)
+    goal, refused = _agent_for_post(post_id, 'interview')
+    if refused:
+        return refused
 
     try:
         from core.http_pool import pooled_post
@@ -970,9 +991,9 @@ def launch_dual_context():
     if not source_post_id or not contexts or len(contexts) < 2:
         return _err('post_id and at least 2 contexts required', 400)
 
-    source_goal = _get_goal_for_post(g.db, source_post_id)
-    if not source_goal:
-        return _err('No agent for this experiment', 404)
+    source_goal, refused = _agent_for_post(source_post_id, 'dual_context')
+    if refused:
+        return refused
 
     new_goals = []
     for ctx in contexts:

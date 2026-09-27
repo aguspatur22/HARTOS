@@ -108,6 +108,26 @@ class ThreadLocalData:
         for key, value in (snapshot or {}).items():
             setattr(self._local, key, value)
 
+    def carry(self, fn):
+        """``fn``, wrapped to run on another thread as THIS thread's request.
+
+        The one way to hand work to a worker: snapshot() now, adopt() on the
+        worker before ``fn`` runs.  The wrapper's ``.snapshot`` is the dict
+        the worker adopts (shared, per adopt()), so a caller can still mark
+        state it hands over, as the VLM loop does to close an abandoned
+        action's run.  Callers: integrations.vlm.local_loop (one computer-use
+        action), integrations.agentic_router (the plan's LLM calls, which ran
+        with no user, prompt or request id until 2026-09-27).
+        """
+        snap = self.snapshot()
+
+        def _carried(*args, **kwargs):
+            self.adopt(snap)
+            return fn(*args, **kwargs)
+
+        _carried.snapshot = snap
+        return _carried
+
     def detached(self):
         """Context manager: run a block with NO request state on this thread,
         then put this thread's state back exactly as it was.

@@ -330,15 +330,17 @@ def _execute_within_budget(execute_action, action_payload, tier, *,
             return 'busy', None
     from core.subprocess_safe import call_bounded
     from hartos.threadlocal import thread_local_data
-    context = thread_local_data.snapshot()
+    # The worker runs as this thread's request (hartos.threadlocal.carry);
+    # its snapshot is kept to close the run stamp if the action is abandoned.
+    run_action = thread_local_data.carry(execute_action)
+    context = run_action.snapshot
     state = {'started': False, 'done': False, 'abandoned': False}
 
     def _act():
         with _abandoned_lock:
             state['started'] = True
         try:
-            thread_local_data.adopt(context)
-            state['result'] = execute_action(
+            state['result'] = run_action(
                 action_payload, tier, safety=safety, verify=verify)
             return state['result']
         except Exception as e:

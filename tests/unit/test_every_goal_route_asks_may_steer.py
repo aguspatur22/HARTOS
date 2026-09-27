@@ -101,12 +101,17 @@ TRACKER_NOT_AGENT = {
 }
 
 
+_SESSIONS = []  # the module's sessionmaker, for _as (require_auth's g.db)
+
+
 @pytest.fixture(scope='module')
 def sf():
     eng = create_engine('sqlite://', connect_args={'check_same_thread': False},
                         poolclass=StaticPool)
     Base.metadata.create_all(eng)
-    return sessionmaker(bind=eng)
+    maker = sessionmaker(bind=eng)
+    _SESSIONS[:] = [maker]
+    return maker
 
 
 @pytest.fixture
@@ -181,8 +186,9 @@ def _goal_count(sf):
 def _as(uid, is_admin=False, role='flat', is_banned=False):
     user = SimpleNamespace(id=uid, is_admin=is_admin, role=role,
                            is_banned=is_banned)
+    # require_auth keeps the returned session as g.db, so it must be real.
     return patch('integrations.social.auth._get_user_from_token',
-                 return_value=(user, MagicMock()))
+                 side_effect=lambda token: (user, _SESSIONS[0]()))
 
 
 def _call(client, key, gid, pid, environ=None, headers=None):
@@ -245,7 +251,8 @@ def test_a_stranger_gets_the_unknown_id_answer(app, client, sf, key):
 @pytest.mark.parametrize('key', sorted(ROUTES), ids=lambda k: f'{k[0]} {k[1]}')
 def test_the_owner_is_admitted(app, client, sf, key):
     owner = _user(sf)
-    gid, pid, _ = _goal(sf, owner_id=owner, created_by='agent_daemon')
+    gid, pid, _ = _goal(sf, owner_id=owner, created_by='agent_daemon',
+                        status='paused' if key[1].endswith('/resume') else 'active')
     with _as(owner):
         r = _call(client, key, gid, pid, REMOTE, TOKEN)
     assert r.status_code in (200, 201), (key, r.status_code, r.get_json())
@@ -318,3 +325,15 @@ def test_a_banned_token_on_this_machine_is_not_that_user(client, sf):
                         json={'instruction': 'x'}, headers=TOKEN)
     assert r.status_code == 403
     assert len(gc.messages) == 1
+
+
+def test_a_signed_in_caller_on_this_machine_steers_a_machine_goal(client, sf):
+    """A token names the caller, and the loopback test still says the call
+    is this machine's: a goal no person owns (a seeded flywheel goal) is
+    steerable from here through /api/goals as through the dashboard."""
+    gid, pid, _ = _goal(sf, created_by='system_bootstrap')
+    with _as(_user(sf)):
+        r = client.patch(f'/api/goals/{gid}/status', json={'status': 'paused'},
+                         headers=TOKEN)
+    assert r.status_code == 200, r.get_json()
+    assert _status(sf, gid) == 'paused'

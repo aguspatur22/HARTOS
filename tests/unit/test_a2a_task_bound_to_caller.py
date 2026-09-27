@@ -274,3 +274,70 @@ def test_in_flight_turns_are_capped_for_the_whole_node(monkeypatch):
         assert threading.active_count() - threads_before <= 3
     finally:
         release.set()
+
+
+def test_send_then_cancel_cannot_exceed_the_cap(monkeypatch):
+    """Review of f97b6bed8, F1: a cancelled task stopped counting while its
+    thread kept running (40 send+cancel pairs: 0 busy replies, 24 live
+    threads against caps of 4 and 16).  A task counts until its EXECUTION
+    ends."""
+    monkeypatch.setattr(gai, '_OPEN_TASKS_PER_CALLER', 2)
+    monkeypatch.setattr(gai, '_OPEN_TASKS_MAX', 3)
+    release = threading.Event()
+    started = threading.Semaphore(0)
+
+    async def ignores_cancel(text, ctx):
+        started.release()
+        while not release.is_set():
+            await asyncio.sleep(0.02)
+        return {'role': 'model', 'parts': [{'text': 'x'}]}
+    h = A2AMessageHandler(ignores_cancel)
+    before = threading.active_count()
+    busy = 0
+    try:
+        for _ in range(10):
+            params = {'message': {'messageId': uuid.uuid4().hex,
+                                  'parts': [{'kind': 'text', 'text': 'x'}]},
+                      'configuration': {'blocking': False}}
+            out = _run(h.handle_message_send(params, caller='peer:a'))
+            if 'error' in out:
+                busy += 1
+                continue
+            # Cancel once the turn RUNS (a task cancelled before it starts
+            # never executes, and rightly stops counting at once).
+            assert started.acquire(timeout=5)
+            _run(h.handle_task_cancel({'taskId': out['id']}, caller='peer:a'))
+        assert busy >= 8, busy
+        assert threading.active_count() - before <= 2
+    finally:
+        release.set()
+    for _ in range(100):
+        if threading.active_count() <= before:
+            break
+        time.sleep(0.05)
+    params = {'message': {'messageId': uuid.uuid4().hex,
+                          'parts': [{'kind': 'text', 'text': 'x'}]},
+              'configuration': {'blocking': False}}
+    assert 'error' not in _run(h.handle_message_send(params, caller='peer:a'))
+
+
+def test_a_cancelled_running_task_is_not_pruned(monkeypatch):
+    """Its execution is still running: evicting it would forget a thread the
+    cap must still count."""
+    monkeypatch.setattr(gai, '_TASK_TTL_S', 0.0)
+    release = threading.Event()
+    started = threading.Event()
+
+    async def slow(text, ctx):
+        started.set()
+        while not release.is_set():
+            await asyncio.sleep(0.02)
+        return {'role': 'model', 'parts': [{'text': 'x'}]}
+    h = A2AMessageHandler(slow)
+    tid = _send_as(h, 'peer:a', blocking=False)
+    assert started.wait(5)
+    _run(h.handle_task_cancel({'taskId': tid}, caller='peer:a'))
+    time.sleep(0.1)
+    h._prune()
+    assert tid in h.tasks
+    release.set()

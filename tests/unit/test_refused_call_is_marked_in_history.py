@@ -141,13 +141,18 @@ class RefusedBrokenJsonIsMarked(_Chat):
 
     def test_arguments_nothing_could_parse_are_marked(self):
         # When even the fallback parse raises, the call is refused as not
-        # JSON; it is marked the same way.
+        # JSON; it is marked the same way.  The text must be one the one
+        # reader (parse_tool_arguments) refuses, or the fallback never runs:
+        # since 3a7abe540 '{"text": <<>>' repairs to {"text": ""} and is
+        # refused as an emptied value instead.  A repair that would invent
+        # Infinity is refused by the reader.
+        broken = '{"text": 1e999e}'
         with mock.patch('hartos.helper.retrieve_json',
                         side_effect=ValueError('unparseable')):
-            reply = self.call('send_message_to_user', '{"text": <<>>')
+            reply = self.call('send_message_to_user', broken)
         self.assertEqual(self.calls, [])
         self.assertIn('must be in JSON format', reply['content'])
-        self._assert_marked(self.next_request_arguments(), '{"text": <<>>')
+        self._assert_marked(self.next_request_arguments(), broken)
 
     def test_the_marked_call_is_never_run_again(self):
         self.call('send_message_to_user', UNQUOTED)
@@ -337,7 +342,7 @@ class ProductionTransformsKeepTheMark(unittest.TestCase):
     def test_group_chat_with_the_transform_on_the_executor_only(self):
         self._assert_every_seat_marked(self._group_chat(('executor',)))
 
-    def _pairwise(self, run_async):
+    def _pairwise(self, run_async, arguments=UNQUOTED, expect='not valid JSON'):
         assistant = ConversableAgent('assistant', llm_config=False,
                                      human_input_mode='NEVER')
         executor = ConversableAgent('executor', llm_config=False,
@@ -349,21 +354,119 @@ class ProductionTransformsKeepTheMark(unittest.TestCase):
             {'role': 'assistant', 'content': None,
              'tool_calls': [{'id': 'call_1', 'type': 'function',
                              'function': {'name': 'send_message_to_user',
-                                          'arguments': UNQUOTED}}]},
+                                          'arguments': arguments}}]},
             executor, request_reply=False, silent=True)
         if run_async:
             reply = asyncio.run(executor.a_generate_reply(sender=assistant))
         else:
             reply = executor.generate_reply(sender=assistant)
-        self.assertIn('not valid JSON', str(reply))
+        self.assertIn(expect, str(reply))
+        self.reply = str(reply)
         return {'assistant': assistant._oai_messages[executor],
                 'executor': executor._oai_messages[assistant]}
+
+    def test_split_call_reads_as_broken_json_not_a_naming_mistake(self):
+        # Before: the executor was handed the guard's split dict as strict
+        # JSON and answered "Unknown argument(s): Consulting, ...".
+        self._pairwise(run_async=False)
+        self.assertNotIn('Unknown argument', self.reply)
+
+    def test_emptied_required_value_does_not_run_through_the_hook(self):
+        # Before: the guard turned '{"text":' into {"text": ""}, strict JSON,
+        # and the tool ran with text ''.
+        for cut in ('{"text":', '{"text": }'):
+            views = self._pairwise(run_async=False, arguments=cut,
+                                   expect='left empty: text')
+            self.assertEqual(self.calls, [], cut)
+            sent = views['assistant'][-1]['tool_calls'][0]['function'][
+                'arguments']
+            self.assertEqual(json.loads(sent)[REFUSED_ARGUMENTS_KEY], cut)
+
+    def test_a_benign_repair_still_runs_through_the_hook(self):
+        # A trailing comma: the guard repairs it, the executor finds the
+        # record, repairs it the same way, binds it and runs it.  Nothing
+        # is marked.
+        views = self._pairwise(run_async=False, arguments='{"text": "hi",}',
+                               expect='sent')
+        self.assertEqual(self.calls, ['hi'])
+        self.assertEqual(views['assistant'][-1]['tool_calls'][0]['function'][
+            'arguments'], '{"text": "hi",}')
 
     def test_pairwise_reply_through_the_transform_hook(self):
         self._assert_every_seat_marked(self._pairwise(run_async=False))
 
     def test_pairwise_async_reply_through_the_transform_hook(self):
         self._assert_every_seat_marked(self._pairwise(run_async=True))
+
+    def _handed_a_guarded_copy(self, run_async):
+        """The executor is handed the guard's copy of a stored call, the way
+        any reply hook that copies the history hands it (the sync
+        TransformMessages hook today; an async one would do the same)."""
+        assistant = ConversableAgent('assistant', llm_config=False,
+                                     human_input_mode='NEVER')
+        executor = ConversableAgent('executor', llm_config=False,
+                                    human_input_mode='NEVER')
+        executor.register_function({'send_message_to_user':
+                                    executor._wrap_function(self.tool)})
+        assistant.send(
+            {'role': 'assistant', 'content': None,
+             'tool_calls': [{'id': 'call_1', 'type': 'function',
+                             'function': {'name': 'send_message_to_user',
+                                          'arguments': UNQUOTED}}]},
+            executor, request_reply=False, silent=True)
+        copy_ = ToolMessageHandler().validate_messages(
+            copy.deepcopy(executor._oai_messages[assistant]))
+        handed = copy_[-1]['tool_calls'][0]['function']
+        self.assertIn('Consulting', json.loads(handed['arguments']))
+        if run_async:
+            _, reply = asyncio.run(executor.a_execute_function(handed))
+        else:
+            _, reply = executor.execute_function(handed)
+        self.assertEqual(self.calls, [])
+        self.assertIn('not valid JSON', reply['content'])
+        self.assertNotIn('Unknown argument', reply['content'])
+        stored = assistant._oai_messages[executor][-1]['tool_calls'][0][
+            'function']['arguments']
+        self.assertEqual(json.loads(stored)[REFUSED_ARGUMENTS_KEY], UNQUOTED)
+
+    def test_sync_executor_reads_the_stored_record_not_the_copy(self):
+        self._handed_a_guarded_copy(run_async=False)
+
+    def test_async_executor_reads_the_stored_record_not_the_copy(self):
+        self._handed_a_guarded_copy(run_async=True)
+
+    def test_another_tools_call_with_the_same_text_is_not_marked(self):
+        # The executor answers `assistant`; `other` sent the same text to a
+        # tool this executor does not run.  That record is not this call.
+        assistant = ConversableAgent('assistant', llm_config=False,
+                                     human_input_mode='NEVER')
+        other = ConversableAgent('other', llm_config=False,
+                                 human_input_mode='NEVER')
+        executor = ConversableAgent('executor', llm_config=False,
+                                    human_input_mode='NEVER')
+        executor.register_function({'send_message_to_user':
+                                    executor._wrap_function(self.tool)})
+        _production_transforms([]).add_to_agent(executor)
+        assistant.send(
+            {'role': 'assistant', 'content': None,
+             'tool_calls': [{'id': 'call_1', 'type': 'function',
+                             'function': {'name': 'send_message_to_user',
+                                          'arguments': UNQUOTED}}]},
+            executor, request_reply=False, silent=True)
+        other.send(
+            {'role': 'assistant', 'content': None,
+             'tool_calls': [{'id': 'call_2', 'type': 'function',
+                             'function': {'name': 'post_to_feed',
+                                          'arguments': UNQUOTED}}]},
+            executor, request_reply=False, silent=True)
+        reply = executor.generate_reply(sender=assistant)
+        self.assertIn('not valid JSON', str(reply))
+        mine = assistant._oai_messages[executor][-1]['tool_calls'][0][
+            'function']['arguments']
+        self.assertEqual(json.loads(mine)[REFUSED_ARGUMENTS_KEY], UNQUOTED)
+        theirs = other._oai_messages[executor][-1]['tool_calls'][0][
+            'function']['arguments']
+        self.assertEqual(theirs, UNQUOTED)
 
     def test_the_next_request_carries_the_stand_in(self):
         # What the assistant's next LLM request is built from: its history
