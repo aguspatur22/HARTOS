@@ -1019,7 +1019,16 @@ def _wire_json_loads(text, on_refused):
         if isinstance(value, list):
             return [strings(v) for v in value]
         if isinstance(value, dict):
-            return {strings(k): strings(v) for k, v in value.items()}
+            out = {strings(k): strings(v) for k, v in value.items()}
+            if len(out) < len(value):
+                # Two keys became one: a lone surrogate replaced by U+FFFD
+                # met another key that now reads the same, and the dict kept
+                # only one of the two arguments.  Review of b0fa4989e, probed:
+                # {"\ud800":1,"\udc00":2} came back as one key, U+FFFD,
+                # holding 2.
+                raise ValueError("keys collide once lone surrogates are "
+                                 "replaced: " + repr(list(value)))
+            return out
         return value
 
     return strings(json.loads(text, parse_float=number(float),
@@ -1053,7 +1062,9 @@ def load_wire_json(text):
     """Parse ``text``, keeping each token a strict parser refuses as its own
     string: an unquoted id ``620e51403072992921`` comes back as
     ``"620e51403072992921"``, never ``inf``; a lone surrogate becomes U+FFFD.
-    Raises like ``json.loads``."""
+    Raises like ``json.loads``, and ValueError when that replacement would
+    turn two keys of one object into the same key (one argument would be
+    lost without a trace)."""
     return _wire_json_loads(text, _keep_refused_token)
 
 
@@ -1084,7 +1095,8 @@ def ensure_tool_call_arguments_json(messages):
     lone surrogate escape, all of which llama.cpp refuses with a 500); else
     parse it, or its ``repair_json`` repair, with ``load_wire_json``, which
     keeps each refused number as its own string and turns a lone surrogate
-    into U+FFFD, and keep the result only if it is a dict; else fall back to
+    into U+FFFD (refusing, rather than merging, two keys that replacement
+    would make one), and keep the result only if it is a dict; else fall back to
     ``"{}"`` — a well-formed empty-args call.  The executor then reports a
     missing argument and the model re-steers, which is strictly better than
     a 500 that aborts the entire turn.

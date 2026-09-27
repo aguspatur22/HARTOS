@@ -169,6 +169,31 @@ class LoneSurrogates(unittest.TestCase):
         out = _out_args(ensure_tool_call_arguments_json(_call({'v': '\ud800'})))
         self.assertEqual(_strict_loads(out), {'v': '\ufffd'})
 
+    def test_two_lone_surrogate_keys_are_not_merged_into_one(self):
+        # Review of b0fa4989e, probed: both keys became U+FFFD, so the dict
+        # held one of them, {"�": 2}, and the other argument was lost
+        # without a trace.  Two arguments that cannot be told apart are not
+        # a call that can be repaired: refused like unrecoverable arguments.
+        out = _out_args(ensure_tool_call_arguments_json(
+            _call('{"\\ud800": 1, "\\udc00": 2}')))
+        self.assertEqual(out, '{}')
+
+    def test_a_lone_surrogate_key_colliding_with_a_real_key_is_refused(self):
+        # U+FFFD is also a character a key may really hold.
+        out = _out_args(ensure_tool_call_arguments_json(
+            _call('{"\\ud800": 1, "\\ufffd": 2}')))
+        self.assertEqual(out, '{}')
+
+    def test_colliding_keys_in_a_dict_argument_are_refused(self):
+        out = _out_args(ensure_tool_call_arguments_json(
+            _call({'\ud800': 1, '\udc00': 2})))
+        self.assertEqual(out, '{}')
+
+    def test_colliding_keys_in_a_nested_object_are_refused(self):
+        out = _out_args(ensure_tool_call_arguments_json(
+            _call('{"a": {"x\\ud800": 1, "x\\udbff": 2}}')))
+        self.assertEqual(out, '{}')
+
     def test_escaped_surrogate_pair_is_left_byte_identical(self):
         text = '{"e": "\\ud83d\\ude00"}'  # a valid pair: one emoji
         out = _out_args(ensure_tool_call_arguments_json(_call(text)))
