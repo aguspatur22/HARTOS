@@ -59,9 +59,8 @@ def venv_root() -> str:
     Resolution order (highest priority first):
         1. ``NUNBA_VENV_ROOT_OVERRIDE`` env var (tests / custom deploys).
         2. ``core.platform_paths.get_data_dir() / "data" / "venvs"``
-           (the canonical answer in any normal install).
-        3. OS-aware fallback when ``core.platform_paths`` is unimportable
-           (pure-Nunba lint runs that have not yet activated HARTOS).
+           (the canonical answer; this module is in the same ``core``
+           package, so there is no install where it is missing).
     """
     override = os.environ.get("NUNBA_VENV_ROOT_OVERRIDE", "").strip()
     if override:
@@ -72,19 +71,8 @@ def venv_root() -> str:
     if _VENV_ROOT_CACHE is not None:
         return _VENV_ROOT_CACHE
 
-    try:
-        from core.platform_paths import get_data_dir  # type: ignore
-        base = os.path.join(str(get_data_dir()), "data", "venvs")
-    except Exception:
-        # platform_paths unimportable — replicate its decision tree.
-        home = os.path.expanduser("~")
-        if sys.platform == "win32":
-            base = os.path.join(home, "Documents", "Nunba", "data", "venvs")
-        elif sys.platform == "darwin":
-            base = os.path.join(home, "Library", "Application Support",
-                                "Nunba", "data", "venvs")
-        else:
-            base = os.path.join(home, ".config", "nunba", "data", "venvs")
+    from core.platform_paths import get_data_dir
+    base = os.path.join(str(get_data_dir()), "data", "venvs")
 
     os.makedirs(base, exist_ok=True)
     _VENV_ROOT_CACHE = base

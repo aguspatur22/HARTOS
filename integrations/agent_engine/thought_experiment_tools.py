@@ -53,32 +53,44 @@ def cast_experiment_vote(experiment_id: str, voter_id: str,
                           suggestion: str = '',
                           voter_type: str = 'agent',
                           confidence: float = 0.8) -> str:
-    """Cast a vote on a thought experiment (as agent or human).
+    """Cast an AGENT's vote on a thought experiment.
 
-    Never as the steward: this tool is called by agents and takes voter_id
-    as given, so it is no signed-in human.  A voter_id that is the steward
-    (voting_rules.is_steward) is refused and nothing is written; the steward
-    votes through the signed-in route (POST /api/social/experiments/<id>/
-    vote, voter_id from the JWT).  The literal 'steward' needs no refusal:
-    it is no one, so tally_votes gives it no steward weight."""
+    This is the agent entry (autogen, MCP); it is no signed-in person, so
+    it casts agent votes only.  ONE rule: ``voter_id`` must resolve to an
+    agent -- a users row with user_type 'agent', by its id or its prompt id
+    (User.agent_id) -- and the vote is recorded under that row's id as an
+    agent vote, whatever ``voter_type`` says (kept in the signature for
+    existing callers, and ignored).  tally_votes counts it as its owner's
+    identity: an agent is its owner, so two agents of one owner are one
+    identity, and no agent is ever the steward (voting_rules.is_steward).
+    Anything else -- a person's id, the literal 'steward', an unknown id --
+    is refused and nothing is written: that is how an agent used to cast
+    people's full-weight votes and fake the distinct-identity quorum.  A
+    person votes through the signed-in route (POST
+    /api/social/experiments/<id>/vote, voter_id from the JWT)."""
     try:
+        from sqlalchemy import or_
         from integrations.social.models import User, db_session
         from integrations.social.thought_experiment_service import ThoughtExperimentService
-        from integrations.social.voting_rules import is_steward
 
         with db_session() as db:
-            if is_steward(db.query(User).filter(
-                    User.id == str(voter_id)).first()):
+            name = str(voter_id)
+            agent = db.query(User).filter(
+                User.user_type == 'agent',
+                or_(User.id == name, User.agent_id == name)).first()
+            if agent is None:
                 return json.dumps({
                     'success': False,
-                    'reason': 'steward_votes_need_the_signed_in_steward',
+                    'reason': 'voter_is_not_an_agent',
+                    'detail': 'this tool casts an agent\'s own vote; a '
+                              'person votes through the signed-in route',
                 })
             result = ThoughtExperimentService.cast_vote(
-                db, experiment_id, voter_id,
+                db, experiment_id, agent.id,
                 vote_value=int(vote_value),
                 reasoning=reasoning,
                 suggestion=suggestion,
-                voter_type=voter_type,
+                voter_type='agent',
                 confidence=float(confidence))
             if result:
                 return json.dumps({'success': True, 'vote': result})

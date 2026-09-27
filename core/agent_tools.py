@@ -1058,7 +1058,17 @@ def build_core_tool_closures(ctx):
         # memory. A long value is read a page at a time, the way book pages
         # are, and the note names the offset of the next page.
         from core.constants import TOOL_OBSERVATION_MAX_CHARS as page_chars
-        value = _read_saved(key)
+        # A pointer the wire trim put where it elided text
+        # ([elided:<id> ...], core.llm_outbound_logger): the original, whole,
+        # from the store's `elided` namespace -- no per-item cap.
+        from core.llm_outbound_logger import ELIDED_KEY_PREFIX, read_elided
+        if str(key).strip().startswith(ELIDED_KEY_PREFIX):
+            value = read_elided(str(key).strip()[len(ELIDED_KEY_PREFIX):])
+            if value is None:
+                return (f'Nothing is stored for {key}: the elided text is kept '
+                        f'for a day, and this one is gone or never existed.')
+        else:
+            value = _read_saved(key)
         try:
             start = max(0, int(offset or 0))
         except (TypeError, ValueError):
@@ -1189,12 +1199,8 @@ def build_core_tool_closures(ctx):
         if ext not in ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp'):
             return ("'" + ext + "' is not an image type I can put on a "
                     "receipt - please send PNG or JPG.")
-        try:
-            from core.platform_paths import get_data_dir
-            dest_dir = os.path.join(get_data_dir(), 'receipt_assets', str(prompt_id))
-        except ImportError:
-            dest_dir = os.path.join(os.path.expanduser('~/Documents/Nunba/data'),
-                                    'receipt_assets', str(prompt_id))
+        from core.platform_paths import get_data_dir
+        dest_dir = os.path.join(get_data_dir(), 'receipt_assets', str(prompt_id))
         os.makedirs(dest_dir, exist_ok=True)
         dest = os.path.join(dest_dir, 'logo' + ext)
         try:
@@ -1538,9 +1544,17 @@ def build_core_tool_closures(ctx):
             return f'Message directed to {mention} agent, not sending to user'
         tool_logger.info('INSIDE send_message_to_user')
         tool_logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
-        thread = threading.Thread(target=send_message_to_user1, args=(user_id, text, '', prompt_id))
-        thread.start()
-        return f'Message sent successfully to user with request_id: {request_id_list[user_prompt]}-intermediate'
+        # The send runs HERE and its result is the tool's result.  This used
+        # to start the send on a thread and return "sent successfully" before
+        # it ran: Nunba gui_app.log 2026-09-26 00:02:10 the tool answered
+        # sent, 00:02:19 the send failed (WinError 10061), and the agent
+        # waited on a question the user never saw.  Both
+        # send_message_to_user1 copies return "Message sent successfully ..."
+        # or "Failed to send message ...".
+        result = send_message_to_user1(user_id, text, '', prompt_id)
+        if isinstance(result, str) and result:
+            return result
+        return 'Message handed to the sender; its delivery was not confirmed'
 
     tools.append((
         "send_message_to_user",

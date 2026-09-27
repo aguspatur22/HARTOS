@@ -175,7 +175,10 @@ def test_the_real_rule_says_the_bridge_uri_is_not_the_users():
     assert crossbar_topic_is_per_user('community.feed') is False
 
 
-def test_a_one_person_topic_is_withheld_when_the_rule_cannot_be_asked(wamp_bus):
+def test_nothing_bridges_when_the_rule_cannot_be_asked(wamp_bus):
+    """Every bridged event asks the egress rule (review of a4ea04651: the
+    bridge carried addressed topics raw); with no rule, nothing leaves on
+    the bridge -- the owner keeps SSE and in-process listeners."""
     bus, session, loop = wamp_bus
     import builtins
     real_import = builtins.__import__
@@ -191,5 +194,4 @@ def test_a_one_person_topic_is_withheld_when_the_rule_cannot_be_asked(wamp_bus):
                                      'component': {'type': 'card'}})
         bus.emit('theme.changed', {'theme': 'aurora'})
     _drain(loop)
-    assert [u for u, _ in session.published] == [
-        'com.hartos.event.theme.changed']
+    assert session.published == []

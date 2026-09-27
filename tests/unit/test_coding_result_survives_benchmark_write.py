@@ -16,7 +16,11 @@ These tests pin three things:
      that includes a tracker that cannot be BUILT (its data dir cannot be
      created), since the DB path is now resolved and created at build time;
   3. each record site's fields reach the row unchanged (success and
-     completion time order get_best_tool's routing).
+     completion time order get_best_tool's routing): the local site
+     (tool from the result, backend name as the fallback), the offload
+     site (a peer's success, and a peer diff outside the sent files
+     recorded as a failure) and the distribute site (one shard failing
+     is still a success; every shard failing is a failure).
 execute_coding_task's own logging is pinned in
 test_execute_coding_task_logs_its_failure.py.
 """
@@ -178,6 +182,38 @@ class TestExecuteLocalKeepsResult:
             ('bug_fix', 'claude_code', '', 'u2', 7.5, 0, 0)]
 
 
+    def test_row_tool_is_the_results_tool_not_the_backend_name(self, tmp_path):
+        from integrations.coding_agent.benchmark_tracker import BenchmarkTracker
+        tracker = BenchmarkTracker(db_path=str(tmp_path / 'b.db'))
+        backend = _backend()
+        backend.execute.return_value = {
+            'success': True, 'output': 'ok', 'tool': 'aider',
+            'execution_time_s': 4.0}
+        from integrations.coding_agent.orchestrator import CodingAgentOrchestrator
+        with patch('integrations.coding_agent.tool_router.CodingToolRouter.route',
+                   return_value=backend), \
+             patch('integrations.coding_agent.benchmark_tracker.get_benchmark_tracker',
+                   return_value=tracker):
+            CodingAgentOrchestrator()._execute_local('t', 'feature', '', 'u4', '', '')
+        assert _rows(tmp_path / 'b.db') == [
+            ('feature', 'aider', '', 'u4', 4.0, 1, 0)]
+
+    def test_row_tool_falls_back_to_the_backend_name(self, tmp_path):
+        from integrations.coding_agent.benchmark_tracker import BenchmarkTracker
+        tracker = BenchmarkTracker(db_path=str(tmp_path / 'b.db'))
+        backend = _backend()
+        backend.execute.return_value = {
+            'success': True, 'output': 'ok', 'execution_time_s': 4.0}
+        from integrations.coding_agent.orchestrator import CodingAgentOrchestrator
+        with patch('integrations.coding_agent.tool_router.CodingToolRouter.route',
+                   return_value=backend), \
+             patch('integrations.coding_agent.benchmark_tracker.get_benchmark_tracker',
+                   return_value=tracker):
+            CodingAgentOrchestrator()._execute_local('t', 'feature', '', 'u4', '', '')
+        assert _rows(tmp_path / 'b.db') == [
+            ('feature', 'claude_code', '', 'u4', 4.0, 1, 0)]
+
+
 class TestTrackerThatCannotBeBuilt:
     """The DB dir is created when the tracker is built, so building can fail."""
 
@@ -274,6 +310,36 @@ class TestOffloadKeepsPeerResult:
         assert _rows(tmp_path / 'b.db') == [
             ('refactor', 'aider', 'm3', 'u3', 3.0, 1, 1)]
 
+    def test_unauthorized_peer_diff_is_recorded_as_a_failure(self, tmp_path):
+        from integrations.coding_agent.benchmark_tracker import BenchmarkTracker
+        tracker = BenchmarkTracker(db_path=str(tmp_path / 'b.db'))
+        mesh, resp = _peer_mocks()
+        # The peer says it succeeded, but it edited a file it was never sent.
+        peer_result = {'success': True, 'output': 'peer did it',
+                       'tool': 'aider', 'execution_time_s': 3.0,
+                       'diffs': {'secrets.py': '+leak'}}
+        from integrations.coding_agent.orchestrator import CodingAgentOrchestrator
+        with patch('integrations.agent_engine.compute_mesh_service.get_compute_mesh',
+                   return_value=mesh), \
+             patch('security.channel_encryption.encrypt_json_for_peer',
+                   return_value={'env': 1}), \
+             patch('security.channel_encryption.decrypt_json_from_peer',
+                   return_value=dict(peer_result)), \
+             patch('core.http_pool.pooled_post', return_value=resp), \
+             patch('integrations.coding_agent.benchmark_tracker.get_benchmark_tracker',
+                   return_value=tracker), \
+             patch.object(CodingAgentOrchestrator, '_read_target_files',
+                          return_value={'a.py': 'x = 1'}), \
+             patch.object(CodingAgentOrchestrator, '_record_peer_trust'), \
+             patch.object(CodingAgentOrchestrator, '_execute_local') as local:
+            result = CodingAgentOrchestrator()._offload_to_hive(
+                't', 'refactor', '', 'u5', 'm5', str(tmp_path))
+        local.assert_not_called()
+        assert result['success'] is False
+        assert result['error'] == 'Unauthorized file modifications'
+        assert _rows(tmp_path / 'b.db') == [
+            ('refactor', 'aider', 'm5', 'u5', 3.0, 0, 1)]
+
 
 class TestDistributeKeepsMergedResult:
     def test_merged_result_returned_not_reoffloaded(self, tmp_path, caplog, restore_perms):
@@ -328,3 +394,97 @@ class TestDistributeKeepsMergedResult:
         assert result['diffs'] == {'a.py': '+y'}
         assert _benchmark_warnings(caplog, 'readonly'), \
             [(r.getMessage(), r.exc_info) for r in caplog.records]
+
+
+def _distribute_with_shards(tmp_path, tracker, failing_urls, user_id, model):
+    """Run _distribute_to_hive over two shards on two peers.
+
+    Each peer POST takes >= 50 ms so the recorded wall time is measurably
+    above zero; a POST to a URL in ``failing_urls`` raises, which is how a
+    shard fails on the real path (_dispatch_shard returns None).
+    """
+    import time as _time
+    shards = []
+    for name in ('a.py', 'b.py'):
+        shard = MagicMock()
+        shard.task_description = 'shard ' + name
+        shard.full_content = {name: 'x = 1'}
+        shard.interface_specs = []
+        shard.scope.value = 'full_file'
+        shard.target_files = [name]
+        shards.append(shard)
+    engine = MagicMock()
+    engine.decompose_task.return_value = shards
+    guard = MagicMock()
+    guard.check_egress.return_value = (True, '')
+    peers = [{'node_id': 'peer-%d' % i, 'x25519_public_hex': 'ab' * 32,
+              'url': 'http://peer%d' % i, 'trust_level': 'SAME_USER'}
+             for i in (1, 2)]
+    mesh = MagicMock()
+    mesh.get_available_peers.return_value = peers
+    ok = MagicMock()
+    ok.status_code = 200
+    ok.json.return_value = {'encrypted': {'blob': 1}}
+
+    def post(url, **_kw):
+        _time.sleep(0.05)
+        if any(url.startswith(u) for u in failing_urls):
+            raise ConnectionError('peer down')
+        return ok
+
+    from integrations.coding_agent.orchestrator import CodingAgentOrchestrator
+    with patch('integrations.agent_engine.shard_engine.ShardEngine',
+               return_value=engine), \
+         patch('security.edge_privacy.ScopeGuard', return_value=guard), \
+         patch('integrations.agent_engine.compute_mesh_service.get_compute_mesh',
+               return_value=mesh), \
+         patch('security.channel_encryption.encrypt_json_for_peer',
+               return_value={'env': 1}), \
+         patch('security.channel_encryption.decrypt_json_from_peer',
+               return_value={'success': True, 'output': 'shard done'}), \
+         patch('security.channel_encryption.get_x25519_public_hex',
+               return_value='cd' * 32), \
+         patch('core.http_pool.pooled_post', side_effect=post), \
+         patch('integrations.coding_agent.benchmark_tracker.get_benchmark_tracker',
+               return_value=tracker), \
+         patch.object(CodingAgentOrchestrator, '_record_peer_trust'), \
+         patch.object(CodingAgentOrchestrator, '_offload_to_hive') as offload, \
+         patch.object(CodingAgentOrchestrator, '_execute_local') as local:
+        result = CodingAgentOrchestrator()._distribute_to_hive(
+            't', 'feature', '', user_id, model, str(tmp_path), 'trusted_peer')
+    offload.assert_not_called()
+    local.assert_not_called()
+    return result
+
+
+class TestDistributedRow:
+    @staticmethod
+    def _row(db):
+        rows = _rows(db)
+        assert len(rows) == 1, rows
+        return rows[0]
+
+    def test_one_failed_shard_still_records_a_success(self, tmp_path):
+        from integrations.coding_agent.benchmark_tracker import BenchmarkTracker
+        tracker = BenchmarkTracker(db_path=str(tmp_path / 'b.db'))
+        result = _distribute_with_shards(
+            tmp_path, tracker, ['http://peer2'], 'u6', 'm6')
+        assert result['shards_succeeded'] == 1
+        task_type, tool, model, user, elapsed, success, offloaded = \
+            self._row(tmp_path / 'b.db')
+        assert (task_type, tool, model, user, success, offloaded) == (
+            'feature', 'distributed', 'm6', 'u6', 1, 1)
+        assert elapsed >= 0.05
+        assert elapsed == pytest.approx(result['execution_time_s'])
+
+    def test_every_shard_failed_records_a_failure(self, tmp_path):
+        from integrations.coding_agent.benchmark_tracker import BenchmarkTracker
+        tracker = BenchmarkTracker(db_path=str(tmp_path / 'b.db'))
+        result = _distribute_with_shards(
+            tmp_path, tracker, ['http://peer1', 'http://peer2'], 'u7', 'm7')
+        assert result['success'] is False
+        task_type, tool, model, user, elapsed, success, offloaded = \
+            self._row(tmp_path / 'b.db')
+        assert (task_type, tool, model, user, success, offloaded) == (
+            'feature', 'distributed', 'm7', 'u7', 0, 1)
+        assert elapsed >= 0.05

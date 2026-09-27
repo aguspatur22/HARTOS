@@ -37,6 +37,10 @@ _TASK_MAX = int(os.environ.get('HEVOLVE_A2A_TASK_MAX', '1024'))
 # caller holding this many unfinished tasks is told 'busy' (review of
 # 436580009: one admitted peer could grow memory and threads without limit).
 _OPEN_TASKS_PER_CALLER = int(os.environ.get('HEVOLVE_A2A_OPEN_TASKS_PER_CALLER', '4'))
+# ...and for the node: every unfinished task holds a thread (non-blocking) or
+# a request worker (blocking), so the whole table of running turns is capped
+# by the same admission check (review of a4ea04651: 60 sends, +60 threads).
+_OPEN_TASKS_MAX = int(os.environ.get('HEVOLVE_A2A_OPEN_TASKS_MAX', '16'))
 
 
 class TaskState(str, Enum):
@@ -176,6 +180,24 @@ class A2AMessageHandler:
                         break
                     self.tasks.pop(tid, None)
 
+    def _admission_refusal(self, caller) -> Optional[str]:
+        """The ONE bound on running turns: 'busy: ...' when this caller
+        (_OPEN_TASKS_PER_CALLER) or the node (_OPEN_TASKS_MAX) already holds
+        that many unfinished tasks, else None.  Finished tasks are evicted
+        by _prune; running ones only end."""
+        self._prune()
+        open_states = (TaskState.SUBMITTED, TaskState.WORKING)
+        with self._tasks_lock:
+            running = [t for t in self.tasks.values() if t.state in open_states]
+        mine = sum(1 for t in running if caller is not None and t.owner == caller)
+        if caller is not None and mine >= _OPEN_TASKS_PER_CALLER:
+            logger.info(f"A2A: {caller!r} holds {mine} unfinished tasks; busy")
+            return f"busy: {mine} tasks of this caller are still running"
+        if len(running) >= _OPEN_TASKS_MAX:
+            logger.info(f"A2A: {len(running)} unfinished tasks on this node; busy")
+            return f"busy: {len(running)} tasks are running on this node"
+        return None
+
     def _task_for(self, task_id, caller):
         """The task, when ``caller`` may see it; else None.  A task bound to
         another caller reads as absent: its existence is not disclosed."""
@@ -213,16 +235,9 @@ class A2AMessageHandler:
             if part.get("kind", part.get("type")) == "text":
                 message_text += part.get("text", "")
 
-        if caller is not None:
-            open_states = (TaskState.SUBMITTED, TaskState.WORKING)
-            with self._tasks_lock:
-                held = sum(1 for t in self.tasks.values()
-                           if t.owner == caller and t.state in open_states)
-            if held >= _OPEN_TASKS_PER_CALLER:
-                logger.info(f"A2A: {caller!r} holds {held} unfinished tasks; "
-                            f"busy")
-                return {"error": {"code": -32000, "message": (
-                    f"busy: {held} tasks of this caller are still running")}}
+        busy = self._admission_refusal(caller)
+        if busy:
+            return {"error": {"code": -32000, "message": busy}}
         # Create task, bound to the caller that was admitted for it.
         task = A2ATask(task_id=message_id, message=message, context_id=context_id)
         task.owner = caller

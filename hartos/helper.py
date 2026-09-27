@@ -169,17 +169,8 @@ async def async_main(urls):
 # Recipe SAVE dir — the SINGLE deployment-aware resolver shared with the REUSE
 # read (cache_loaders) and the daemon reuse-CHECK, so a recipe is written, read,
 # and checked in the SAME folder in bundled / Docker / dev (no extra env).
-try:
-    from core.platform_paths import get_recipe_prompts_dir
-    PROMPTS_DIR = os.path.abspath(get_recipe_prompts_dir())
-except Exception:
-    # Fallback mirrors get_recipe_prompts_dir: bundled (read-only install) → user
-    # data dir; Docker & dev → code-relative prompts/.
-    if getattr(sys, 'frozen', False) or os.environ.get('NUNBA_BUNDLED'):
-        PROMPTS_DIR = os.path.abspath(os.path.join(
-            os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts'))
-    else:
-        PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts'))
+from core.platform_paths import get_recipe_prompts_dir
+PROMPTS_DIR = os.path.abspath(get_recipe_prompts_dir())
 os.makedirs(PROMPTS_DIR, exist_ok=True)
 
 
@@ -3667,11 +3658,8 @@ def _resolve_agent_data_dir():
     # Bundled/frozen mode: use writable user directory (Program Files is read-only)
     from core.config_cache import is_bundled as _is_bundled_check
     if _is_bundled_check():
-        try:
-            from core.platform_paths import get_agent_data_dir
-            return get_agent_data_dir()
-        except ImportError:
-            return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
+        from core.platform_paths import get_agent_data_dir
+        return get_agent_data_dir()
     return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'agent_data')
 
 AGENT_DATA_DIR = _resolve_agent_data_dir()
@@ -3680,11 +3668,8 @@ try:
         os.makedirs(AGENT_DATA_DIR, exist_ok=True)
 except PermissionError:
     # Fallback: user home directory (e.g. bundled app in Program Files)
-    try:
-        from core.platform_paths import get_agent_data_dir as _get_agent_fallback
-        AGENT_DATA_DIR = _get_agent_fallback()
-    except ImportError:
-        AGENT_DATA_DIR = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
+    from core.platform_paths import get_agent_data_dir as _get_agent_fallback
+    AGENT_DATA_DIR = _get_agent_fallback()
     os.makedirs(AGENT_DATA_DIR, exist_ok=True)
     logging.getLogger(__name__).warning(f"agent_data dir redirected to {AGENT_DATA_DIR} (install dir not writable)")
 

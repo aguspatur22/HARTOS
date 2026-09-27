@@ -37,6 +37,10 @@ def _trim(msgs, budget, monkeypatch):
 
 
 def _assert_head_and_tail(text, head, tail):
+    # A body that carries a pointer gets the pointer explanation appended to
+    # its system message (test_wire_trim_elided_pointers.py); it is not part
+    # of the message's own text.
+    text = text.split(lol.ELIDED_POINTER_EXPLANATION)[0]
     assert text.startswith(head), 'the head was cut: %r' % text[:120]
     assert text.endswith(tail), 'the tail was cut: %r' % text[-120:]
     assert WIRE_TRIM_MARKER in text

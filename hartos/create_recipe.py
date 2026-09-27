@@ -341,12 +341,8 @@ try:
     log_dir = os.path.join(get_data_dir(), 'logs')
     os.makedirs(log_dir, exist_ok=True)
 except Exception:
-    try:
-        log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
-        os.makedirs(log_dir, exist_ok=True)
-    except Exception:
-        import tempfile
-        log_dir = tempfile.gettempdir()  # last resort: a log path must never brick boot
+    import tempfile
+    log_dir = tempfile.gettempdir()  # last resort: a log path must never brick boot
 
 # Single log file with rotation (no more timestamped files that accumulate forever)
 log_file = os.path.join(log_dir, "agent_system.log")
@@ -539,21 +535,28 @@ def send_message_to_user1(user_id, response, inp, prompt_id):
     path — it was an artefact of the cloud server's per-user session
     dict and isn't needed by local subscribers.
 
-    Always fire-and-forget — callers don't read the return value.
+    Returns "Message sent successfully to user with request_id: ..." or
+    "Failed to send message to user with request_id: ...", the same two
+    answers REUSE's copy gives.  The send_message_to_user tool
+    (core.agent_tools) returns it to the model, so the model is told whether
+    its message went out; the other callers here ignore it.
     """
     user_prompt = f'{user_id}_{prompt_id}'
     try:
         request_id = f'{request_id_list[user_prompt]}-intermediate'
     except (KeyError, NameError):
         request_id = f'{user_prompt}-intermediate'
+    sent = f'Message sent successfully to user with request_id: {request_id}'
+    failed = f'Failed to send message to user with request_id: {request_id}'
 
     if is_bundled():
         # Bundled (Nunba install) — local chat topic, on-device.
         from core.peer_link.crossbar_publish import publish_agent_message
-        publish_agent_message(text=response, user_id=user_id,
-                              request_id=request_id, prompt_id=prompt_id,
-                              inp=inp)
-        return
+        if publish_agent_message(text=response, user_id=user_id,
+                                 request_id=request_id, prompt_id=prompt_id,
+                                 inp=inp):
+            return sent
+        return failed
 
     # Standalone central HARTOS — canonical Kong gateway.
     url = 'https://azurekong.hertzai.com:8443/autogen_response'
@@ -572,6 +575,8 @@ def send_message_to_user1(user_id, response, inp, prompt_id):
                 f'send_message_to_user1: azurekong forward failed ({_e})')
         except Exception:
             pass
+        return failed
+    return sent
 
 
 def execute_python_file(task_description:str,user_id: int,prompt_id:int,action_entry_point:int=0):
@@ -976,13 +981,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     try:
         from integrations.channels.memory.memory_graph import MemoryGraph
         import os
-        try:
-            from core.platform_paths import get_memory_graph_dir
-            graph_db_path = get_memory_graph_dir(user_prompt)
-        except ImportError:
-            graph_db_path = os.path.join(
-                os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", user_prompt
-            )
+        from core.platform_paths import get_memory_graph_dir
+        graph_db_path = get_memory_graph_dir(user_prompt)
         memory_graph = MemoryGraph(db_path=graph_db_path, user_id=str(user_id))
         tool_logger.info(f"MemoryGraph initialized for {user_prompt}")
     except Exception as e:

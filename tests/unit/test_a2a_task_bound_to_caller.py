@@ -245,3 +245,32 @@ def test_one_caller_cannot_hold_unbounded_open_tasks(monkeypatch):
         assert len(h.tasks) == 4
     finally:
         release.set()
+
+
+def test_in_flight_turns_are_capped_for_the_whole_node(monkeypatch):
+    """Review of a4ea04651, finding 2: every non-blocking send started a
+    thread and kept a task (60 sends, +60 threads).  ONE admission check
+    bounds unfinished tasks per caller AND for the node; past either, the
+    send answers 'busy' and starts nothing."""
+    monkeypatch.setattr(gai, '_OPEN_TASKS_PER_CALLER', 2)
+    monkeypatch.setattr(gai, '_OPEN_TASKS_MAX', 3)
+    release = threading.Event()
+
+    async def slow(text, ctx):
+        while not release.is_set():
+            await asyncio.sleep(0.02)
+        return {'role': 'model', 'parts': [{'text': 'x'}]}
+    h = A2AMessageHandler(slow)
+    threads_before = threading.active_count()
+    try:
+        for who in ('peer:a', 'peer:b', 'peer:c'):
+            _send_as(h, who, blocking=False)
+        params = {'message': {'messageId': uuid.uuid4().hex,
+                              'parts': [{'kind': 'text', 'text': 'x'}]},
+                  'configuration': {'blocking': False}}
+        busy = _run(h.handle_message_send(params, caller='peer:d'))
+        assert 'busy' in busy['error']['message'], busy
+        assert len(h.tasks) == 3
+        assert threading.active_count() - threads_before <= 3
+    finally:
+        release.set()

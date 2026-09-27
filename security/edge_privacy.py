@@ -120,7 +120,9 @@ def _is_secret_key(key: str) -> bool:
 
 
 def _is_contact_key(key: str) -> bool:
-    return any(w in key for w in _CONTACT_KEY_WORDS)
+    # 'email', 'contact_email', 'phone_number' -- not 'phone_like_count'
+    return any(key == w or key.endswith('_' + w) or key == w + '_number'
+               or key == w + '_address' for w in _CONTACT_KEY_WORDS)
 
 
 def is_identifier_key(key: Any) -> bool:
@@ -260,7 +262,11 @@ def uri_names_user(uri: str, user_id: Any) -> bool:
                               or uri.endswith('/' + user_id))
 
 
-@functools.lru_cache(maxsize=8)
+def _is_user_template(template: str) -> bool:
+    return '{user_id}' in template
+
+
+@functools.lru_cache(maxsize=16)
 def _per_user_patterns(templates: Tuple[str, ...]):
     patterns = []
     for template in templates:
@@ -280,13 +286,20 @@ def per_user_uri_owner(uri: str) -> str:
     user; a community, a session, a global feed or
     ``com.hartos.event.<topic>`` does not.
     """
+    from core.constants import CHAT_TOPICS
     from core.peer_link.message_bus import (
         PER_USER_TOPICS_OUTSIDE_BUS, TOPIC_MAP)
-    templates = tuple(t for t in (*TOPIC_MAP.values(),
-                                  *PER_USER_TOPICS_OUTSIDE_BUS)
-                      if crossbar_uri_is_per_user(t))
-    for rx in _per_user_patterns(templates):
-        m = rx.fullmatch(uri or '')
+    uri = uri or ''
+    known = (*TOPIC_MAP.values(), *PER_USER_TOPICS_OUTSIDE_BUS, *CHAT_TOPICS)
+    # A declared SHARED URI is nobody's, even where a per-user template
+    # would also match it ('com.hertzai.hevolve.{user_id}' vs the global
+    # 'com.hertzai.hevolve.confirmation').
+    shared = tuple(t for t in known if not _is_user_template(t))
+    if any(rx.fullmatch(uri) for rx in _per_user_patterns(shared)):
+        return ''
+    per_user = tuple(t for t in known if _is_user_template(t))
+    for rx in _per_user_patterns(per_user):
+        m = rx.fullmatch(uri)
         if m:
             return m.group('user_id')
     return ''
@@ -307,7 +320,7 @@ def crossbar_uri_is_per_user(uri: str, user_id: Any = '') -> bool:
     """
     uri = uri or ''
     if '{' in uri:
-        return '{user_id}' in uri
+        return _is_user_template(uri)
     owner = per_user_uri_owner(uri)
     if not owner:
         return False

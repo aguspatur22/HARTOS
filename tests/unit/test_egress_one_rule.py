@@ -28,6 +28,7 @@ sessions (recording fakes), the Crossbar HTTP client, the SSE broker.
 """
 import ast
 import asyncio
+import re
 import json
 import logging
 import os
@@ -301,19 +302,38 @@ def test_the_ownership_rule_answers_for_concrete_uris():
     assert own('com.hertzai.hevolve.chat.u-1', 'u-2') is False
     assert own('com.hertzai.hevolve.chat.u-11', 'u-1') is False
     assert own('com.hertzai.hevolve.community.c1', 'u-1') is False
-    assert own('com.hertzai.hevolve.chat.u-1', '') is False
     assert own('com.hartos.event.agent.ui.update', 'u-1') is False
+    # a declared per-user URI is its user's even when the payload names nobody
+    assert own('com.hertzai.hevolve.chat.u-1', '') is True
+    # review F6: a last segment equal to the user id is not enough -- only a
+    # DECLARED per-user template makes a URI one user's
+    assert own('com.hertzai.hevolve.community.u-1', 'u-1') is False
+    assert own('com.hertzai.hevolve.game.u-1', 'u-1') is False
+    assert own('com.hartos.event.tts.speak.u-1', 'u-1') is False
+    # a declared SHARED URI is nobody's, though chat.general's template
+    # 'com.hertzai.hevolve.{user_id}' would also match it
+    assert own('com.hertzai.hevolve.confirmation', '') is False
+    assert own('com.hertzai.hevolve.chat.new', '') is False
+    assert own('com.hertzai.hevolve.u9', 'u9') is True
 
 
-def test_a_one_person_event_bridges_only_onto_its_owners_uri(legs):
-    """Unpatched: the bridge publishes com.hartos.event.<topic>, so a card
-    whose topic ends in its user's id is on that user's own URI."""
+def test_a_one_person_event_bridges_only_onto_its_owners_uri(legs, monkeypatch):
+    """The rule is unpatched; only its DATA grows: once a per-user bridge URI
+    is declared, a card on its own user's URI bridges raw, on anyone else's
+    it is withheld.  Undeclared (today), no card bridges at all."""
+    from core.peer_link import message_bus as mb
+    legs.ebus.emit('agent.ui.update.u-1', {'user_id': 'u-1', 'code': 'K7Q2'})
+    _drain(legs.loop)
+    assert legs.ebus_session.published == []
+    monkeypatch.setattr(mb, 'PER_USER_TOPICS_OUTSIDE_BUS', (
+        *mb.PER_USER_TOPICS_OUTSIDE_BUS,
+        'com.hartos.event.agent.ui.update.{user_id}'))
     legs.ebus.emit('agent.ui.update.u-1', {'user_id': 'u-1', 'code': 'K7Q2'})
     legs.ebus.emit('agent.ui.update.u-1', {'user_id': 'u-2', 'code': 'K7Q2'})
     legs.ebus.emit('agent.ui.update', {'user_id': 'u-1', 'code': 'K7Q2'})
     _drain(legs.loop)
-    assert [u for u, _ in legs.ebus_session.published] == [
-        'com.hartos.event.agent.ui.update.u-1']
+    assert [(u, p['code']) for u, p in legs.ebus_session.published] == [
+        ('com.hartos.event.agent.ui.update.u-1', 'K7Q2')]
 
 
 # ── bd92 F3: one answer to "who is this event for" ─────────────────────────
@@ -339,7 +359,9 @@ def test_realtime_never_treats_a_one_person_topic_as_public():
     from integrations.social.realtime import _authorize_topic_for_user_id as ok
     assert ok('agent.ui.update', 'u-1') is False
     assert ok('agent.ui.update.u-1', 'u-1') is True
-    assert ok('agent.lifecycle.started', '') is True      # still public
+    # review of a4ea04651 F4: 'agent.' is not everyone's either (no
+    # publish_event caller uses it); only the one table decides
+    assert ok('agent.lifecycle.started', '') is False
     assert ok('com.hertzai.hevolve.social.u-1', 'u-1') is True
     assert ok('com.hertzai.hevolve.social.u-1', 'u-2') is False
 
@@ -398,6 +420,11 @@ def test_redact_experience_redacts_secrets_in_every_content_leaf():
 
 _SCAN_DIRS = ('core', 'security', 'integrations', 'hartos')
 _CANONICAL = os.path.join('security', 'edge_privacy.py')
+_AUDIENCE_HOME = os.path.join('core', 'platform', 'events.py')
+_DLP_HOME = os.path.join('security', 'dlp_engine.py')
+_CLASSIFIER_TABLE = re.compile(
+    r'(PUBLIC|GLOBAL|ONE_PERSON|NODE_INTERNAL)\w*(PREFIX|TOPIC)'
+    r'|BLOCKLIST|PRIVATE_FIELDS|CONTENT_FIELDS|IDENTIFIER_KEY')
 _REDACTORS = {'redact', 'redact_secrets', 'scrub_text', 'scrub_for_egress',
               'redact_fields', 'map_content'}
 
@@ -424,8 +451,13 @@ def test_source_guard_the_egress_rule_has_one_home():
       * a membership test on the literal '{user_id}' (the template rule),
       * an .endswith(f'.{user_id}') suffix test (the concrete rule),
       * a recursive payload walker that calls a redactor,
-      * a module-level *CONTENT_FIELDS / *IDENTIFIER_KEY* table,
-    anywhere but security/edge_privacy.py."""
+      * a scrubber that calls the DLP engine's redact directly (review:
+        claude_code_backend's DLP-only copy let sk-ant-... through),
+      * a table answering "whose is this topic" or "which fields may go"
+        (*PUBLIC*PREFIX*, *GLOBAL*PREFIX*, *BLOCKLIST*, *CONTENT_FIELDS*,
+        ...; review: realtime / tenant_acl each had their own),
+    anywhere but security/edge_privacy.py (tables: also
+    core/platform/events.py, which owns topic_audience)."""
     found = []
     for path in _sources():
         rel = os.path.relpath(path, _ROOT)
@@ -458,10 +490,181 @@ def test_source_guard_the_egress_rule_has_one_home():
                     for n in ast.walk(node))
                 if node.name in calls and walks_dicts and calls & _REDACTORS:
                     found.append((rel, node.lineno, 'redacting walker ' + node.name))
-            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and rel != _DLP_HOME):
+                calls = set(_called_names(node))
+                if {'get_dlp_engine', 'redact'} <= calls:
+                    found.append((rel, node.lineno, 'DLP scrubber ' + node.name))
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and rel != _AUDIENCE_HOME:
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                 for t in targets:
                     name = getattr(t, 'id', '')
-                    if 'CONTENT_FIELDS' in name or 'IDENTIFIER_KEY' in name:
+                    if _CLASSIFIER_TABLE.search(name):
                         found.append((rel, node.lineno, name))
     assert found == [], 'a second egress rule: %r' % found
+
+
+# ── review of a4ea04651 ────────────────────────────────────────────────────
+#
+# F1: the bridge sent every ADDRESSED topic raw on com.hartos.event.<topic>
+#     (reviewer probe rv_probe_e: tts.speak, outreach.prospect_replied,
+#     perception.watcher.fired).
+# F2: the scrub rewrote protocol values (rv_probe_c: addresses, versions,
+#     10-digit numbers, base64 keys).
+# F3: claude_code_backend had a DLP-only scrubber.
+# F4: realtime / tenant_acl had their own public-topic tables.
+# F5: publish_async's owner was not pinned by a payload that names nobody.
+# F6: any last segment equal to the user id counted as the user's URI.
+
+def test_every_bridged_event_is_scrubbed_unless_the_uri_is_its_users(legs):
+    local = []
+    legs.ebus.on('tts.speak', lambda t, d: local.append(dict(d)))
+    legs.ebus.emit('tts.speak', {'user_id': 'u-1',
+                                 'text': f'remind me: call {PHONE}, mail {EMAIL}'})
+    legs.ebus.emit('outreach.prospect_replied', {
+        'prospect_id': 1, 'email': 'ceo@acme.com',
+        'body_preview': f'my cell is {PHONE}'})
+    legs.ebus.emit('perception.watcher.fired', {
+        'user_id': 'u-1', 'condition': f'see my password {API_KEY}',
+        'action': 'x'})
+    legs.ebus.emit('system.health.snapshot', {'node_id': PROMPT_ID, 'cpu': 5})
+    _drain(legs.loop)
+
+    got = {u: p for u, p in legs.ebus_session.published}
+    assert set(got) == {'com.hartos.event.tts.speak',
+                        'com.hartos.event.outreach.prospect_replied',
+                        'com.hartos.event.perception.watcher.fired',
+                        'com.hartos.event.system.health.snapshot'}
+    blob = json.dumps(legs.ebus_session.published)
+    for raw in (PHONE, EMAIL, 'ceo@acme.com', API_KEY):
+        assert raw not in blob, raw
+    assert got['com.hartos.event.tts.speak']['text'] == \
+        'remind me: call [PHONE_REDACTED], mail [EMAIL_REDACTED]'
+    assert got['com.hartos.event.outreach.prospect_replied']['prospect_id'] == 1
+    assert got['com.hartos.event.system.health.snapshot']['node_id'] == PROMPT_ID
+    # the in-process record is raw
+    assert local[0]['text'] == f'remind me: call {PHONE}, mail {EMAIL}'
+
+
+def test_peer_gossip_crosses_the_bridge_byte_identical(legs):
+    """Scrubbing the bridge must not partition the hive: the capability
+    advert's endpoint, attestation and model facts survive untouched."""
+    advert = {
+        'peer_id': '8f3a1c9e2b7d4f60', 'endpoint': PEER_URL,
+        'auth_token': 'c0ffee' * 8,
+        'origin_attestation': {'signature': 'ab' * 32,
+                               'x25519_public': 'q2+/4155550199/Zx9yA=',
+                               'address': '203.0.113.7:6777',
+                               'hart_version': '2026.9.27.1'},
+        'models': [{'name': 'qwen3.5-4b', 'build': '1.4.0.12',
+                    'vram_bytes': '8589934592'}],
+        'announced_at': 1727430000.5,
+    }
+    legs.ebus.emit('peer.capability.announce', json.loads(json.dumps(advert)))
+    _drain(legs.loop)
+    (uri, sent), = legs.ebus_session.published
+    assert uri == 'com.hartos.event.peer.capability.announce'
+    sent = dict(sent)
+    sent.pop('msg_id')
+    assert sent == advert
+
+
+def test_protocol_values_survive_and_person_values_do_not():
+    from security.edge_privacy import scrub_for_egress
+    protocol = {
+        'type': 'announce', 'node_id': '8f3a1c9e2b7d4f60', 'url': PEER_URL,
+        'public_key': '3fa91234567890' + 'ab' * 25,
+        'x25519_public': 'q2+/4155550199/Zx9yA=', 'address': '203.0.113.7:6777',
+        'lan_ip': '192.168.1.42', 'peers': ['http://198.51.100.9:6777'],
+        'hart_version': '2026.9.27.1', 'build': '1.4.0.12',
+        'sig': 'MEUCIQ/4155550199/+x', 'nonce': '4155550199',
+        'hostname': 'msi-203-0-113-7', 'q': '10.1.2.3',
+        'vram_bytes': '8589934592', 'phone_like_count': '1234567890',
+        'artifact': 'sha256:' + '12' * 32, 'date': '2026-09-27',
+    }
+    assert scrub_for_egress(protocol) == protocol
+    person = scrub_for_egress({
+        'api_key': API_KEY, 'private_key': API_KEY,
+        'contact_email': EMAIL, 'phone': '4155550199', 'mobile': 'call me',
+        'note': PHONE, 'reply': f'my number is 4155550199 {EMAIL}',
+        'author': {'name': 'a', 'email': EMAIL, 'voice_profile': 'v1'},
+    })
+    blob = json.dumps(person)
+    for raw in (API_KEY, EMAIL, PHONE, '4155550199', 'call me', 'v1'):
+        assert raw not in blob, raw
+    assert person['author'] == {'name': 'a'}
+
+
+def test_the_copilot_prompt_uses_the_one_scrub():
+    from integrations.coding_agent.claude_code_backend import _scrub_for_egress
+    out = _scrub_for_egress(
+        f'use {API_KEY} with password=hunter2secret and mail {EMAIL}')
+    for raw in (API_KEY, 'hunter2secret', EMAIL):
+        assert raw not in out, raw
+    assert _scrub_for_egress('') == ''
+
+
+def test_publish_and_subscribe_gates_ask_the_one_classifier():
+    from integrations.social.realtime import _authorize_topic_for_user_id as pub
+    from integrations.social.tenant_acl import authorize_subscribe as sub
+    # once "public", now per-user like any addressed topic
+    for topic in ('tts.audio_ready', 'game.s1', 'admin.broadcast',
+                  'presence.online', 'dm.c1', 'agent.lifecycle.a1'):
+        assert pub(topic, 'u-1') is False, topic
+        assert sub(topic, {'user_id': 'u-1'}) is False, topic
+    # everyone's (topic_audience EVERYONE): the measured callers
+    assert pub('setup_progress', '') is True
+    assert pub('social.post.p1.vote', '') is True
+    assert pub('community.feed', '') is True
+    assert sub('community.feed', {'user_id': 'u-1'}) is True
+    assert sub('community.feed', {}) is False
+    # the publisher's own per-user bus topic
+    assert pub('chat.social', 'u-1') is True
+    assert pub('chat.social', '') is False
+    assert sub('chat.social', {'user_id': 'u-1'}) is True
+    # a concrete topic naming the user
+    assert sub('com.hertzai.hevolve.social.u-1', {'user_id': 'u-1'}) is True
+    assert sub('com.hertzai.hevolve.social.u-2', {'user_id': 'u-1'}) is False
+
+
+def test_the_real_thinking_envelope_reaches_its_own_user_raw(legs):
+    """crossbar_publish.publish_thinking_trace sends an envelope that names
+    no user; on the user's own chat URI it goes byte-identical."""
+    from core.peer_link.crossbar_publish import publish_thinking_trace
+    client = _Client()
+    with _no_link_manager(), patch('core.safe_hartos_attr.safe_hartos_attr',
+                                   return_value=_publish_async(client)):
+        assert publish_thinking_trace(text=f'mail {EMAIL}', user_id='u-1',
+                                      request_id=PROMPT_ID) is True
+    (topic, payload), = client.published
+    assert topic == 'com.hertzai.hevolve.chat.u-1'
+    sent = json.loads(payload)
+    assert 'user_id' not in sent and sent['text'] == [f'mail {EMAIL}']
+
+
+def test_publish_async_asks_with_the_user_the_payload_names(legs):
+    """The bus leg stamps the topic suffix into the payload; for
+    channel.response.<uid> that suffix is 'channel.response.<uid>', not a
+    user.  The egress owner is the user the PAYLOAD names: nobody -> the
+    URI's own user (raw); someone else -> scrubbed."""
+    client = _Client()
+    reply = json.dumps({'text': [f'mail {EMAIL}'], 'action': 'ChannelResponse'})
+    with _no_link_manager():
+        pa = _publish_async(client)
+        pa('com.hertzai.hevolve.channel.response.u-1', reply)
+        pa('com.hertzai.hevolve.chat.u-1', {'user_id': 'u-2', 'text': EMAIL})
+        pa('com.hertzai.hevolve.chat.10077', {'user_id': 10077, 'text': EMAIL})
+    assert client.published[0] == (
+        'com.hertzai.hevolve.channel.response.u-1', reply)
+    assert json.loads(client.published[1][1])['text'] == '[EMAIL_REDACTED]'
+    assert json.loads(client.published[2][1])['text'] == EMAIL
+
+
+def test_a_community_named_like_its_user_is_still_other_peoples(legs):
+    with _no_link_manager():
+        MessageBus().publish('community.message',
+                             {'community_id': 'u1', 'text': EMAIL},
+                             user_id='u1', skip_peerlink=True)
+    uri, payload = legs.cb.published[0]
+    assert uri == 'com.hertzai.hevolve.community.u1'
+    assert json.loads(payload)['text'] == '[EMAIL_REDACTED]'

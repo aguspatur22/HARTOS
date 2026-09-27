@@ -571,12 +571,8 @@ except Exception:
     # helper uses, so we NEVER fall back to the read-only /nix/store package dir on
     # the embedded OS (the boot crash this guards). get_recipe_prompts_dir handles
     # frozen desktop + embedded HART OS (/nix/store or /etc/hartos-release) + dev.
-    try:
-        from core.platform_paths import get_recipe_prompts_dir
-        PROMPTS_DIR = os.path.abspath(get_recipe_prompts_dir())
-    except Exception:
-        PROMPTS_DIR = os.path.abspath(os.path.join(
-            os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts'))
+    from core.platform_paths import get_recipe_prompts_dir
+    PROMPTS_DIR = os.path.abspath(get_recipe_prompts_dir())
 
 # Ensure prompts directory exists (agent creation writes JSON here)
 os.makedirs(PROMPTS_DIR, exist_ok=True)
@@ -622,13 +618,8 @@ def _get_or_create_graph(user_id, prompt_id=None):
         session_key = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
         with _memory_graph_lock:
             if session_key not in _memory_graphs:
-                try:
-                    from core.platform_paths import get_memory_graph_dir
-                    db_path = get_memory_graph_dir(session_key)
-                except ImportError:
-                    db_path = os.path.join(
-                        os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", session_key
-                    )
+                from core.platform_paths import get_memory_graph_dir
+                db_path = get_memory_graph_dir(session_key)
                 _memory_graphs[session_key] = MemoryGraph(
                     db_path=db_path,
                     user_id=str(user_id),
@@ -835,11 +826,8 @@ logging.setLogRecordFactory(RequestLogRecord)
 _is_bundled = bool(os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False))
 
 if _is_bundled:
-    try:
-        from core.platform_paths import get_log_dir as _get_log_dir_lc
-        _nunba_log_dir = _get_log_dir_lc()
-    except ImportError:
-        _nunba_log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
+    from core.platform_paths import get_log_dir as _get_log_dir_lc
+    _nunba_log_dir = _get_log_dir_lc()
     try:
         os.makedirs(_nunba_log_dir, exist_ok=True)
     except PermissionError:
@@ -2501,6 +2489,11 @@ def publish_async(topic, message, timeout=2.0):
             data = json.loads(message)
         except (json.JSONDecodeError, TypeError):
             data = {'raw': message}
+    # The user the PAYLOAD names, read before the bus leg below stamps the
+    # topic suffix into it: the egress rule compares it with the owner of
+    # the Crossbar URI (a payload naming nobody on a declared per-user URI
+    # is that URI's user's).
+    _claimed_user = data.get('user_id', '') if isinstance(data, dict) else ''
 
     # 1. Route through MessageBus (LOCAL + PEERLINK — always works offline)
     try:
@@ -2603,10 +2596,9 @@ def publish_async(topic, message, timeout=2.0):
             _wire, _wire_is_json = json.loads(message), True
         except (json.JSONDecodeError, TypeError):
             pass
-    _owner = data.get('user_id', '') if isinstance(data, dict) else ''
     try:
         from security.edge_privacy import crossbar_egress_copy
-        _out = crossbar_egress_copy(topic, _wire, _owner)
+        _out = crossbar_egress_copy(topic, _wire, _claimed_user)
     except ImportError as _ep_err:
         app.logger.warning(f"Egress rule unavailable ({_ep_err}); not "
                            f"publishing {topic} to Crossbar")
@@ -8635,10 +8627,7 @@ def _tune_resonance_after_chat(user_id, prompt_text, response_text):
 
 _tts_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='tts_async')
 
-# --- Language persistence (DRY: one write path) ---
-_HART_LANG_PATH = os.path.join(
-    os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'hart_language.json')
-
+# --- Language persistence (DRY: one write path, core.user_lang) ---
 
 def _persist_language(lang: str) -> bool:
     """Thin shim for backward compatibility.  Real implementation is in
@@ -13377,11 +13366,8 @@ def _validate_startup():
     if _db_p and _db_p != ':memory:' and os.path.isabs(_db_p):
         db_dir = os.path.join(os.path.dirname(_db_p), 'agent_data')
     elif os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
-        try:
-            from core.platform_paths import get_agent_data_dir as _get_ad_dir
-            db_dir = _get_ad_dir()
-        except ImportError:
-            db_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
+        from core.platform_paths import get_agent_data_dir as _get_ad_dir
+        db_dir = _get_ad_dir()
     else:
         db_dir = os.path.join(os.path.dirname(__file__), 'agent_data')
     if not os.path.isdir(db_dir):

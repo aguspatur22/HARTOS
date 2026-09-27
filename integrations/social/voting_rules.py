@@ -93,7 +93,7 @@ def is_steward(user) -> bool:
     whatever its own row says: an agent counts as its owner for the quorum
     (tally_votes), never as the steward.  A voter id with no users row --
     the literal 'steward' included -- is no one.  Only a signed-in human
-    may cast this vote: the agent tool refuses a steward's voter id
+    may cast this vote: the agent tool casts agent votes only
     (thought_experiment_tools.cast_experiment_vote)."""
     if user is None or getattr(user, 'user_type', None) != 'human':
         return False

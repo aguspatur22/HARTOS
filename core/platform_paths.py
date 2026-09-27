@@ -47,8 +47,13 @@ def get_data_dir() -> str:
     resolved = (os.environ.get('NUNBA_DATA_DIR', '').strip()
                 or os.environ.get('HARTOS_DATA_DIR', '').strip()
                 or _platform_default_data_dir())
-    _cached_data_dir = _off_the_real_root_under_test(resolved)
-    return _cached_data_dir
+    guarded = _off_the_real_root_under_test(resolved, _platform_default_data_dir())
+    # A frozen build is never swapped.  Under test, sys.frozen is a patch that
+    # ends with the test: caching its real root would hand it to every later
+    # test in the process, so that answer is not kept.
+    if not (under_test() and _is_frozen()):
+        _cached_data_dir = guarded
+    return guarded
 
 
 def _platform_default_data_dir() -> str:
@@ -80,14 +85,21 @@ def under_test() -> bool:
     return 'pytest' in sys.modules
 
 
-def _off_the_real_root_under_test(data_dir: str) -> str:
-    """`data_dir`, or a per-process temp dir when a test would use the owner's
-    real data root.
+def _is_frozen() -> bool:
+    """A frozen (installed) build: cx_Freeze sets sys.frozen."""
+    return bool(getattr(sys, 'frozen', False))
 
-    The ONE test guard for everything under the data root: identity, keys,
-    databases, recipes, logs. Every resolver in this module goes through
-    get_data_dir, so each writer that asks this module for a path is covered,
-    including ones added later.
+
+def _off_the_real_root_under_test(path: str, real: str, label: str = '') -> str:
+    """`path`, or a per-process temp dir when a test would use `real`, one of
+    the owner's real roots (the data root; the macOS log root).  `label`
+    names the temp subdir standing in for a root other than the data root.
+
+    The ONE test guard for everything under the owner's roots: identity, keys,
+    databases, recipes, logs. Every resolver in this module goes through it,
+    so each writer that asks this module for a path is covered, including
+    ones added later; tests/unit/test_identity_is_hermetic.py fails on a
+    shipped module that builds ~/Documents/Nunba itself.
 
     Importing integrations.social.peer_discovery builds a GossipProtocol at
     module level, which reads and can write node_id.json. On 2026-09-23 an
@@ -102,26 +114,30 @@ def _off_the_real_root_under_test(data_dir: str) -> str:
     NUNBA_DATA_DIR to a tmp path) is left alone; only the real root is
     swapped out. Same shape as models.py's DB_PATH guard (828562872).
 
-    Residual: the test is "pytest is imported", so a production process that
-    imported pytest would run on a temp data root, removed at exit. No shipped
-    HARTOS module imports it (tests/unit/test_identity_is_hermetic.py fails if
-    one starts to), but the frozen Nunba bundle does ship pytest in lib/.
-    A writer that builds ~/Documents/Nunba itself instead of asking this
-    module is not covered.
+    The test is "pytest is imported", and the installed Nunba ships pytest in
+    lib/, so a swap there would put a person's DB, recipes and memories in a
+    dir deleted at exit.  Two limits: a frozen build is NEVER swapped, and
+    every swap logs a WARNING naming both paths, so a mis-fire in a source
+    run is visible rather than silent.  No shipped HARTOS module imports
+    pytest (tests/unit/test_identity_is_hermetic.py fails if one starts to).
     """
     global _pytest_data_dir
-    if not under_test():
-        return data_dir
-    real = os.path.normcase(os.path.abspath(_platform_default_data_dir()))
-    if os.path.normcase(os.path.abspath(data_dir)) != real:
-        return data_dir
+    if not under_test() or _is_frozen():
+        return path
+    if os.path.normcase(os.path.abspath(path)) != os.path.normcase(os.path.abspath(real)):
+        return path
     if _pytest_data_dir is None:
         import atexit
         import shutil
         import tempfile
         _pytest_data_dir = tempfile.mkdtemp(prefix='hartos_test_data_')
         atexit.register(shutil.rmtree, _pytest_data_dir, ignore_errors=True)
-    return _pytest_data_dir
+    swapped = os.path.join(_pytest_data_dir, label) if label else _pytest_data_dir
+    import logging
+    logging.getLogger('hevolve.platform').warning(
+        "pytest is imported: %s is the owner's real root, using %s instead "
+        '(removed at exit)', path, swapped)
+    return swapped
 
 
 def get_identity_data_dir() -> str:
@@ -336,7 +352,8 @@ def get_log_dir() -> str:
         return override
 
     if _IS_MACOS:
-        base = os.path.expanduser('~/Library/Logs/Nunba')
+        real_logs = os.path.expanduser('~/Library/Logs/Nunba')
+        base = _off_the_real_root_under_test(real_logs, real_logs, 'Library-Logs')
     else:
         # Windows + Linux both nest under the data dir.
         base = os.path.join(get_data_dir(), 'logs')

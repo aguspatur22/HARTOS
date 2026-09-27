@@ -789,11 +789,8 @@ class ModelCatalog:
     """
 
     def __init__(self, catalog_path: Optional[str] = None):
-        try:
-            from core.platform_paths import get_db_dir
-            data_dir = Path(get_db_dir())
-        except ImportError:
-            data_dir = Path.home() / 'Documents' / 'Nunba' / 'data'
+        from core.platform_paths import get_db_dir
+        data_dir = Path(get_db_dir())
         data_dir.mkdir(parents=True, exist_ok=True)
         self._path = Path(catalog_path) if catalog_path else data_dir / 'model_catalog.json'
         self._entries: Dict[str, ModelEntry] = {}

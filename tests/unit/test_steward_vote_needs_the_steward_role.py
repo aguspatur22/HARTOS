@@ -196,19 +196,20 @@ def test_the_tool_refuses_to_vote_as_the_real_steward(db):
     assert db.query(ExperimentVote).filter_by(voter_id=steward.id).count() == 0
 
 
-def test_the_tool_still_casts_an_ordinary_vote(db):
-    """Control: the refusal is only for the steward."""
+def test_the_tool_casts_no_persons_vote_steward_or_not(db):
+    """The tool casts agent votes only (test_agent_tool_votes_as_the_agent):
+    a person's id is refused like the steward's, and nothing is written.
+    Its control, an agent's vote that is written, is the next test."""
     from integrations.agent_engine.thought_experiment_tools import (
         cast_experiment_vote)
 
-    # security_guardrail takes no agent votes (VOTER_RULES), so a person.
     e = _experiment(db)
     person = _user(db)
     out = json.loads(cast_experiment_vote(e.id, person.id, vote_value=1,
                                           voter_type='human'))
     db.expire_all()
-    assert out['success'] is True, out
-    assert db.query(ExperimentVote).filter_by(voter_id=person.id).count() == 1
+    assert out['success'] is False, out
+    assert db.query(ExperimentVote).filter_by(voter_id=person.id).count() == 0
 
 
 def test_an_agents_tool_vote_counts_as_its_owner_never_as_the_steward(db):

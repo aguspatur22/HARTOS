@@ -1,17 +1,22 @@
-"""A cancelled remote turn gives the LLM permit back before the turn starts.
+"""A cancelled remote turn gives the LLM permit back: before the turn starts,
+and mid-turn at its next LLM call.
 
-Measured before choosing (review finding M2, 2026-09-26): once
-dispatch.local_chat_dispatch has called the in-process /chat, nothing can
-stop THAT turn alone.  The only mid-flight abort is core.foreground's cancel
-registry, which closes the shared background LLM client and so drops every
-background call on the node, not one turn.  What a cancel CAN do without
-touching anyone else is act while the turn waits for the one permit (up to
-HEVOLVE_LOCAL_LLM_WAIT_S, 30 s) and at the gate right before the turn runs.
-So: a cancel_event is honoured while waiting and after the acquire, and the
-permit is released; a turn already running finishes.
+Review of a4ea04651 (probe: started 0.75 s, cancelled 2.38 s, ran to
+3.77 s): a cancel stopped only a QUEUED turn.  The node already aborts
+background LLM work through core.llama_scheduler, the one admission every
+local llama call passes (pooled_post, the httpx and urllib patches).  Its
+preempt closes the SHARED background client, which would drop every other
+background call, so a per-turn cancel cannot use that.  It uses the same
+admission by request id instead: local_chat_dispatch binds the turn's
+cancel_event to its request id (daemon_a2a_<ctx>), and the scheduler refuses
+every later LLM call of that id (TurnCancelled) and wakes it if queued for a
+slot.  The call already on the wire when the cancel lands finishes (one
+call, not the turn); llama-server has no per-request abort other than
+closing that connection.
 
-Driven through the REAL local_chat_dispatch and the REAL semaphore; the
-in-process /chat callable and the user-activity gate are the boundary.
+Driven through the REAL local_chat_dispatch, the REAL semaphore, the REAL
+scheduler and the REAL pooled_post; the in-process /chat callable, the
+user-activity gate and the llama HTTP session are the boundary.
 """
 import threading
 import time
@@ -133,3 +138,130 @@ def test_a_cancel_that_lands_as_the_permit_is_taken_gives_it_back(
                                         cancel_event=cancel) == ('cancelled', None)
     assert chat == []
     assert real.acquire(timeout=0.2), 'the permit was not given back'
+
+
+def test_a_cancel_mid_turn_refuses_the_turns_next_llm_call(monkeypatch):
+    from core import http_pool
+    from hartos.threadlocal import thread_local_data
+    monkeypatch.setattr(dispatch, 'is_user_recently_active', lambda: False)
+    monkeypatch.setattr(dispatch, 'local_dispatch_provider_breaker_open',
+                        lambda *a, **k: '')
+    monkeypatch.setattr(http_pool, '_is_llama_completion_url', lambda url: True)
+    on_wire, first_call, go_on = [], threading.Event(), threading.Event()
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {'choices': [{'message': {'content': 'ok'}}]}
+
+    class _Session:
+        def post(self, url, timeout=None, **kw):
+            on_wire.append(kw.get('json', {}).get('user'))
+            if len(on_wire) == 1:
+                first_call.set()
+                go_on.wait(5)
+            return _Resp()
+    monkeypatch.setattr(http_pool, '_llama_session_for', lambda kind: _Session())
+
+    def turn(**kw):
+        """Three LLM calls, the way a /chat turn makes them; an exception
+        from the transport ends the turn, as the pipeline's does."""
+        thread_local_data.set_request_id(kw['request_id'])
+        for i in range(3):
+            http_pool.pooled_post('http://127.0.0.1:8080/v1/chat/completions',
+                                  json={'messages': [{'role': 'user',
+                                                      'content': str(i)}]})
+        return {'text': 'done'}
+    monkeypatch.setattr(dispatch, '_in_process_chat', lambda *a, **k: turn)
+    cancel = threading.Event()
+    out = {}
+    t = threading.Thread(target=lambda: out.update(r=dispatch.local_chat_dispatch(
+        'p', 'u', 'pid', daemon_id='a2a_ctx1', cancel_event=cancel)))
+    t.start()
+    assert first_call.wait(5)
+    cancel.set()
+    go_on.set()
+    t.join(5)
+    assert out['r'] == ('cancelled', None), out
+    assert on_wire == ['daemon_a2a_ctx1'], on_wire
+    assert _permit_free()
+
+
+def test_a_turn_queued_for_a_slot_wakes_on_its_cancel(monkeypatch):
+    from core.llama_scheduler import LlamaScheduler, TurnCancelled
+    s = LlamaScheduler(n_slots=1)
+    held = s.acquire('someone-else', 'daemon')
+    cancel = threading.Event()
+    s.bind_cancel('daemon_a2a_q', cancel)
+    out = {}
+
+    def call():
+        try:
+            with s.slot('daemon_a2a_q', 'daemon', timeout=30):
+                out['ran'] = True
+        except TurnCancelled:
+            out['cancelled'] = time.monotonic()
+    t = threading.Thread(target=call)
+    t.start()
+    time.sleep(0.3)
+    started = time.monotonic()
+    cancel.set()
+    t.join(5)
+    s.release(held)
+    s.unbind_cancel('daemon_a2a_q')
+    assert 'ran' not in out and out['cancelled'] - started < 2, out
+    assert s.stats()['in_flight'] == 0
+
+
+def test_other_turns_are_untouched_by_a_cancel(monkeypatch):
+    from core.llama_scheduler import LlamaScheduler
+    s = LlamaScheduler(n_slots=2)
+    cancel = threading.Event()
+    s.bind_cancel('daemon_a2a_a', cancel)
+    cancel.set()
+    with s.slot('daemon_other', 'daemon', timeout=1) as tok:
+        assert tok is not None
+    s.unbind_cancel('daemon_a2a_a')
+    with s.slot('daemon_a2a_a', 'daemon', timeout=1) as tok:
+        assert tok is not None, 'an unbound id is admitted again'
+
+
+def test_a_task_cancel_while_the_permit_is_held_means_the_turn_never_starts(
+        chat, monkeypatch):
+    """Review of a4ea04651, finding 4: the cancel must reach the dispatch
+    through the REAL registered executor (register_dynamic_agents), the
+    REAL A2A handler and a REAL task/cancel; dropping the cancel_event
+    anywhere on that path let the turn run once the permit came back."""
+    import asyncio
+    from integrations.google_a2a import dynamic_agent_registry as dar
+    from integrations.google_a2a import register_dynamic_agents as rda
+    from integrations.google_a2a.google_a2a_integration import (
+        A2AMessageHandler, TaskState)
+    agent = dar.TrainedAgent(
+        agent_id='77_0', prompt_id=77, flow_id=0, persona='ops', action='a',
+        recipe=[], status='done', can_perform_without_user_input='yes',
+        fallback_action='', metadata={'user_id': 'u'}, recipe_file='')
+    ex = dar.DynamicAgentExecutor.__new__(dar.DynamicAgentExecutor)
+    ex.discovery = type('D', (), {'get_agent_by_id': lambda self, a: agent})()
+    monkeypatch.setattr(rda, 'get_dynamic_executor', lambda: ex)
+    handler = A2AMessageHandler(rda.create_dynamic_executor_function(agent))
+    assert dispatch._local_llm_semaphore.acquire(timeout=1)
+    released = False
+    try:
+        task = asyncio.run(handler.handle_message_send(
+            {'message': {'parts': [{'kind': 'text', 'text': 'hi'}]},
+             'configuration': {'blocking': False}}, caller='peer:x'))
+        time.sleep(0.4)
+        out = asyncio.run(handler.handle_task_cancel(
+            {'taskId': task['id']}, caller='peer:x'))
+        assert out.get('success'), out
+        dispatch._local_llm_semaphore.release()
+        released = True
+        time.sleep(1.0)
+    finally:
+        if not released:
+            dispatch._local_llm_semaphore.release()
+    assert chat == [], 'the cancelled turn ran once the permit came back'
+    assert handler.tasks[task['id']].state == TaskState.FAILED
+    assert _permit_free()

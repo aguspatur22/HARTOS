@@ -45,14 +45,16 @@ from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 from core.constants import SUPPORTED_LANG_DICT
+from core.platform_paths import get_db_path
 
 logger = logging.getLogger(__name__)
 
 
-_HART_LANG_PATH = os.path.join(
-    os.path.expanduser('~'), 'Documents', 'Nunba', 'data',
-    'hart_language.json',
-)
+# <data root>/data/hart_language.json.  On Windows that is the same
+# ~/Documents/Nunba/data file as before; on macOS / Linux it now follows the
+# data root like every other file (it used to be the one file left in
+# ~/Documents/Nunba there), and under pytest it is a temp file.
+_HART_LANG_PATH = get_db_path('hart_language.json')
 
 
 # ── Read-side cache (mtime-invalidated) ─────────────────────────────

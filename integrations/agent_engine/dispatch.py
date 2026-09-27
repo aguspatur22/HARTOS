@@ -250,11 +250,14 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
 
     ``cancel_event`` (a threading.Event): set by whoever stopped waiting for
     this turn (the A2A task/cancel of a peer that gave up).  Honoured while
-    the turn waits for the LLM permit and once more right after it is
-    taken, returning ``('cancelled', None)`` with the permit given back.  A
-    turn already running is not stopped: the only mid-flight abort
-    (core.foreground's cancel registry) closes the shared background LLM
-    client and would drop every other background call too.
+    the turn waits for the LLM permit, right after it is taken, and during
+    the turn: it is bound to the turn's request id in core.llama_scheduler,
+    which refuses the turn's NEXT local LLM call (TurnCancelled), so the
+    turn ends and the permit comes back.  Returns ``('cancelled', None)``.
+    The one call already on the wire finishes: llama-server can abort a
+    request only by its connection closing, and the connection is the
+    SHARED background client (core.foreground's preempt), which would stop
+    every other background call too.
 
     ``native_fallback=False`` says "only use this if the Nunba adapter is
     present".  On native HARTOS (central) the loopback POST already reaches
@@ -355,6 +358,7 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
     # between the acquire and the try, so a raise there leaked the semaphore
     # permanently -- one permit, so the node's background LLM would have been
     # wedged for the life of the process.
+    _bound = None
     try:
         # Signal to the watchdog that this thread is in a legitimate LLM call.
         _notify_watchdog_llm_start()
@@ -362,6 +366,10 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
         # user responses via drain_thinking_traces(), and is what
         # dispatch.is_genuine_user_request reads to classify the turn.
         request_id = daemon_request_id(daemon_id) if daemon_id is not None else None
+        if cancel_event is not None and request_id:
+            from core.llama_scheduler import get_scheduler
+            get_scheduler().bind_cancel(request_id, cancel_event)
+            _bound = request_id
         result = hevolve_chat(
             text=prompt, user_id=user_id, agent_id=prompt_id,
             create_agent=True, casual_conv=False, autonomous=True,
@@ -369,15 +377,29 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
             **({'model_config': model_config} if model_config else {}),
         )
     except Exception as e:
+        if cancel_event is not None and cancel_event.is_set():
+            logger.info(f"Local /chat for {daemon_id or prompt_id} cancelled "
+                        f"mid-turn ({type(e).__name__}); permit given back")
+            return 'cancelled', None
         logger.warning(f"In-process /chat failed for {daemon_id or prompt_id}: {e}")
         return 'unavailable', None
     finally:
+        if _bound:
+            try:
+                from core.llama_scheduler import get_scheduler
+                get_scheduler().unbind_cancel(_bound)
+            except Exception:
+                pass
         _local_llm_semaphore.release()
         try:
             _notify_watchdog_llm_end()
         except Exception:
             logger.debug('watchdog LLM-end notify failed', exc_info=True)
 
+    if cancel_event is not None and cancel_event.is_set():
+        # The turn swallowed the refusal and returned: its answer is for a
+        # caller that has gone.
+        return 'cancelled', None
     result = result or {}
     # The Nunba adapter explicitly stamps an agent-addressed request made
     # during HARTOS warm-up as loading.  That text is an availability notice,

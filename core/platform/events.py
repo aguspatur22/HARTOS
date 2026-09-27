@@ -140,12 +140,16 @@ _NODE_INTERNAL_TOPIC_PREFIXES: tuple = (
 # They contain NO user or agent identifiers, so broadcasting them to
 # every SSE client is safe even multi-tenant — and refusing them left
 # every real-time admin health/pressure/optimization panel dark.  The
-# WAMP-side authorizer (integrations/social/realtime.py
-# _PUBLIC_TOPIC_PREFIXES) already treats system./model./catalog. as
-# public; this aligns the SSE guard with that same notion for the
-# infra subset.  (The two lists intentionally differ elsewhere: WAMP
-# also lists per-conversation chat.social/dm. which are authorized
-# per-subscriber, NOT SSE-global.)
+# realtime publish gate and the router's subscribe gate ask this same
+# table (integrations/social/realtime_acl.topic_open_to), so there is one
+# answer to "is this topic everyone's".  Per-user bus topics (chat.social)
+# are authorized there per publisher / subscriber, not listed here.
+#
+# 'social.post.' / 'social.comment.' / 'social.vote.': aggregate vote
+# scores (realtime.on_vote_update), no user identifiers.  'setup_progress'
+# / 'setup.': the node's own boot / channel-setup cards (channels/base.py
+# critical errors), published with no user_id before anyone signs in --
+# the same node-infra class as system.*.
 #
 # DELIBERATELY EXCLUDED — agent/goal/memory-scoped topics that carry an
 # agent_id/goal_id (agent.action.completed ×4882, action_state.changed,
@@ -158,6 +162,9 @@ _SSE_GLOBAL_PREFIXES: tuple = (
     'community.', 'hive.', 'public.',
     # host/infra telemetry (no user/agent identifiers) — admin ops feed:
     'system.', 'resource.', 'model.', 'catalog.', 'app.',
+    'setup_progress', 'setup.',
+    # aggregate social counters (vote scores), no user identifiers:
+    'social.post.', 'social.comment.', 'social.vote.',
     # hive-network AGGREGATE telemetry — epoch / peer_count / convergence,
     # no user or agent identifiers (federation.aggregated).  Same userless
     # class as system./model.; feeds the federation health panel.  NOT
@@ -212,28 +219,43 @@ def topic_audience(topic: str) -> str:
     return AUDIENCE_ADDRESSED
 
 
-def _topic_bridges_to_wamp(topic: str, data: Any = None) -> bool:
-    """May the WAMP bridge publish this event?
+_WITHHOLD = object()
 
-    Node-internal: never.  Addressed and everyone's events: yes, as before.
-    One person's: only if the bridged URI is theirs under the canonical
-    Crossbar rule, asked with the event's user_id.  If that rule cannot be
-    consulted the one-person event is withheld: the owner still has SSE and
-    in-process listeners, and a leak cannot be recalled.
+
+def _bridge_payload(topic: str, data: Any = None) -> Any:
+    """What of this event the WAMP bridge may publish, or _WITHHOLD.
+
+    The bridge publishes on ``com.hartos.event.<topic>``; in Hybrid/Hive
+    mode it joins central's router, where every node subscribes to that
+    prefix.  So it asks the one egress rule like every other Crossbar leg
+    (security.edge_privacy.crossbar_leg_is_users_own):
+      * node-internal: never bridged;
+      * a URI that is the event user's own: the event as emitted;
+      * anyone else's: one person's event is withheld (a pair code is not
+        made safe by a scrub); every other event goes as the scrubbed copy
+        (scrub_for_egress keeps ids, urls, versions, keys and signatures, so
+        peer gossip still verifies), or is withheld if the scrub failed.
+    If the rule cannot be consulted, nothing is bridged: the owner still has
+    SSE and in-process listeners, and a leak cannot be recalled.
     """
     audience = topic_audience(topic)
     if audience == AUDIENCE_NODE:
-        return False
-    if audience != AUDIENCE_ONE_PERSON:
-        return True
+        return _WITHHOLD
     try:
-        from security.edge_privacy import crossbar_leg_is_users_own
+        from security.edge_privacy import (
+            crossbar_leg_is_users_own, scrubbed_or_none)
     except Exception as e:
-        logger.warning("WAMP bridge: ownership rule unavailable (%s); "
-                       "withholding one-person topic %s", e, topic)
-        return False
+        logger.warning("WAMP bridge: egress rule unavailable (%s); "
+                       "withholding %s", e, topic)
+        return _WITHHOLD
+    uri = _local_to_wamp(topic)
     user_id = data.get('user_id', '') if isinstance(data, dict) else ''
-    return crossbar_leg_is_users_own(_local_to_wamp(topic), user_id)
+    if crossbar_leg_is_users_own(uri, user_id):
+        return data
+    if audience == AUDIENCE_ONE_PERSON:
+        return _WITHHOLD
+    out = scrubbed_or_none(data, uri)
+    return _WITHHOLD if out is None and data is not None else out
 
 
 def _topic_targets_sse(topic: str) -> bool:
@@ -373,12 +395,12 @@ class EventBus:
             except Exception as e:
                 logger.warning("Wildcard listener error on '%s': %s", topic, e)
 
-        # Bridge to WAMP (skip if event already came from WAMP → no echo, and
-        # a topic addressed to one person only onto a URI that is theirs:
-        # _topic_bridges_to_wamp)
-        if (not _from_wamp and self._wamp_connected and self._wamp_session
-                and _topic_bridges_to_wamp(topic, data)):
-            self._publish_to_wamp(topic, data)
+        # Bridge to WAMP (skip if event already came from WAMP → no echo);
+        # what leaves is decided by the one egress rule: _bridge_payload.
+        if not _from_wamp and self._wamp_connected and self._wamp_session:
+            _out = _bridge_payload(topic, data)
+            if _out is not _WITHHOLD:
+                self._publish_to_wamp(topic, _out)
 
         # Bridge to SSE (Nunba desktop / Android web view).  This grew the
         # SSE transport adapter the broadcast_sse_safe docstring asked for

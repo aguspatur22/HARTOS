@@ -544,34 +544,49 @@ def invoke_peer_agent(peer_url: str, agent_id: str, prompt: str,
     if not task or task.get('state') not in _OPEN_TASK_STATES:
         return task
     task_id = task.get('id')
-    while time.monotonic() < deadline - _POLL_INTERVAL_S:
-        time.sleep(_POLL_INTERVAL_S)
+    interval = _POLL_INTERVAL_S
+    while time.monotonic() + interval < deadline:
+        time.sleep(interval)
+        # Back off: 0.25 s, then up to 2 s, so a 30 s wait is ~20 signed
+        # reads, not 120 (review of a4ea04651).
+        interval = min(interval * 2, _POLL_INTERVAL_MAX_S)
         got = _call('message/get', {'taskId': task_id})
         if got is None:
             continue
-        if got.get('error'):
-            logger.info(f"peer_reuse: message/get {agent_id}: {got['error']}")
-            break
-        if got.get('state') not in _OPEN_TASK_STATES:
+        # State first: a FAILED task also carries an 'error' string, and it
+        # is an answer to return, not a reason to cancel (review of a4ea04651).
+        if got.get('state') and got.get('state') not in _OPEN_TASK_STATES:
             return got
-    logger.info(f'peer_reuse: {agent_id} on {peer_url} still running at the '
-                f'end of the {timeout:.1f}s budget; cancelling it there')
-    _cancel_remote(_call, task_id)
+        if isinstance(got.get('error'), dict):
+            logger.info(f"peer_reuse: message/get {agent_id}: {got['error']}")
+            return None
+    logger.info(f'peer_reuse: {agent_id} on {peer_url} still running when the '
+                f'{timeout:.1f}s budget ran out; cancelling it there')
+    refused = _cancel_remote(_call, task_id)
+    if refused:
+        # It ended while the cancel was on its way: one last look.
+        last = _call('message/get', {'taskId': task_id})
+        if last and last.get('state') and last['state'] not in _OPEN_TASK_STATES:
+            return last
     return None
 
 
 #: Task states in which a remote turn has not ended (A2A TaskState values).
 _OPEN_TASK_STATES = ('submitted', 'working')
 _POLL_INTERVAL_S = 0.25
+_POLL_INTERVAL_MAX_S = 2.0
 
 
-def _cancel_remote(call, task_id) -> None:
+def _cancel_remote(call, task_id) -> bool:
     """Best-effort task/cancel; the budget is spent, so it gets a short
-    timeout of its own through ``call``'s floor."""
+    timeout of its own through ``call``'s floor.  True when the peer REFUSED
+    it (the task had already ended), so the caller takes one last look."""
     try:
-        call('task/cancel', {'taskId': task_id})
+        out = call('task/cancel', {'taskId': task_id})
     except Exception as e:
         logger.info(f'peer_reuse: task/cancel {task_id} failed: {e}')
+        return False
+    return bool(out and isinstance(out.get('error'), dict))
 
 
 def _result_text(result: Optional[dict]) -> str:

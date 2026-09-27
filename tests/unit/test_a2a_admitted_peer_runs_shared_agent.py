@@ -956,3 +956,74 @@ def test_hart_a2a_send_refuses_a_url_that_names_no_agent(monkeypatch):
     out = _cli(monkeypatch, 'a2a', 'send', 'http://node-b:5000', 'x')
     assert out.exit_code != 0
     assert '/a2a/<agent_id>' in out.output, out.output
+
+
+# ── review of a4ea04651, finding 3: the invoker's poll ───────────────────
+
+def _scripted_peer(monkeypatch, replies):
+    """pooled_post answering each JSON-RPC method from ``replies`` (a dict
+    of method -> list of results, consumed in order)."""
+    calls = []
+
+    class _R:
+        status_code = 200
+
+        def __init__(self, body):
+            self._b = body
+
+        def json(self):
+            return self._b
+
+    def post(url, json=None, timeout=None, **kw):
+        m = json['method']
+        calls.append(m)
+        seq = replies[m]
+        if callable(seq):
+            res = seq(calls)
+        else:
+            res = seq.pop(0) if len(seq) > 1 else seq[0]
+        return _R({'jsonrpc': '2.0', 'id': json['id'], 'result': res})
+    monkeypatch.setattr(peer_reuse, 'pooled_post', post)
+    return calls
+
+
+def test_a_failed_task_is_returned_not_cancelled(monkeypatch):
+    calls = _scripted_peer(monkeypatch, {
+        'message/send': [{'id': 't1', 'state': 'working'}],
+        'message/get': [{'id': 't1', 'state': 'failed', 'error': 'boom'}],
+        'task/cancel': [{'success': True}]})
+    res = peer_reuse.invoke_peer_agent(PEER_URL, AGENT, 'x', timeout=5,
+                                       peer_node_id=SERVER_ID)
+    assert res == {'id': 't1', 'state': 'failed', 'error': 'boom'}, res
+    assert 'task/cancel' not in calls, calls
+
+
+def test_a_refused_cancel_gets_one_last_look(monkeypatch):
+    """The task finished while the cancel was on its way: the cancel is
+    refused, and the finished answer is still used."""
+    done = {'id': 't1', 'state': 'completed',
+            'content': {'parts': [{'text': 'late but done'}]}}
+    calls = _scripted_peer(monkeypatch, {
+        'message/send': [{'id': 't1', 'state': 'working'}],
+        'message/get': lambda calls: (done if 'task/cancel' in calls
+                                      else {'id': 't1', 'state': 'working'}),
+        'task/cancel': [{'error': {'code': -32600,
+                                   'message': 'Cannot cancel task in state completed'}}]})
+    monkeypatch.setattr(peer_reuse, '_POLL_INTERVAL_S', 0.05)
+    res = peer_reuse.invoke_peer_agent(PEER_URL, AGENT, 'x', timeout=0.6,
+                                       peer_node_id=SERVER_ID)
+    assert calls[-2:] == ['task/cancel', 'message/get'], calls
+    assert res == done, res
+
+
+def test_the_poll_backs_off(monkeypatch):
+    calls = _scripted_peer(monkeypatch, {
+        'message/send': [{'id': 't1', 'state': 'working'}],
+        'message/get': [{'id': 't1', 'state': 'working'}],
+        'task/cancel': [{'success': True}]})
+    started = time.monotonic()
+    assert peer_reuse.invoke_peer_agent(PEER_URL, AGENT, 'x', timeout=6,
+                                        peer_node_id=SERVER_ID) is None
+    assert time.monotonic() - started >= 5.5
+    assert calls.count('message/get') <= 8, calls
+    assert calls[-1] == 'task/cancel' or calls[-2] == 'task/cancel', calls

@@ -78,16 +78,14 @@ elif _DB_PATH_ENV == ':memory:':
     DB_URL = 'sqlite://'
 else:
     import sys as _sys_models
+    from core.platform_paths import get_db_path as _get_db_path
+    from core.platform_paths import under_test as _under_test
     if _DB_PATH_ENV:
         DB_PATH = _DB_PATH_ENV
     elif os.environ.get('NUNBA_BUNDLED') or getattr(_sys_models, 'frozen', False):
         # Bundled mode: cross-platform writable data dir
-        try:
-            from core.platform_paths import get_db_path as _get_db_path
-            DB_PATH = _get_db_path('hevolve_database.db')
-        except ImportError:
-            DB_PATH = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'hevolve_database.db')
-    elif 'pytest' in _sys_models.modules:
+        DB_PATH = _get_db_path('hevolve_database.db')
+    elif _under_test():
         # Under test with NOTHING configured. Do not fall through to the shared
         # agent_data database below: that file is real (tens of MB of dev state),
         # and a suite that writes it leaves state behind for the NEXT run. Two

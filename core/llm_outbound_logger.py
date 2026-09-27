@@ -299,14 +299,8 @@ def _get_source() -> str:
 
 
 def _get_log_path() -> str:
-    try:
-        from core.platform_paths import get_log_dir
-        return os.path.join(get_log_dir(), _LOG_FILENAME)
-    except Exception:
-        return os.path.join(
-            os.path.expanduser('~'), 'Documents', 'Nunba', 'logs',
-            _LOG_FILENAME,
-        )
+    from core.platform_paths import get_log_dir
+    return os.path.join(get_log_dir(), _LOG_FILENAME)
 
 
 # PERF-2 (audit): this writer reached ~196MB — unbounded append + buffering=1
@@ -825,6 +819,8 @@ def _truncate_msg_content(msg: dict, target_chars: int, marker: str,
         tail_chars = max(0, target_chars - head_chars)
     if head_chars + tail_chars >= len(text):
         return msg, 0  # nothing left to elide without cutting the head
+    if callable(marker):
+        marker = marker(text)  # a pointer to this text (see elided_pointer)
     new_text = _middle_cut(text, head_chars, tail_chars, marker)
     if isinstance(new_msg.get('content'), list):
         new_parts = []
@@ -842,6 +838,103 @@ def _truncate_msg_content(msg: dict, target_chars: int, marker: str,
     else:
         new_msg['content'] = new_text
     return new_msg, len(text) - len(new_text) + len(marker)
+
+
+# ─── Pointers to what the trim elides ───────────────────────────────────
+# Owner direction (2026-09-27): "tool results shd be saved with pointers and
+# whatever is trimmed needs pointers to memory"; "the pointer design shd be
+# explicitly understood by the LLM ... and a pointer shd not influence the
+# context".  Whatever the trim cuts out of a message, or drops as a tool
+# result, is saved whole in the agent-data store under the ``elided``
+# namespace (core.cache_loaders: the store behind get_data_by_key), and the
+# wire carries ``[elided:<id> <n> chars of <kind>]`` in its place.  The id is
+# the first 12 hex digits of the text's sha256, so the pointer stays well
+# inside the trim's 64-token floor.  ``get_data_by_key(key="elided:<id>")``
+# reads the original back a page at a time.  A pointer is metadata only: no
+# instruction, no summary.  What it is and how to expand it is said once, in
+# the system message of a body that carries one (ELIDED_POINTER_EXPLANATION).
+ELIDED_NAMESPACE = 'elided'
+ELIDED_KEY_PREFIX = 'elided:'
+_ELIDED_POINTER_RE = None  # compiled on first use
+_ELIDED_MAX_CHARS = 4_000_000   # the whole namespace; oldest entries go first
+_ELIDED_TTL_S = 24 * 3600       # a REUSE replay reads it within the day
+_elided_lock = threading.Lock()
+_ELIDED_KINDS = {'tool': 'a tool result', 'user': 'a user turn',
+                 'assistant': 'an assistant turn', 'system': 'the system prompt'}
+_ELIDED_LISTED_DROPS = 5        # dropped tool results named in the explanation
+
+ELIDED_POINTER_EXPLANATION = (
+    "\n\nSome messages below were shortened to fit. A mark like "
+    "[elided:ID N chars of KIND] stands where text was removed: the mark is "
+    "not the content and is not a result. Judge only what is shown. If you "
+    "need the removed text and can call tools, call get_data_by_key with "
+    "key=\"elided:ID\"; it returns the text a page at a time, and each page "
+    "names the offset of the next.")
+
+
+def elided_pointer(pointer_id: str, n_chars: int, kind: str) -> str:
+    """The ONE pointer format: ``[elided:<id> <n> chars of <kind>]``."""
+    return f'[{ELIDED_KEY_PREFIX}{pointer_id} {int(n_chars)} chars of {kind}]'
+
+
+def parse_elided_pointers(text: str) -> list:
+    """``[(pointer_id, n_chars, kind), ...]`` for every pointer in ``text`` --
+    the parser of :func:`elided_pointer`'s format, defined beside it."""
+    global _ELIDED_POINTER_RE
+    if _ELIDED_POINTER_RE is None:
+        import re as _re
+        _ELIDED_POINTER_RE = _re.compile(
+            r'\[' + _re.escape(ELIDED_KEY_PREFIX)
+            + r'([0-9a-f]{12}) (\d+) chars of ([a-z ]+)\]')
+    return [(m.group(1), int(m.group(2)), m.group(3))
+            for m in _ELIDED_POINTER_RE.finditer(str(text or ''))]
+
+
+def _elided_id(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(
+        text.encode('utf-8', 'surrogatepass')).hexdigest()[:12]
+
+
+def _save_elided(records: dict) -> bool:
+    """Merge ``records`` into the ``elided`` namespace and write it; prune
+    entries older than _ELIDED_TTL_S and, past _ELIDED_MAX_CHARS, the oldest.
+    Never raises; False when the store could not be written (the caller then
+    sends plain markers, never a pointer to nothing)."""
+    if not records:
+        return True
+    try:
+        from core.cache_loaders import load_agent_data, save_agent_data
+        with _elided_lock:
+            data = load_agent_data(ELIDED_NAMESPACE)
+            data = dict(data) if isinstance(data, dict) else {}
+            data.update(records)
+            now = time.time()
+            live = sorted(((k, v) for k, v in data.items()
+                           if isinstance(v, dict)
+                           and now - float(v.get('at') or 0) < _ELIDED_TTL_S),
+                          key=lambda kv: -float(kv[1].get('at') or 0))
+            kept, total = {}, 0
+            for k, v in live:
+                total += len(str(v.get('text') or ''))
+                if total > _ELIDED_MAX_CHARS and kept:
+                    break
+                kept[k] = v
+            return save_agent_data(ELIDED_NAMESPACE, kept)
+    except Exception as e:
+        logger.warning("wire-trim: could not save elided text: %s", e)
+        return False
+
+
+def read_elided(pointer_id: str):
+    """The original text a pointer names, or None when it is not stored."""
+    try:
+        from core.cache_loaders import load_agent_data
+        data = load_agent_data(ELIDED_NAMESPACE)
+        entry = (data or {}).get(str(pointer_id).strip()) if isinstance(data, dict) else None
+        return entry.get('text') if isinstance(entry, dict) else None
+    except Exception:
+        return None
 
 
 def _middle_cut(text: str, head_chars: int, tail_chars: int,
@@ -882,10 +975,11 @@ def _truncate_tool_call_arguments(msg: dict, target_chars: int,
             new_calls.append(tc)
             continue
         tail_chars = share // 2
-        cut = _middle_cut(args, share - tail_chars, tail_chars, marker)
+        mark = marker(args) if callable(marker) else marker
+        cut = _middle_cut(args, share - tail_chars, tail_chars, mark)
         new_calls.append({**tc, 'function': {
             **fn, 'arguments': json.dumps({'trimmed_arguments': cut})}})
-        n_cut += len(args) - len(cut) + len(marker)
+        n_cut += len(args) - len(cut) + len(mark)
     if not n_cut:
         return msg, 0
     return {**msg, 'tool_calls': new_calls}, n_cut
@@ -936,7 +1030,28 @@ def ensure_user_turn(messages: list) -> bool:
                 and messages[0].get('role') == 'system') else 0
     messages.insert(idx, {'role': 'user', 'name': 'User',
                           'content': WIRE_USER_SEED_TEXT})
+    # A last-resort guard, not a path: since the seats' limiters put the
+    # task turn back (protected_messages), a body without a user turn means
+    # it was lost upstream.  Loud and counted, so it is seen, not absorbed.
+    global _user_seed_count
+    with _user_seed_lock:
+        _user_seed_count += 1
+        n = _user_seed_count
+    logger.warning(
+        "wire-trim: seeded a user turn (WIRE_USER_SEED_TEXT) into a body with "
+        "none -- the real task turn was lost before the wire (seed #%d this "
+        "process); roles=%s", n,
+        [m.get('role') for m in messages if isinstance(m, dict)][:12])
     return True
+
+
+_user_seed_count = 0
+_user_seed_lock = threading.Lock()
+
+
+def user_seed_count() -> int:
+    """How many bodies ensure_user_turn had to seed in this process."""
+    return _user_seed_count
 
 
 def _task_turn(messages: list):
@@ -1027,7 +1142,39 @@ def _drop_units(messages: list) -> dict:
     return units
 
 
-def _trim_to_budget(body: dict) -> tuple:
+def _strip_pointers(msg: dict) -> dict:
+    """``msg`` with every pointer removed (the plain WIRE_TRIM_MARKER stays),
+    for a body whose elided text could not be saved."""
+    import re as _re
+    pat = _re.compile(r'\[' + _re.escape(ELIDED_KEY_PREFIX)
+                      + r'[0-9a-f]{12} \d+ chars of [a-z ]+\]' + '\n?')
+    out = dict(msg)
+    if isinstance(out.get('content'), str):
+        out['content'] = pat.sub('', out['content'])
+    elif isinstance(out.get('content'), list):
+        out['content'] = [{**p, 'text': pat.sub('', p['text'])}
+                          if isinstance(p, dict) and isinstance(p.get('text'), str)
+                          else p for p in out['content']]
+    if out.get('tool_calls'):
+        calls = []
+        for tc in out['tool_calls']:
+            fn = tc.get('function') if isinstance(tc, dict) else None
+            if isinstance(fn, dict) and isinstance(fn.get('arguments'), str):
+                try:
+                    obj = json.loads(fn['arguments'])
+                    if isinstance(obj, dict) and isinstance(
+                            obj.get('trimmed_arguments'), str):
+                        obj['trimmed_arguments'] = pat.sub(
+                            '', obj['trimmed_arguments'])
+                        tc = {**tc, 'function': {**fn, 'arguments': json.dumps(obj)}}
+                except ValueError:
+                    pass
+            calls.append(tc)
+        out['tool_calls'] = calls
+    return out
+
+
+def _trim_to_budget(body: dict, _reserve: int = 0) -> tuple:
     """Return ``(trimmed_body, n_dropped, n_truncated_chars, est_before,
     est_after, budget)``.
 
@@ -1095,6 +1242,7 @@ def _trim_to_budget(body: dict) -> tuple:
         logger.info(
             "wire-trim: seeded one user turn (body had no role='user' — would "
             "trip llama-server's Qwen3 'No user query found in messages' 500).")
+    _entry_body = body  # for the one re-run with a reserve (see below)
 
     model = body.get('model') or None
     max_tokens = int(body.get('max_tokens') or body.get('max_completion_tokens') or 2048)
@@ -1159,6 +1307,30 @@ def _trim_to_budget(body: dict) -> tuple:
     if est_before <= budget:
         return body, 0, 0, est_before, est_before, budget
 
+    # What a trim that elides adds -- the pointer explanation in the system
+    # message and the dropped results it names -- is only known once the
+    # trim has run.  So the trim runs aiming at the full budget and, when
+    # those additions then push it over, once more with exactly that much
+    # reserved (``_reserve``; see the end of this function).  A cut's own
+    # pointer is reserved in ``marker_tokens`` below.  The budget RETURNED
+    # is always the full one.
+    _sample_pointer = elided_pointer('0' * 12, 10 ** 6, 'an assistant turn')
+    _pointer_tokens = count_tokens_for_text(_sample_pointer + '\n', model)
+    full_budget = budget
+    budget = max(1, budget - int(_reserve))
+    elided = {}          # pointer_id -> record, saved once at the end
+    dropped_pointers = []
+
+    def _remember(text, kind):
+        pid = _elided_id(text)
+        elided[pid] = {'text': text, 'kind': kind, 'at': time.time(),
+                       'request_id': _get_request_id()}
+        return elided_pointer(pid, len(text), kind)
+
+    def _marker_for(msg):
+        kind = _ELIDED_KINDS.get(msg.get('role'), 'a message')
+        return lambda text: (WIRE_TRIM_MARKER + _remember(text, kind) + '\n')
+
     has_system = bool(messages and isinstance(messages[0], dict)
                       and messages[0].get('role') == 'system')
     # Never dropped: the newest user message, the task turn and the newest
@@ -1187,6 +1359,11 @@ def _trim_to_budget(body: dict) -> tuple:
             break
         messages[:] = [m for m in messages if not any(m is d for d in drop)]
         n_dropped += len(drop)
+        for d in drop:
+            if isinstance(d, dict) and d.get('role') == 'tool':
+                d_text = _content_to_text(d.get('content'))
+                if d_text:
+                    dropped_pointers.append(_remember(d_text, 'a tool result'))
         if count_tokens_for_messages(messages, model) <= budget:
             break
 
@@ -1196,7 +1373,8 @@ def _trim_to_budget(body: dict) -> tuple:
     # reserved, so the cut message exceeded budget by the marker length
     # (~7 tokens) and the wire request still tickled n_ctx.
     _TOKENS_PER_MSG = 4  # OpenAI envelope overhead per message
-    marker_tokens = count_tokens_for_text(WIRE_TRIM_MARKER, model)
+    marker_tokens = (count_tokens_for_text(WIRE_TRIM_MARKER, model)
+                     + _pointer_tokens)
 
     n_truncated_chars = 0
 
@@ -1283,11 +1461,12 @@ def _trim_to_budget(body: dict) -> tuple:
                 for tc in p['tool_calls'] if isinstance(tc, dict))
             new_p, n_cut = _truncate_tool_call_arguments(
                 p, _chars_for_tokens(args_text, room_for_p, model),
-                WIRE_TRIM_MARKER)
+                lambda t: (WIRE_TRIM_MARKER
+                           + _remember(t, 'tool call arguments') + '\n'))
         else:
             target_chars = _chars_for_tokens(p_text, room_for_p, model)
             new_p, n_cut = _truncate_msg_content(
-                p, target_chars, WIRE_TRIM_MARKER, _content_to_text)
+                p, target_chars, _marker_for(p), _content_to_text)
         if n_cut:
             n_truncated_chars += n_cut
             messages[p_idx] = new_p
@@ -1311,10 +1490,41 @@ def _trim_to_budget(body: dict) -> tuple:
             _content_to_text(messages[0].get('content')), room_for_system,
             model)
         new_sys, n_cut = _truncate_msg_content(
-            messages[0], target_chars, WIRE_TRIM_MARKER, _content_to_text)
+            messages[0], target_chars, _marker_for(messages[0]),
+            _content_to_text)
         if n_cut:
             n_truncated_chars += n_cut
             messages[0] = new_sys
+
+    # ─── Pointers: save what was elided, then explain them -- or, when the
+    # store cannot be written, send plain markers (never a pointer to
+    # nothing).  A pointer that ended up cut out of a message is not saved.
+    budget = full_budget
+    sent = '\n'.join(_content_to_text(m.get('content')) + json.dumps(
+        m.get('tool_calls') or '', ensure_ascii=False) for m in messages)
+    listed = dropped_pointers[-_ELIDED_LISTED_DROPS:]
+    live = {pid: rec for pid, rec in elided.items()
+            if pid in sent or any(pid in lp for lp in listed)}
+    if live and not _reserve:
+        _added = count_tokens_for_text(
+            ELIDED_POINTER_EXPLANATION + ' Removed earlier: '
+            + ' '.join(listed) + '.', model)
+        if count_tokens_for_messages(messages, model) + _added > full_budget:
+            return _trim_to_budget(_entry_body, _reserve=_added)
+    if live and _save_elided(live):
+        explanation = ELIDED_POINTER_EXPLANATION
+        if listed:
+            explanation += (' Removed earlier: ' + ' '.join(listed) + '.')
+        if has_system:
+            head = dict(messages[0])
+            head['content'] = (_content_to_text(head.get('content'))
+                               + explanation)
+            messages[0] = head
+        else:
+            messages.insert(0, {'role': 'system',
+                                'content': explanation.strip()})
+    elif live:
+        messages[:] = [_strip_pointers(m) for m in messages]
 
     # ─── Post-trim acceptance test — the trim is best-effort, so CHECK it ───
     # Trimming can be structurally unable to reach the budget: every message
