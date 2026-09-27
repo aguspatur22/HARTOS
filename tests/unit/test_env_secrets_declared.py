@@ -227,3 +227,54 @@ def test_source_guard_no_name_is_both_delivered_and_not_from_vault():
             if reads_from_env(name):
                 both.append(f'{rel} {name}')
     assert both == []
+
+
+# ── Node secrets: the node's own vault may set them, a card never ──────
+
+NODE = ('SOCIAL_SECRET_KEY', 'SOCIAL_DB_KEY', 'DATABASE_URL', 'REDIS_URL')
+
+
+@pytest.mark.parametrize('name', NODE)
+def test_a_node_secret_is_never_an_owner_entered_credential(name):
+    """Review follow-up: SOCIAL_SECRET_KEY signs every JWT, SOCIAL_DB_KEY
+    and DATABASE_URL point the node at its data.  A value from the consent
+    card or an agent must never set them, held or not."""
+    from hartos.ai_key_vault import is_node_secret, reads_from_env
+    assert reads_from_env(name) is False
+    assert is_node_secret(name) is True
+
+
+def test_an_owner_credential_is_not_a_node_secret():
+    from hartos.ai_key_vault import is_node_secret
+    assert is_node_secret('NEWS_API_KEY') is False
+    assert is_node_secret('SITE_PASSWORD') is False
+
+
+# ── The deliverable names come from a manifest, not from importing ─────
+
+def test_the_manifest_is_current():
+    """reads_from_env reads hartos.env_secrets_manifest.DELIVERABLE, so the
+    first call on Nunba's boot path imports no adapter.  The manifest is
+    generated from the declarations; this fails when it is stale.
+    Regenerate: python -m hartos.env_secrets_manifest"""
+    from hartos import env_secrets_manifest as m
+    assert m.DELIVERABLE == m.collect(), (
+        'stale: run python -m hartos.env_secrets_manifest; '
+        f'missing {sorted(m.collect() - m.DELIVERABLE)}, '
+        f'extra {sorted(m.DELIVERABLE - m.collect())}')
+
+
+def test_reads_from_env_imports_no_adapter():
+    """Measured before: the first reads_from_env imported 30 adapters and 13
+    modules, about 6 s on the boot path."""
+    import subprocess
+    code = ("import sys; sys.path.insert(0, '.')\n"
+            "from hartos.ai_key_vault import reads_from_env\n"
+            "reads_from_env('NEWS_API_KEY'); reads_from_env('TWITCH_CLIENT_SECRET')\n"
+            "bad = [m for m in sys.modules if m.startswith('integrations.channels')"
+            " or m == 'integrations.service_tools.gh_pr_tool']\n"
+            "print(','.join(sorted(bad)))\n")
+    out = subprocess.run([sys.executable, '-c', code], cwd=ROOT, capture_output=True,
+                         text=True, timeout=300)
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.strip() == '', out.stdout

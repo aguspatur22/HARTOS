@@ -53,6 +53,18 @@ SECRET_KEYS = [
     'ANTHROPIC_API_KEY',
 ]
 
+# The node's own secrets and connection strings in SECRET_KEYS: its JWT
+# signing key, its database key and where its data lives.  Only the node's
+# own vault (hartos.ai_key_vault.AIKeyVault.preload_env) may put them in the
+# environment; a consent-card or agent-supplied value never sets them, held
+# or not (hartos.ai_key_vault.is_node_secret).
+NODE_SECRET_KEYS = (
+    'SOCIAL_SECRET_KEY',
+    'SOCIAL_DB_KEY',
+    'DATABASE_URL',
+    'REDIS_URL',
+)
+
 
 class SecretsManager:
     """Thread-safe singleton for encrypted secret access."""

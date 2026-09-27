@@ -4359,6 +4359,18 @@ def tool_argument_error(func, func_name, arguments, repaired):
     blank string json_repair filled in) is refused the same way.
     """
     import inspect
+    if not isinstance(arguments, dict):
+        # One JSON object of named values, or not run -- the rule the history
+        # guard (ensure_tool_call_arguments_json) applies to the same call.
+        # The executor used to run '[1, 2]' positionally and '"hello"' as one
+        # argument while the guard rewrote the call in the history to the
+        # refused stand-in ("the call was not run"); the two now agree
+        # (coordinator's default, review of dbfef4360).  Measured before:
+        # all 854 tool calls models made in llm_outbound.jsonl + .old carry
+        # an object.
+        return (f"Error: {func_name} was not run: its arguments were not one "
+                f"JSON object of named values. Call {func_name} again with "
+                f"one JSON object using its parameter names.")
     args, kwargs = tool_call_shape(arguments)
     if REFUSED_ARGUMENTS_KEY in kwargs:
         # A refused call's stand-in (refused_arguments_json) is never run,

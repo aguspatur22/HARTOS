@@ -674,3 +674,42 @@ def test_the_autogen_request_resource_tool_files_the_same_ask(world):
     assert 'RESOURCE_REQUEST' not in out
     # The machine's owner is asked, not the remote caller.
     assert _asks() == [('credential', 'secret:SITE_PASSWORD', '42', False)]
+
+
+# ── Node secrets never come from a card or an agent ────────────────────
+
+@pytest.mark.parametrize('name', ['SOCIAL_SECRET_KEY', 'SOCIAL_DB_KEY'])
+def test_a_node_secret_is_never_asked_for_on_the_card(world, monkeypatch, name):
+    """Even when the process does not hold it yet: answered as any name is,
+    with no card."""
+    from hartos.ai_key_vault import request_credential
+    monkeypatch.delenv(name, raising=False)
+    out = request_credential('{"key_name": "%s", "label": "x"}' % name, agent_id='42')
+    assert 'Asked the owner' in out
+    assert [t for t, _ in world if t == 'consent.request'] == []
+    assert [a for a in _asks() if a[1] == 'secret:' + name] == []
+
+
+@pytest.mark.parametrize('name', ['SOCIAL_SECRET_KEY', 'SOCIAL_DB_KEY'])
+def test_store_credential_never_writes_a_node_secret(world, monkeypatch, name):
+    from hartos.ai_key_vault import get_ai_key_vault
+    monkeypatch.delenv(name, raising=False)
+    vault = get_ai_key_vault()
+    assert vault.store_credential(name, 'agent-supplied') == name
+    assert name not in os.environ
+    assert vault._secrets_manager()._cache.get(name) is None
+    assert name not in vault.owner_credential_names()
+    vault.hold_credential(name, 'agent-supplied')
+    assert vault.get_tool_key(name) == ''
+
+
+@pytest.mark.parametrize('name', ['SOCIAL_SECRET_KEY', 'SOCIAL_DB_KEY'])
+def test_the_nodes_own_vault_still_preloads_a_node_secret(world, monkeypatch, name):
+    from hartos.ai_key_vault import get_ai_key_vault
+    monkeypatch.delenv(name, raising=False)
+    vault = get_ai_key_vault()
+    vault._secrets_manager()._cache[name] = 'node-vault-value'
+    vault.preload_env()
+    assert os.environ[name] == 'node-vault-value'
+    monkeypatch.delenv(name, raising=False)
+

@@ -158,6 +158,20 @@ class TestFrozenBuild:
         assert venv_paths.venv_creator_python() == want
         assert venv_paths.python_embed_dir() == os.path.realpath(embed)
 
+    @pytest.mark.parametrize("posix_name", ["python3", "python"])
+    def test_a_posix_python_embed_is_found_in_bin(self, tmp_path, monkeypatch,
+                                                  posix_name):
+        # The macOS / Linux bundle lays python-embed out as bin/python3 (or
+        # bin/python), not python.exe.
+        app = tmp_path / "Nunba.app"
+        interp = app / "python-embed" / "bin" / posix_name
+        interp.parent.mkdir(parents=True)
+        interp.write_text("", encoding="utf-8")
+        (app / "Nunba").write_text("", encoding="utf-8")
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr(sys, "executable", str(app / "Nunba"))
+        assert venv_paths.venv_creator_python() == os.path.realpath(interp)
+
     def test_without_python_embed_there_is_no_creator_and_no_venv(
             self, frozen_app):
         app, embed = frozen_app

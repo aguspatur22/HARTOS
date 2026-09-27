@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import secrets
 from datetime import datetime, timedelta
 from typing import Any, Optional
@@ -197,6 +198,26 @@ def _flags(body: dict, defaults: dict[str, Optional[bool]]):
         else:
             return None, f'{key} must be true or false'
     return out, None
+
+
+def _number(body: dict, key: str, default, *, whole: bool = True,
+            nullable: bool = False):
+    """A numeric field from the body: (value, None) or (None, error).
+
+    A key the body does not name takes `default`; null is allowed only
+    when `nullable`.  A JSON bool, a string ('abc' or '3600'), a list or a
+    non-finite number is refused (int('abc') used to answer 500).  With
+    `whole`, only a JSON integer is accepted."""
+    if key not in body:
+        return default, None
+    raw = body[key]
+    if raw is None and nullable:
+        return None, None
+    kinds = (int,) if whole else (int, float)
+    if isinstance(raw, bool) or not isinstance(raw, kinds)             or not math.isfinite(raw):
+        return None, (f'{key} must be a whole number' if whole
+                      else f'{key} must be a number')
+    return raw, None
 
 
 def _new_id(prefix: str) -> str:
@@ -367,17 +388,26 @@ def set_discoverable():
     if uid is None:
         return _err('unauthenticated', 401)
     body = _json()
+    # enabled / age_claim_18 left out are a no (consent is never implied);
+    # face_visible and avatar_style left out keep what is stored, like
+    # vibe_tags below (a toggle used to reset them).
     flags, bad = _flags(body, {'enabled': False, 'age_claim_18': False,
-                               'face_visible': False})
+                               'face_visible': None})
     if bad:
         return _err(bad)
     enable = flags['enabled']
-    ttl = int(body.get('ttl_sec', ENCOUNTER_DISCOVERABLE_TTL_SEC))
+    ttl, bad = _number(body, 'ttl_sec', ENCOUNTER_DISCOVERABLE_TTL_SEC)
+    if bad:
+        return _err(bad)
     if ttl <= 0 or ttl > ENCOUNTER_DISCOVERABLE_TTL_SEC:
         ttl = ENCOUNTER_DISCOVERABLE_TTL_SEC
     age_claim = flags['age_claim_18']
     face_visible = flags['face_visible']
-    avatar_style = str(body.get('avatar_style', 'studio_ghibli'))[:64]
+    avatar_style = None
+    if 'avatar_style' in body:
+        avatar_style, bad = _text(body, 'avatar_style', 64)
+        if bad:
+            return _err(bad)
     # vibe_tags is also written by PUT /encounter/persona, so a toggle that
     # does not name them leaves the user's tags alone (it used to reset
     # them to []).
@@ -415,8 +445,10 @@ def set_discoverable():
     pref.enabled_at = now if enable else pref.enabled_at
     pref.expires_at = (now + timedelta(seconds=ttl)) if enable else None
     pref.age_claim_18 = age_claim
-    pref.face_visible = face_visible
-    pref.avatar_style = avatar_style
+    if face_visible is not None:
+        pref.face_visible = face_visible
+    if avatar_style is not None:
+        pref.avatar_style = avatar_style
     if vibe_tags is not None:
         pref.vibe_tags = vibe_tags
     pref.toggle_count_24h = (pref.toggle_count_24h or 0) + 1
@@ -517,10 +549,15 @@ def report_sighting():
         return _err('unauthenticated', 401)
     body = _json()
     peer_pubkey = str(body.get('peer_pubkey', '')).strip().lower()
-    rssi_peak = int(body.get('rssi_peak', 0))
-    dwell_sec = int(body.get('dwell_sec', 0))
-    lat = body.get('lat')
-    lng = body.get('lng')
+    nums = {}
+    for key, default, whole in (('rssi_peak', 0, True), ('dwell_sec', 0, True),
+                                ('lat', None, False), ('lng', None, False)):
+        nums[key], bad = _number(body, key, default, whole=whole,
+                                 nullable=not whole)
+        if bad:
+            return _err(bad)
+    rssi_peak, dwell_sec = nums['rssi_peak'], nums['dwell_sec']
+    lat, lng = nums['lat'], nums['lng']
     if not peer_pubkey or len(peer_pubkey) < 16:
         return _err('peer_pubkey required (hex, >=16 chars)')
 

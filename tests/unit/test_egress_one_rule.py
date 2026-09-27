@@ -670,3 +670,132 @@ def test_a_community_named_like_its_user_is_still_other_peoples(legs):
     uri, payload = legs.cb.published[0]
     assert uri == 'com.hertzai.hevolve.community.u1'
     assert json.loads(payload)['text'] == '[EMAIL_REDACTED]'
+
+
+# ── review of d89d50223 (egress half rejected) ────────────────────────────
+#
+# F1: the shape exemption let whole phone numbers / ips through as content
+#     ({'text': '4155550199'}) -- shapes exempt ONLY under identifier keys.
+# F2: identifier keys exempted any value ('ip': an email, 'commit': an
+#     email, 'home_address': a street) -- the value's shape is checked too.
+# F3: a secret-keyed value no pattern recognised went raw.
+# F4: a failed scrub on the bridge must withhold, never publish {}.
+# F5: EVERYONE-class topics became publishable by anyone.
+# F7: an undeclared com.hertzai.hevolve.<x> was user <x>'s (catch-all).
+
+@pytest.mark.parametrize('value', [
+    '4155550199', '+14155550199', '415.555.0199', '(415)555-0199',
+    '415-555-0199', '73.22.101.5', 'call:4155550199',
+    'user:john.doe@example.com', '4111111111111111',
+])
+def test_a_whole_token_of_personal_data_in_content_is_scrubbed(value):
+    from security.edge_privacy import scrub_for_egress
+    for payload in ({'text': value}, {'reply': [value]}, value):
+        out = json.dumps(scrub_for_egress(payload))
+        assert value not in out, (value, out)
+
+
+def test_identifier_keys_exempt_only_values_shaped_like_their_key():
+    from security.edge_privacy import scrub_for_egress
+    raw = {
+        'ip': 'jane@acme.io', 'lan_ip': 'call 4155550199',
+        'commit': 'jane@acme.io', 'build': 'my email is jane@acme.io',
+        'version': 'call 4155550199', 'host': 'john@example.com',
+        'status': 'jane@acme.io phone 4155550199',
+        'reply_to_address': 'jane@acme.io',
+        'home_address': '221B Baker Street', 'address': '1 Main St, Springfield',
+    }
+    blob = json.dumps(scrub_for_egress(raw))
+    for v in ('jane@acme.io', 'john@example.com', '4155550199',
+              '221B Baker Street', '1 Main St'):
+        assert v not in blob, v
+    shaped = {
+        'ip': '73.22.101.5', 'lan_ip': '192.168.1.42',
+        'peer_ip': 'fe80::1ff:fe23:4567:890a', 'address': '203.0.113.7:6777',
+        'commit': 'a4ea046510b898eb26d9337dd0e6b145be031a6f',
+        'build': '1.4.0.12', 'hart_version': '2026.9.27.1',
+        'guardrail_hash': 'c0ffee' * 10, 'checksum': 'sha256:' + 'bb' * 32,
+        'prompt_id': PROMPT_ID, 'request_id': PROMPT_ID, 'nonce': '4155550199',
+        'status': 'INITIALIZED', 'url': PEER_URL, 'hostname': 'msi-203-0-113-7',
+        'vram_bytes': '8589934592',
+    }
+    assert scrub_for_egress(shaped) == shaped
+
+
+def test_a_secret_keyed_value_no_pattern_knows_is_withheld():
+    """M6: secret-named keys win over identifier suffixes, and a value no
+    secret pattern recognises is withheld whole, not sent raw."""
+    from security.edge_privacy import scrub_for_egress
+    out = scrub_for_egress({
+        'api_key': 'AIzaSyShort123', 'auth_token': 'abc123def456',
+        'secret_hash': 'hunter2hunter2', 'session_token_id': '4155550199',
+        'password': 'correcthorse', 'token': 'none',
+    })
+    blob = json.dumps(out)
+    for v in ('AIzaSyShort123', 'abc123def456', 'hunter2hunter2',
+              '4155550199', 'correcthorse'):
+        assert v not in blob, v
+    assert out['token'] == 'none'          # a status word, not a secret
+
+
+def test_the_capability_advert_keeps_its_auth_token_for_peers():
+    """The one explicit exception: the gossip advert's auth_token is FOR
+    peers (they call the endpoint with it); it travels beside the signed
+    origin_attestation, and only there."""
+    from security.edge_privacy import scrub_for_egress
+    advert = {'peer_id': 'p1', 'endpoint': PEER_URL,
+              'auth_token': 'Zx9-token-abc123',
+              'origin_attestation': {'node_signature': 'ab' * 32}}
+    assert scrub_for_egress(advert) == advert
+    assert scrub_for_egress({'auth_token': 'Zx9-token-abc123'}) != {
+        'auth_token': 'Zx9-token-abc123'}
+
+
+def test_a_failed_scrub_on_the_bridge_publishes_nothing(legs):
+    """M4: a failed scrub is withheld; the bridge never publishes {}."""
+    with patch('security.edge_privacy.scrub_for_egress',
+               side_effect=RuntimeError('dlp broken')):
+        legs.ebus.emit('tts.speak', {'user_id': 'u-1', 'text': EMAIL})
+        legs.ebus.emit('theme.changed', {'theme': 'aurora'})
+    _drain(legs.loop)
+    assert legs.ebus_session.published == []
+
+
+def test_only_the_measured_server_broadcasts_are_publishable_without_a_user():
+    """F5: EVERYONE-class topics are subscribable by any signed-in user, but
+    the realtime publish gate takes only what server code publishes with no
+    user (measured publish_event callers): community.*, vote scores,
+    setup_progress, and the node-infra feeds that were public before."""
+    from integrations.social.realtime import _authorize_topic_for_user_id as pub
+    from integrations.social.tenant_acl import authorize_subscribe as sub
+    for topic in ('hive.x', 'public.x', 'federation.x', 'app.x',
+                  'resource.x'):
+        assert pub(topic, '') is False, topic
+        assert pub(topic, 'u-1') is False, topic
+        assert sub(topic, {'user_id': 'u-1'}) is True, topic
+        assert sub(topic, {}) is False, topic
+    for topic in ('community.feed', 'community.message', 'setup_progress',
+                  'social.post.p1.vote', 'system.health', 'model.loaded',
+                  'catalog.updated'):
+        assert pub(topic, '') is True, topic
+
+
+def test_an_undeclared_uri_under_the_catch_all_is_nobodys():
+    """F7: 'com.hertzai.hevolve.{user_id}' is the catch-all; a URI only it
+    matches is not attributed to a user, so it is scrubbed as shared."""
+    from security.edge_privacy import crossbar_uri_is_per_user as own
+    from security.edge_privacy import per_user_uri_owner
+    assert per_user_uri_owner('com.hertzai.hevolve.intermediate2') == ''
+    assert own('com.hertzai.hevolve.somethingnew', '') is False
+    assert own('com.hertzai.hevolve.somethingnew', 'somethingnew') is False
+    # declared, more specific templates still name their user
+    assert per_user_uri_owner('com.hertzai.hevolve.chat.u-1') == 'u-1'
+    assert per_user_uri_owner('com.hertzai.hevolve.social.u-1') == 'u-1'
+
+
+def test_publish_async_scrubs_an_undeclared_catch_all_uri(legs):
+    client = _Client()
+    with _no_link_manager():
+        _publish_async(client)('com.hertzai.hevolve.somethingnew',
+                               {'text': f'mail {EMAIL}'})
+    assert json.loads(client.published[0][1])['text'] == 'mail [EMAIL_REDACTED]'

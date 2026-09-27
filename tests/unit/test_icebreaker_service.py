@@ -153,6 +153,24 @@ def test_peer_tags_unused_unless_peer_made_interests_discoverable(session):
     assert shared_ctx['peer_vibe_tags'] == ['hiking', 'secret_club']
 
 
+def test_viewer_own_tags_used_even_when_viewer_shares_nothing(session):
+    """The share flag gates what OTHERS see.  The viewer's own tags are
+    theirs, so their draft may anchor on them with their flag off."""
+    mid = _seed_match(session, user_a=1, user_b=2)
+    _seed_pref(session, user_id=1, vibe_tags=['sitar'],
+               interests_discoverable=False)
+    _seed_pref(session, user_id=2, vibe_tags=[])
+    seen = {}
+
+    def cb(ctx):
+        seen.update(ctx)
+        return ''
+
+    out = draft_icebreaker(mid, '1', session, llm_callback=cb)
+    assert seen['viewer_vibe_tags'] == ['sitar']
+    assert out['shared_tag'] == 'sitar'
+
+
 def test_neutral_template_when_no_tags(session):
     mid = _seed_match(session, user_a=1, user_b=2)
     _seed_pref(session, user_id=1, vibe_tags=[])

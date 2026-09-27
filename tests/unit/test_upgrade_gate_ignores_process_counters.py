@@ -73,6 +73,21 @@ def test_a_baseline_written_before_the_fix_does_not_block_either(registry):
     assert safe is True, reason
 
 
+def test_a_candidate_from_an_older_build_does_not_block_either(registry):
+    """A marked baseline against an unmarked candidate (a rollback to a build
+    from before the fix): the marker on either side takes the metric out."""
+    reg, snapshot, tmp = registry
+    snapshot('v2', **BUSY)
+    old_build = {'version': 'v1', 'benchmarks': {'world_model': {'metrics': {
+        'flush_rate': {'value': 1.0, 'direction': 'higher', 'unit': 'ratio'},
+        'correction_density': {'value': 0, 'direction': 'higher', 'unit': 'count'},
+        'hivemind_queries': {'value': 0, 'direction': 'higher', 'unit': 'count'},
+    }}}}
+    (tmp / 'v1.json').write_text(json.dumps(old_build))
+    safe, reason = reg.is_upgrade_safe('v2', 'v1')
+    assert safe is True, reason
+
+
 def test_the_counters_are_still_reported(registry):
     reg, snapshot, _ = registry
     snap = snapshot('v1', **BUSY)

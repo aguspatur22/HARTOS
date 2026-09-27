@@ -570,6 +570,118 @@ def test_tags_must_be_a_list_of_strings(client, route, tags):
     assert data['vibe_tags'] == ['chess']
 
 
+def _discoverable(client, uid):
+    return client.get('/api/social/encounter/discoverable',
+                      headers=_as_user(uid)).get_json()['data']
+
+
+def test_toggle_that_omits_enabled_turns_broadcast_off(client):
+    """Consent default: a body that does not say enabled is not a yes."""
+    client.post('/api/social/encounter/discoverable',
+                json={'enabled': True, 'age_claim_18': True},
+                headers=_as_user(70))
+    assert _discoverable(client, 70)['enabled'] is True
+    r = client.post('/api/social/encounter/discoverable',
+                    json={'age_claim_18': True}, headers=_as_user(70))
+    assert r.status_code == 200
+    assert _discoverable(client, 70)['enabled'] is False
+
+
+def test_face_visible_is_off_unless_the_user_says_so(client):
+    client.post('/api/social/encounter/discoverable',
+                json={'enabled': True, 'age_claim_18': True},
+                headers=_as_user(71))
+    assert _discoverable(client, 71)['face_visible'] is False
+    assert _discoverable(client, 71)['avatar_style'] == 'studio_ghibli'
+
+
+def test_toggle_keeps_stored_face_visible_and_avatar_style(client):
+    """Like vibe_tags: a toggle that does not name face_visible or
+    avatar_style leaves the stored values alone (it reset them)."""
+    client.post('/api/social/encounter/discoverable',
+                json={'enabled': True, 'age_claim_18': True,
+                      'face_visible': True, 'avatar_style': 'pixel'},
+                headers=_as_user(72))
+    client.post('/api/social/encounter/discoverable',
+                json={'enabled': False}, headers=_as_user(72))
+    state = _discoverable(client, 72)
+    assert state['face_visible'] is True
+    assert state['avatar_style'] == 'pixel'
+    # And naming them still changes them.
+    client.post('/api/social/encounter/discoverable',
+                json={'enabled': False, 'face_visible': False,
+                      'avatar_style': 'neon'}, headers=_as_user(72))
+    state = _discoverable(client, 72)
+    assert state['face_visible'] is False
+    assert state['avatar_style'] == 'neon'
+
+
+@pytest.mark.parametrize('raw', [None, 7, ['pixel'], {'a': 1}, True])
+def test_avatar_style_must_be_a_string(client, raw):
+    r = client.post('/api/social/encounter/discoverable',
+                    json={'enabled': False, 'avatar_style': raw},
+                    headers=_as_user(73))
+    assert r.status_code == 400
+    assert 'avatar_style' in r.get_json()['error']
+    assert _discoverable(client, 73)['toggle_count_24h'] == 0
+
+
+@pytest.mark.parametrize('raw', ['abc', '3600', None, True, 1.5, [], {}])
+def test_ttl_must_be_a_whole_number(client, raw):
+    """int('abc') raised a 500."""
+    r = client.post('/api/social/encounter/discoverable',
+                    json={'enabled': True, 'age_claim_18': True,
+                          'ttl_sec': raw}, headers=_as_user(74))
+    assert r.status_code == 400
+    assert 'ttl_sec' in r.get_json()['error']
+    assert _discoverable(client, 74)['enabled'] is False
+
+
+def test_ttl_whole_number_still_accepted(client):
+    r = client.post('/api/social/encounter/discoverable',
+                    json={'enabled': True, 'age_claim_18': True,
+                          'ttl_sec': 600}, headers=_as_user(75))
+    assert r.status_code == 200
+    assert 0 < r.get_json()['data']['remaining_sec'] <= 600
+
+
+@pytest.mark.parametrize('key,raw', [
+    ('rssi_peak', 'abc'), ('rssi_peak', None), ('rssi_peak', 1.5),
+    ('dwell_sec', 'x'), ('dwell_sec', True), ('dwell_sec', []),
+    ('lat', 'north'), ('lat', True), ('lng', {}), ('lng', 'x'),
+])
+def test_sighting_numbers_must_be_numbers(client, key, raw):
+    pk = 'dada' * 8
+    _make_discoverable(client, 76)
+    _register_pubkey(client, 76, pk)
+    body = {'peer_pubkey': pk, 'rssi_peak': -40, 'dwell_sec': 4,
+            'lat': 12.9, 'lng': 77.5, key: raw}
+    r = client.post('/api/social/encounter/sighting', json=body,
+                    headers=_as_user(77))
+    assert r.status_code == 400
+    assert key in r.get_json()['error']
+
+
+def test_sighting_numbers_accept_numbers_and_null_location(client):
+    pk = 'dbdb' * 8
+    _make_discoverable(client, 78)
+    _register_pubkey(client, 78, pk)
+    r = client.post('/api/social/encounter/sighting',
+                    json={'peer_pubkey': pk, 'rssi_peak': -40,
+                          'dwell_sec': 4, 'lat': None, 'lng': 77},
+                    headers=_as_user(79))
+    assert r.status_code == 200
+
+
+def test_owner_sees_own_tags_on_discoverable_get(client):
+    """The share flag gates what OTHERS see; the owner's own GET still
+    shows their tags with interests_discoverable off."""
+    client.put('/api/social/encounter/persona',
+               json={'vibe_tags': ['chess'], 'interests_discoverable': False},
+               headers=_as_user(80))
+    assert _discoverable(client, 80)['vibe_tags'] == ['chess']
+
+
 def test_source_guard_recognize_me_limit_is_the_constant():
     """DRY: the recognize_me column width in the local model and in the
     v59 DDL is ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS, not a second 280
