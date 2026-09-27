@@ -516,6 +516,19 @@ class GPUWorker:
             )
             return
 
+        # An engine declared to live in its OWN venv (tts_router
+        # install_target='venv') that ran on any other interpreter has no
+        # usable venv: none was built, or another interpreter built it and
+        # core.venv_paths refused it.  The engine is not installed, and a
+        # --target pip into the shared user site is the place its venv
+        # exists to keep it out of (measured 2026-09-25: f5_tts and TTS,
+        # both rc=1, then an agentic goal each).  Installing an engine is
+        # the owner's call: offer it through capability_setup, whose
+        # consent-gated work runs repair_backend_venv -> install_backend_full.
+        if self._engine_is_outside_its_venv():
+            self._offer_engine_setup(pkg)
+            return
+
         logger.warning(
             f"{self.name}: subprocess missing Python package '{pkg}' — "
             f"dispatching to error_advice + deterministic self-heal"
@@ -670,6 +683,58 @@ class GPUWorker:
             return False
         return (os.path.normcase(os.path.abspath(venv_py))
                 == os.path.normcase(os.path.abspath(self.python_exe)))
+
+    def _engine_is_outside_its_venv(self) -> bool:
+        """True when ``self.name`` is a TTS engine declared to run from its
+        own venv (``tts_router.ENGINE_REGISTRY[...].install_target ==
+        'venv'``) and this worker's interpreter is not that venv."""
+        try:
+            from integrations.channels.media.tts_router import ENGINE_REGISTRY
+            spec = ENGINE_REGISTRY.get(self.name)
+        except Exception as e:
+            logger.debug(f"{self.name}: engine spec lookup skipped: {e}")
+            return False
+        if getattr(spec, 'install_target', None) != 'venv':
+            return False
+        return not self._child_is_backend_venv()
+
+    def _offer_engine_setup(self, pkg: str) -> None:
+        """Say why this worker cannot run, and offer the engine's setup to
+        the owner once per worker (``capability_setup`` dedupes the card
+        across workers and turns)."""
+        if getattr(self, '_engine_setup_offered', False):
+            return
+        self._engine_setup_offered = True
+        logger.error(
+            f"{self.name}: worker ran on {self.python_exe}, not its own "
+            f"venv, and cannot import '{pkg}': the engine is not installed "
+            f"(no venv, or one another interpreter built).  No pip into the "
+            f"shared site; offering its setup to the owner"
+        )
+
+        def _offer():
+            try:
+                from integrations.agent_engine.capability_setup import (
+                    request_capability_setup,
+                )
+                outcome = request_capability_setup(
+                    f'tts:{self.name}',
+                    reason=(
+                        f"The {self.name} voice is not installed on this "
+                        f"computer, so it could not speak. Set it up? It "
+                        f"downloads and installs here; until then replies "
+                        f"use another voice."
+                    ),
+                    category='subprocess.tool_load',
+                    context={'backend': self.name, 'missing_package': pkg},
+                )
+                logger.info(f"{self.name}: setup offer: {outcome}")
+            except Exception as e:
+                logger.warning(f"{self.name}: setup could not be offered: {e}")
+
+        threading.Thread(
+            target=_offer, daemon=True, name=f"setup-offer-{self.name}",
+        ).start()
 
     def _user_site_packages_dir(self) -> Optional[str]:
         """Return the user-writable site-packages dir for runtime

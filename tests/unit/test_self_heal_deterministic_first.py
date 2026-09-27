@@ -40,8 +40,11 @@ class _SyncThread:
 
 
 def _make_worker():
+    # chatterbox_ml runs on python-embed (tts_router install_target='main'),
+    # so its heal goes to the user site.  An engine with its own venv takes
+    # the setup offer instead (tests at the end of this file).
     return gpu_worker.GPUWorker(
-        name='chatterbox_turbo',
+        name='chatterbox_ml',
         module='integrations.service_tools.gpu_worker',
     )
 
@@ -278,3 +281,116 @@ def test_the_heal_installs_the_distribution_nunbas_table_names(
 
     assert captured['args'][-1] == 'coqpit-config', captured['args']
     assert 'coqpit' not in captured['args']
+
+
+# ── 2026-09-28: an engine that lives in its own venv is never healed into ──
+# ── the shared user site; its setup is offered through the owner's consent ──
+#
+# Measured on the installed build (gui_app.log.4, 2026-09-25 16:48:30-46):
+# f5_tts is declared install_target='venv' (tts_router) but had no venv, so
+# the spawn fell back to python-embed, died with "No module named 'f5_tts'",
+# and the heal ran `pip install f5_tts --target ~/.nunba/site-packages` --
+# the shared site that engine's venv exists to keep it out of (rc=1), then
+# raised an agentic goal.  xtts_v2 did the same for 'TTS' (its venv was
+# built by another interpreter, so the spawn refused it).  The engine is not
+# installed; installing it is capability_setup's consent-gated path.
+
+def _offer_mock(monkeypatch):
+    offer = MagicMock(return_value='asked')
+    monkeypatch.setattr(
+        'integrations.agent_engine.capability_setup.request_capability_setup',
+        offer)
+    return offer
+
+
+@pytest.mark.parametrize('engine, missing', [
+    ('f5_tts', 'f5_tts'),      # no venv at all
+    ('xtts_v2', 'TTS'),        # venv refused (another interpreter built it)
+    ('kokoro', 'torch'),       # a transitive of the engine, same answer
+])
+def test_a_venv_engine_outside_its_venv_offers_setup_never_pips_the_user_site(
+        monkeypatch, he_mock, tmp_path, engine, missing):
+    monkeypatch.setattr('core.venv_paths.venv_python_if_exists',
+                        lambda backend: None)
+    run_mock = MagicMock(side_effect=_fake_run(0))
+    monkeypatch.setattr(gpu_worker.subprocess, 'run', run_mock)
+    offer = _offer_mock(monkeypatch)
+    w = gpu_worker.GPUWorker(name=engine,
+                             module='integrations.service_tools.gpu_worker')
+    stop_mock = MagicMock()
+    monkeypatch.setattr(w, 'stop', stop_mock)
+    monkeypatch.setattr(w, '_user_site_packages_dir',
+                        lambda: str(tmp_path / 'usersite'))
+
+    w._maybe_self_heal_from_line(
+        f"ModuleNotFoundError: No module named '{missing}'")
+
+    run_mock.assert_not_called()          # nothing pip'd anywhere
+    he_mock.assert_not_called()           # no "pip failed" agentic goal
+    stop_mock.assert_not_called()
+    offer.assert_called_once()
+    args, kwargs = offer.call_args
+    assert args == (f'tts:{engine}',)
+    assert kwargs['category'] == 'subprocess.tool_load'
+    assert kwargs['context']['backend'] == engine
+    assert kwargs['context']['missing_package'] == missing
+    assert kwargs['reason'].strip()
+
+
+def test_a_venv_engine_offer_is_made_once_per_worker(monkeypatch, he_mock):
+    monkeypatch.setattr('core.venv_paths.venv_python_if_exists',
+                        lambda backend: None)
+    monkeypatch.setattr(gpu_worker.subprocess, 'run',
+                        MagicMock(side_effect=_fake_run(0)))
+    offer = _offer_mock(monkeypatch)
+    w = gpu_worker.GPUWorker(name='f5_tts',
+                             module='integrations.service_tools.gpu_worker')
+    monkeypatch.setattr(w, 'stop', MagicMock())
+
+    w._maybe_self_heal_from_line("ModuleNotFoundError: No module named 'torch'")
+    w._maybe_self_heal_from_line("ModuleNotFoundError: No module named 'f5_tts'")
+
+    assert offer.call_count == 1
+
+
+def test_a_venv_engine_in_its_own_venv_still_heals_into_that_venv(
+        monkeypatch, he_mock, tmp_path):
+    py = tmp_path / 'venvs' / 'f5_tts' / 'Scripts' / 'python.exe'
+    py.parent.mkdir(parents=True)
+    py.write_text('')
+    venv_py = str(py)
+    monkeypatch.setattr(
+        'core.venv_paths.venv_python_if_exists',
+        lambda backend: venv_py if backend == 'f5_tts' else None)
+    captured = _capture_pip(monkeypatch)
+    offer = _offer_mock(monkeypatch)
+    w = gpu_worker.GPUWorker(name='f5_tts',
+                             module='integrations.service_tools.gpu_worker',
+                             python_exe=venv_py)
+    monkeypatch.setattr(w, 'stop', MagicMock())
+
+    w._maybe_self_heal_from_line("ModuleNotFoundError: No module named 'vocos'")
+
+    assert captured['args'][0] == venv_py
+    assert '--target' not in captured['args']
+    offer.assert_not_called()
+
+
+def test_an_engine_installed_into_python_embed_still_heals_the_user_site(
+        monkeypatch, he_mock, tmp_path):
+    """chatterbox_ml is install_target='main': python-embed + the user site
+    IS where it lives, so the heal there is unchanged."""
+    monkeypatch.setattr('core.venv_paths.venv_python_if_exists',
+                        lambda backend: None)
+    captured = _capture_pip(monkeypatch)
+    offer = _offer_mock(monkeypatch)
+    w = gpu_worker.GPUWorker(name='chatterbox_ml',
+                             module='integrations.service_tools.gpu_worker')
+    monkeypatch.setattr(w, 'stop', MagicMock())
+    user_site = str(tmp_path / 'usersite')
+    monkeypatch.setattr(w, '_user_site_packages_dir', lambda: user_site)
+
+    w._maybe_self_heal_from_line(_MODNOTFOUND_LINE)
+
+    assert captured['args'][captured['args'].index('--target') + 1] == user_site
+    offer.assert_not_called()
