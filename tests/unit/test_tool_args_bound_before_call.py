@@ -139,7 +139,8 @@ class SplitArgumentsAreNotCalled(_Base):
     def test_repaired_positional_empty_value_is_named_as_empty(self):
         # A repaired list binds positionally; its empty first value is
         # reported as left empty, not as missing (it was given).
-        ok, reply = self.run_sync('send_message_to_user', "['', 'a']")
+        # (json_repair drops a "" list item outright, so the blank is spaces.)
+        ok, reply = self.run_sync('send_message_to_user', '["  ", "a",]')
         self.assertEqual(self.calls, [])
         self._assert_json_refusal(ok, reply, ('text',))
         self.assertIn('Required argument(s) left empty: text', reply['content'])
