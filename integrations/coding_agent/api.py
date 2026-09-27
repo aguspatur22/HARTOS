@@ -96,8 +96,17 @@ def list_goals():
 @coding_agent_bp.route('/api/coding/goals/<goal_id>', methods=['GET'])
 @require_auth
 def get_goal(goal_id):
+    """One coding goal, to whoever dashboard_service.may_steer admits (its
+    owner, an admin, this machine for a goal no person owns); an unknown id
+    and someone else's goal answer the same 403.  Review of dc32b1146: this
+    served any signed-in user."""
     from .goal_manager import CodingGoalManager
+    from integrations.social.dashboard_service import goal_to_steer, steering_caller
 
+    _, refused = goal_to_steer(g.db, goal_id, 'read', steering_caller(),
+                               str(g.user.id), audit=False)
+    if refused:
+        return jsonify({'success': False, 'data': refused}), 403
     result = CodingGoalManager.get_goal(g.db, goal_id)
     return jsonify(result)
 

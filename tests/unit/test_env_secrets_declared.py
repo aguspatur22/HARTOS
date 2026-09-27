@@ -151,7 +151,9 @@ def test_every_channel_gets_its_webhook_secret_names():
 # ── Source guards: the declarations cannot drift ────────────────────────
 
 def test_source_guard_every_secret_env_read_is_declared():
-    from hartos.ai_key_vault import reads_from_env
+    """A node secret is declared by security.secrets_manager.NODE_SECRET_KEYS
+    (only the node's own vault preload sets it)."""
+    from hartos.ai_key_vault import is_node_secret, reads_from_env
     missing = []
     for rel in _files():
         if rel in EXEMPT:
@@ -166,7 +168,7 @@ def test_source_guard_every_secret_env_read_is_declared():
             if name is not None:
                 if not SECRETY.search(name.upper()):
                     continue
-                if reads_from_env(name) or name in not_from_vault:
+                if reads_from_env(name) or is_node_secret(name)                         or name in not_from_vault:
                     continue
                 missing.append(f'{rel}:{lineno} {name}')
             else:

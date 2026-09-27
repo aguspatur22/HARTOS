@@ -185,3 +185,148 @@ def test_in_a_turn_the_model_cannot_name_someone_else(db, registry, turn):
     assert json.loads(result['content'])['success'] is False
     db.expire_all()
     assert db.query(ExperimentVote).filter_by(experiment_id=e.id).count() == 0
+
+
+# ── Review of d99b1aa88: reach the tool from how people ask ───────────
+# It was attached only for the literal phrase "thought experiment", and in
+# CREATE only at agent build time.  Now a turn that pairs a vote word
+# (vote / voting / ballot) with an experiment word (experiment / proposal)
+# or an experiment id unlocks it, in the per-turn attach both CREATE and
+# REUSE run (core.agent_tool_menu.attach_for_turn).
+
+_EXP_ID = '3f2a9c1e-7b4d-4e2a-9c1e-7b4d4e2a9c1e'
+
+
+@pytest.mark.parametrize('turn_text', [
+    'cast your vote on experiment abc',
+    'please vote on the experiment about latency',
+    'Voting on proposal 12 closes tonight, add yours',
+    'ballot for the thought experiment',
+    f'vote 2 on {_EXP_ID}',
+    'Vote on the thought experiment about cache warmup',
+])
+def test_a_vote_on_an_experiment_unlocks_the_tool(turn_text):
+    from integrations.agent_engine.marketing_tools import detect_goal_tags
+    assert 'thought_experiment' in detect_goal_tags(turn_text)
+
+
+@pytest.mark.parametrize('turn_text', [
+    'vote for the best pizza place tonight',
+    'run an experiment on the cache and tell me the latency',
+    f'what is the status of {_EXP_ID}?',
+    'What is the weather in Chennai today?',
+    'the devotee was experimenting',   # no word starts with vote
+])
+def test_other_turns_do_not(turn_text):
+    from integrations.agent_engine.marketing_tools import detect_goal_tags
+    assert 'thought_experiment' not in detect_goal_tags(turn_text)
+
+
+def _agents_built_for(registry, goal_text):
+    """Agents as create/reuse build them: Tier-1 gate on the build-time goal,
+    register_dual, and the per-conversation ledger the turn attach reads."""
+    autogen = pytest.importorskip('autogen')
+    from core.agent_tools import register_dual
+    from integrations.agent_engine.marketing_tools import resolve_goal_tags
+    helper = autogen.ConversableAgent('helper', llm_config=_NO_CALL_LLM)
+    executor = autogen.ConversableAgent('executor', llm_config=False,
+                                        human_input_mode='NEVER')
+    tools = _gated_tools(registry, goal_text)
+    for name, fn in tools.items():
+        register_dual(helper, executor, fn, name, fn.__doc__ or name)
+    executor._hart_attached_tools = set(tools)
+    executor._hart_unlocked_tags = set(resolve_goal_tags(None, goal_text))
+    return helper, executor
+
+
+def _tool_reply(executor, helper, experiment_id, value=2):
+    """The executor answering a model's tool call through autogen's own
+    reply machinery (generate_reply -> tool-call reply -> the function)."""
+    return executor.generate_reply(messages=[{
+        'role': 'assistant', 'content': None,
+        'tool_calls': [{'id': 'call_1', 'type': 'function', 'function': {
+            'name': 'cast_experiment_vote',
+            'arguments': json.dumps({'experiment_id': experiment_id,
+                                     'vote_value': value})}}],
+    }], sender=helper)
+
+
+def test_a_later_turn_attaches_the_tool_the_build_goal_did_not(
+        db, registry, turn):
+    """An agent built for something else is asked, mid-conversation, to vote:
+    the turn attach gives it the tool before the model sees the turn."""
+    from core.agent_tool_menu import attach_for_turn
+    from integrations.agent_engine.thought_experiment_tools import (
+        ExperimentVoteTool)
+    from integrations.service_tools import registry as reg_mod
+
+    ExperimentVoteTool.register()
+    helper, executor = _agents_built_for(registry, 'summarise my inbox')
+    assert 'cast_experiment_vote' not in executor._hart_attached_tools
+
+    new, n = attach_for_turn('please vote on the experiment about latency',
+                             helper, executor, reg_mod.service_tool_registry)
+    assert 'thought_experiment' in new and n >= 1
+    assert 'cast_experiment_vote' in executor._hart_attached_tools
+    # Idempotent: the same turn again attaches nothing more.
+    assert attach_for_turn('vote on the experiment again', helper, executor,
+                           reg_mod.service_tool_registry) == ([], 0)
+
+    e = _experiment(db)
+    agent = _user(db, 'agent', owner_id=_user(db).id, agent_id='55503')
+    turn.set_prompt_id('55503')
+    reply = _tool_reply(executor, helper, e.id)
+    assert json.loads(reply['tool_responses'][0]['content'])['success'] is True
+    db.expire_all()
+    assert [(v.voter_id, v.voter_type) for v in
+            db.query(ExperimentVote).filter_by(experiment_id=e.id)] == [
+                (agent.id, 'agent')]
+
+
+def test_a_real_autogen_tool_call_runs_on_the_turns_thread(db, registry):
+    """Measured, not assumed: autogen executes the tool on the thread that
+    drives the reply, so it sees that thread's prompt_id.  A thread that
+    carries the agent's prompt_id votes as it; another thread with none is
+    refused."""
+    import threading
+    from integrations.agent_engine.thought_experiment_tools import (
+        ExperimentVoteTool)
+
+    ExperimentVoteTool.register()
+    helper, executor = _agents_built_for(registry, TURN)
+    e = _experiment(db)
+    agent = _user(db, 'agent', owner_id=_user(db).id, agent_id='55504')
+    out = {}
+
+    def _turn(key, prompt_id):
+        thread_local_data.set_prompt_id(prompt_id)
+        reply = _tool_reply(executor, helper, e.id)
+        out[key] = json.loads(reply['tool_responses'][0]['content'])
+
+    for key, pid in (('with', '55504'), ('without', None)):
+        t = threading.Thread(target=_turn, args=(key, pid))
+        t.start()
+        t.join(60)
+    assert out['with']['success'] is True, out
+    assert out['without']['success'] is False, out
+    db.expire_all()
+    assert [v.voter_id for v in
+            db.query(ExperimentVote).filter_by(experiment_id=e.id)] == [agent.id]
+
+
+def test_source_guard_create_and_reuse_turns_both_attach_per_turn():
+    """Wiring guard (the behaviour is pinned above on the shared helper):
+    CREATE's turn (get_response_group) and REUSE's (get_agent_response)
+    both call attach_for_turn, and both builders set the ledger it reads.
+    create/reuse cannot be imported in a bare pytest env."""
+    import ast
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+    for rel, turn_fn in (('hartos/create_recipe.py', 'get_response_group'),
+                         ('hartos/reuse_recipe.py', 'get_agent_response')):
+        src = open(os.path.join(root, rel), encoding='utf-8').read()
+        fn = next(n for n in ast.walk(ast.parse(src))
+                  if isinstance(n, ast.FunctionDef) and n.name == turn_fn)
+        calls = {c.func.id for c in ast.walk(fn)
+                 if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+        assert 'attach_for_turn' in calls, f'{rel}:{turn_fn}'
+        assert '_hart_unlocked_tags = set(goal_tags)' in src, rel

@@ -41,6 +41,8 @@ os.environ.setdefault('SOCIAL_DB_PATH', ':memory:')
 
 from hartos.lifecycle_hooks import register_groupchat_for_session  # noqa: E402
 from integrations.agent_engine.api import agent_engine_bp  # noqa: E402
+from integrations.coding_agent.api import coding_agent_bp  # noqa: E402
+from integrations.distributed_agent.api import distributed_agent_bp  # noqa: E402
 from integrations.social.api_dashboard import dashboard_bp  # noqa: E402
 from integrations.social.api_tracker import tracker_bp  # noqa: E402
 from integrations.social.models import AgentGoal, Base, User  # noqa: E402
@@ -74,6 +76,10 @@ ROUTES = {
         lambda gid, pid: ('post', f'/api/social/tracker/experiments/{pid}/inject', {'variable': 'v'}),
     ('POST', '/api/social/tracker/experiments/<post_id>/interview'):
         lambda gid, pid: ('post', f'/api/social/tracker/experiments/{pid}/interview', {'question': 'q'}),
+    ('GET', '/api/coding/goals/<goal_id>'):
+        lambda gid, pid: ('get', f'/api/coding/goals/{gid}', None),
+    ('GET', '/api/distributed/goals/<goal_id>/progress'):
+        lambda gid, pid: ('get', f'/api/distributed/goals/{gid}/progress', None),
     ('POST', '/api/social/tracker/dual-context'):
         lambda gid, pid: ('post', '/api/social/tracker/dual-context',
                           {'post_id': pid, 'contexts': [{'label': 'a'}, {'label': 'b'}]}),
@@ -104,6 +110,36 @@ TRACKER_NOT_AGENT = {
 _SESSIONS = []  # the module's sessionmaker, for _as (require_auth's g.db)
 
 
+# Goal routes that only an admin reaches at all (require_admin); an admin is
+# admitted by may_steer, so they are the rule's by construction.
+ADMIN_ONLY = {
+    ('PATCH', '/api/coding/goals/<goal_id>'),
+}
+
+# Parameterised rules on these blueprints whose parameter is NOT a goal (a
+# product, a patent, a ledger or distributed task, a speculation).  The
+# resolver sweep below still drives each one as a stranger, so a route
+# listed here that does reach a goal's content fails anyway.
+NOT_GOAL = {
+    ('GET', '/api/marketing/products/<product_id>'),
+    ('PUT', '/api/marketing/products/<product_id>'),
+    ('DELETE', '/api/marketing/products/<product_id>'),
+    ('GET', '/api/agent-engine/speculation/<speculation_id>'),
+    ('GET', '/api/agent-engine/ledger/tasks/<task_id>'),
+    ('GET', '/api/ip/patents/<patent_id>'),
+    ('PATCH', '/api/ip/patents/<patent_id>/status'),
+    ('POST', '/api/distributed/tasks/<task_id>/submit'),
+    ('POST', '/api/distributed/tasks/<task_id>/verify'),
+}
+
+BLUEPRINTS = (dashboard_bp, agent_engine_bp, tracker_bp, coding_agent_bp,
+              distributed_agent_bp)
+
+# What a goal's content reader returns in this suite.  A stranger's answer
+# from ANY route must never carry it.
+SECRET = 'GOAL-CONTENT-7f3a'
+
+
 @pytest.fixture(scope='module')
 def sf():
     eng = create_engine('sqlite://', connect_args={'check_same_thread': False},
@@ -122,17 +158,50 @@ def app(sf, monkeypatch, tmp_path):
     monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', 'owner-1')
     a = Flask(__name__)
     a.config['TESTING'] = True
-    for bp in (dashboard_bp, agent_engine_bp, tracker_bp):
+    for bp in BLUEPRINTS:
         a.register_blueprint(bp)
     chat = SimpleNamespace(status_code=200, json=lambda: {'response': 'ok'})
+    # The goal-content READERS every goal route resolves through, each
+    # answering SECRET; and the status WRITER, recorded.  The resolver sweep
+    # (test_no_route_gives_a_stranger_a_goals_content) keys on these, not on
+    # a parameter's name.
+    from integrations.agent_engine.goal_manager import GoalManager
+    real_status_write = GoalManager.update_goal_status
+    writes = []
+
+    def _recorded_write(db, goal_id, status):
+        writes.append((goal_id, status))
+        return real_status_write(db, goal_id, status)
+
+    coordinator = MagicMock()
+    # Plain values for the rest of the coordinator the routes call, so a
+    # route's jsonify never meets a MagicMock.
+    coordinator.submit_result.return_value = True
+    coordinator.verify_result.return_value = False
+    coordinator.claim_next_task.return_value = None
+    coordinator.create_baseline.return_value = 'snap-1'
+    coordinator.submit_goal.return_value = 'dist-new'
+    coordinator.get_goal_progress.side_effect = lambda gid: {
+        'goal_id': gid, 'context': {}, 'tasks': [SECRET]}
     with patch('integrations.social.models.get_db', side_effect=lambda: sf()), \
+         patch.object(GoalManager, 'get_goal', staticmethod(
+             lambda db, gid: {'success': True, 'goal': {'title': SECRET}})), \
+         patch.object(GoalManager, 'update_goal_status', staticmethod(_recorded_write)), \
+         patch('integrations.social.dashboard_service.DashboardService.get_agent_snapshot',
+               side_effect=lambda db, gid: {'agent': {'title': SECRET}}), \
+         patch('integrations.social.dashboard_service.DashboardService.get_agent_chat_tail',
+               side_effect=lambda gid, **kw: {'messages': [SECRET]}), \
+         patch('integrations.social.dashboard_service.get_a2a_graph',
+               side_effect=lambda gid, **kw: {'nodes': [SECRET]}), \
+         patch('integrations.distributed_agent.api._get_coordinator',
+               return_value=coordinator), \
          patch('security.immutable_audit_log.get_audit_log'), \
          patch('core.http_pool.pooled_post', return_value=chat) as posted, \
          patch('integrations.channels.memory.memory_graph.MemoryGraph') as graph, \
          patch('core.platform_paths.get_memory_graph_dir', return_value=str(tmp_path)), \
          patch('integrations.social.realtime.publish_event'):
         graph.return_value.register.return_value = 'm1'
-        a.chat_post, a.memory_graph = posted, graph
+        a.chat_post, a.memory_graph, a.writes = posted, graph, writes
         yield a
 
 
@@ -200,15 +269,27 @@ def _call(client, key, gid, pid, environ=None, headers=None):
 
 
 def _goal_scoped_rules(app):
+    """Every rule on BLUEPRINTS that takes a parameter (whatever it is
+    called: review of dc32b1146, a guard keyed on '<goal_id>' missed routes
+    whose parameter had another name), plus the tracker's."""
+    names = {bp.name for bp in BLUEPRINTS}
     out = set()
     for r in app.url_map.iter_rules():
+        if r.endpoint.split('.', 1)[0] not in names:
+            continue  # the test app's own /static
         methods = r.methods - {'HEAD', 'OPTIONS'}
         for m in methods:
-            key = (m, r.rule)
-            if ('<agent_id>' in r.rule or '<goal_id>' in r.rule
-                    or r.rule.startswith('/api/social/tracker/')):
-                out.add(key)
+            if '<' in r.rule or r.rule.startswith('/api/social/tracker/'):
+                out.add((m, r.rule))
     return out
+
+
+def _fill(rule, value):
+    """A concrete URL for ``rule`` with every parameter set to ``value``
+    (an int converter gets 1)."""
+    import re
+    url = re.sub(r'<int:[^>]+>', '1', rule)
+    return re.sub(r'<(?:[^:>]+:)?[^>]+>', value, url)
 
 
 # ── the vocabulary guard ────────────────────────────────────────────────
@@ -216,12 +297,13 @@ def _goal_scoped_rules(app):
 def test_every_goal_scoped_route_is_classified(app):
     rules = _goal_scoped_rules(app)
     assert rules, 'enumeration found nothing -- it is broken'
-    unclassified = rules - set(ROUTES) - TRACKER_NOT_AGENT
+    unclassified = rules - set(ROUTES) - TRACKER_NOT_AGENT - ADMIN_ONLY - NOT_GOAL
     assert not unclassified, (
         f'goal-scoped routes nobody decided about: {sorted(unclassified)}; '
-        'add each to ROUTES (it must ask may_steer) or, for a tracker route '
-        'that acts on a post and not its agent, to TRACKER_NOT_AGENT')
-    stale = (set(ROUTES) | TRACKER_NOT_AGENT) - rules
+        'add each to ROUTES (it must ask may_steer), ADMIN_ONLY, NOT_GOAL, or '
+        'for a tracker route that acts on a post and not its agent, '
+        'TRACKER_NOT_AGENT')
+    stale = (set(ROUTES) | TRACKER_NOT_AGENT | ADMIN_ONLY | NOT_GOAL) - rules
     assert not stale, f'classified routes that no longer exist: {sorted(stale)}'
 
 
@@ -337,3 +419,106 @@ def test_a_signed_in_caller_on_this_machine_steers_a_machine_goal(client, sf):
                          headers=TOKEN)
     assert r.status_code == 200, r.get_json()
     assert _status(sf, gid) == 'paused'
+
+
+# ── by resolver, not by name (review of dc32b1146) ──────────────────────
+
+def test_no_route_gives_a_stranger_a_goals_content(app, client, sf):
+    """Every parameterised rule on BLUEPRINTS, whatever its parameter is
+    called, driven as a signed-in stranger with every parameter set to a
+    real goal's id (which is also its post id): no answer carries what a goal
+    content reader returns, no status is written, nothing is injected."""
+    owner = _user(sf)
+    db = sf()
+    gid = uuid.uuid4().hex
+    db.add(AgentGoal(id=gid, owner_id=owner, goal_type='thought_experiment',
+                     title='secret title', prompt_id='4242', status='active',
+                     config_json={'post_id': gid}))
+    db.commit()
+    db.close()
+    leaked = []
+    with _as(_user(sf)):
+        for method, rule in sorted(_goal_scoped_rules(app)):
+            r = getattr(client, method.lower())(
+                _fill(rule, gid), json={}, headers=TOKEN, environ_base=REMOTE)
+            if SECRET in r.get_data(as_text=True):
+                leaked.append((method, rule, r.status_code))
+    assert not leaked, f'goal content reached a stranger: {leaked}'
+    assert app.writes == []
+    assert _status(sf, gid) == 'active'
+
+
+@pytest.mark.parametrize('key', sorted(k for k in ROUTES if k[0] == 'GET'),
+                         ids=lambda k: k[1])
+def test_the_owner_reads_through_the_spied_readers(client, sf, key):
+    """Control: the SECRET readers are the ones these routes use, so the
+    sweep above can see a leak."""
+    owner = _user(sf)
+    gid, pid, _ = _goal(sf, owner_id=owner)
+    with _as(owner):
+        r = _call(client, key, gid, pid, REMOTE, TOKEN)
+    assert r.status_code == 200, (key, r.get_json())
+    assert SECRET in r.get_data(as_text=True), key
+
+
+# ── a terminal goal stays terminal (review of dc32b1146) ────────────────
+
+@pytest.mark.parametrize('terminal', ['completed', 'failed', 'error', 'archived'])
+def test_a_finished_goal_cannot_be_paused_and_resumed_back_to_life(client, sf, terminal):
+    owner = _user(sf)
+    gid, pid, _ = _goal(sf, owner_id=owner, status=terminal)
+    with _as(owner):
+        paused = client.post(f'/api/social/dashboard/agents/{gid}/pause',
+                             headers=TOKEN, environ_base=REMOTE)
+        resumed = client.post(f'/api/social/dashboard/agents/{gid}/resume',
+                              headers=TOKEN, environ_base=REMOTE)
+    assert paused.status_code == 400, paused.get_json()
+    assert resumed.status_code == 400, resumed.get_json()
+    assert _status(sf, gid) == terminal
+
+
+def test_a_stalled_goal_is_not_paused_by_accident_of_its_label(client, sf):
+    """Only an active goal may be paused: the rule names the one status it
+    leaves, rather than the ones it may not."""
+    owner = _user(sf)
+    gid, pid, _ = _goal(sf, owner_id=owner, status='paused')
+    with _as(owner):
+        r = client.post(f'/api/social/dashboard/agents/{gid}/pause',
+                        headers=TOKEN, environ_base=REMOTE)
+    assert r.status_code == 400
+    assert _status(sf, gid) == 'paused'
+
+
+# ── the tracker never runs an agent as nobody (review of dc32b1146) ─────
+
+def test_interviewing_a_machine_goal_runs_it_as_the_caller(app, client, sf):
+    """A goal no person owns has no owner to run /chat as; it was posted
+    with user_id=None.  The caller this machine admitted asks, so the turn
+    is theirs."""
+    gid, pid, _ = _goal(sf, created_by='system_bootstrap')
+    me = _user(sf)
+    with _as(me):
+        r = client.post(f'/api/social/tracker/experiments/{pid}/interview',
+                        json={'question': 'why?'}, headers=TOKEN)
+    assert r.status_code == 200, r.get_json()
+    assert app.chat_post.call_args.kwargs['json']['user_id'] == me
+
+
+def test_distributed_progress_of_an_api_submitted_goal_is_its_submitters(
+        app, client, sf):
+    """A goal submitted to /api/distributed/goals has no AgentGoal row; the
+    coordinator's parent context names who submitted it."""
+    submitter = _user(sf)
+    from integrations.distributed_agent import api as dist_api
+    coord = dist_api._get_coordinator()
+    coord.get_goal_progress.side_effect = lambda gid: {
+        'goal_id': gid, 'context': {'user_id': submitter}, 'tasks': [SECRET]}
+    with _as(submitter):
+        mine = client.get('/api/distributed/goals/dist-1/progress',
+                          headers=TOKEN, environ_base=REMOTE)
+    with _as(_user(sf)):
+        theirs = client.get('/api/distributed/goals/dist-1/progress',
+                            headers=TOKEN, environ_base=REMOTE)
+    assert mine.status_code == 200 and SECRET in mine.get_data(as_text=True)
+    assert theirs.status_code == 403
+    assert SECRET not in theirs.get_data(as_text=True)

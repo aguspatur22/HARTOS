@@ -127,6 +127,12 @@ TOPIC_MAP = {
 #                  (core.constants.CHAT_TOPIC_NEW + '.' + user_id)
 #   vision      -- hart_intelligence_entry vision consent event
 #   channel.response -- integrations.channels.response.router
+# TOPIC_MAP topics whose {user_id} template covers a whole namespace
+# ('chat.general' -> 'com.hertzai.hevolve.{user_id}' also matches every
+# undeclared com.hertzai.hevolve.<x>).  Such a template attributes no URI to
+# a user; per_user_uri_owner skips it, so those URIs count as shared.
+CATCH_ALL_TOPICS = ('chat.general',)
+
 PER_USER_TOPICS_OUTSIDE_BUS = (
     'com.hertzai.hevolve.chat.new.{user_id}',
     'com.hertzai.hevolve.vision.{user_id}',

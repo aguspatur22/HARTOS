@@ -435,6 +435,11 @@ def submit_goal():
         return jsonify({'success': False, 'error': 'objective is required'}), 400
     if not tasks:
         return jsonify({'success': False, 'error': 'tasks list is required'}), 400
+    # Who submitted it: the goal's owner for /goals/<id>/progress (there is
+    # no AgentGoal row for an API-submitted goal).  The token's user, never
+    # a value the body chose.
+    context = dict(context or {})
+    context['user_id'] = str(g.user.id)
 
     # submit_goal refuses with an exception instead of answering with a goal
     # that is missing children: HiveDepthExceeded for a hop past the
@@ -468,12 +473,32 @@ def submit_goal():
 @distributed_agent_bp.route('/api/distributed/goals/<goal_id>/progress', methods=['GET'])
 @require_auth
 def goal_progress(goal_id):
-    """Get distributed progress for a goal."""
+    """Get distributed progress for a goal, to whoever may steer it.
+
+    The goal is the AgentGoal / CodingGoal with this id when there is one
+    (dispatch submits under the goal's own id), else the coordinator's goal,
+    owned by the ``user_id`` its context names (the submitter, stamped by
+    POST /goals; a peer's gossiped goal names none, so it is this machine's).
+    Judged by dashboard_service.may_steer; an unknown id and someone else's
+    goal answer the same 403.  Review of dc32b1146: any signed-in user read
+    any goal's tasks.
+    """
+    from types import SimpleNamespace
+    from integrations.social.dashboard_service import (
+        find_goal, goal_to_steer, steering_caller)
     coordinator = _get_coordinator()
     if not coordinator:
         return _no_coordinator()
 
     progress = coordinator.get_goal_progress(goal_id)
+    goal = find_goal(g.db, goal_id)
+    if goal is None and 'error' not in progress:
+        goal = SimpleNamespace(
+            owner_id=(progress.get('context') or {}).get('user_id'))
+    _, refused = goal_to_steer(g.db, goal_id, 'read', steering_caller(),
+                               str(g.user.id), goal=goal, audit=False)
+    if refused:
+        return jsonify({'success': False, 'data': refused}), 403
     return jsonify({'success': True, **progress})
 
 

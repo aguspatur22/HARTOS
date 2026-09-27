@@ -540,6 +540,11 @@ def _mentions(lower: str, keywords) -> bool:
     return False
 
 
+#: A thought experiment's id (uuid4, ThoughtExperimentService.create_experiment).
+_EXPERIMENT_ID_RE = re.compile(
+    r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b')
+
+
 def detect_goal_tags(prompt) -> list:
     """Detect goal type tags from a prompt for category-based tool loading.
 
@@ -686,10 +691,20 @@ def detect_goal_tags(prompt) -> list:
 
     # goal_manager maps 'thought_experiment' to its tool tag, which unlocks
     # the agent's own vote (thought_experiment_tools.ExperimentVoteTool).
+    # People ask to vote without the phrase "thought experiment" ("cast your
+    # vote on experiment abc", "vote on the proposal"), so a vote word paired
+    # with an experiment word, or with an experiment id (a UUID), counts too
+    # (review of d99b1aa88).  A vote word alone ("vote for the best pizza")
+    # and an experiment alone ("run an experiment") do not.
     thought_experiment_keywords = [
         'thought experiment', 'thought-experiment',
     ]
-    if _mentions(lower, thought_experiment_keywords):
+    vote_keywords = ['vote', 'voting', 'ballot']
+    experiment_keywords = ['experiment', 'proposal']
+    if (_mentions(lower, thought_experiment_keywords)
+            or (_mentions(lower, vote_keywords)
+                and (_mentions(lower, experiment_keywords)
+                     or _EXPERIMENT_ID_RE.search(lower)))):
         tags.append('thought_experiment')
 
     return tags

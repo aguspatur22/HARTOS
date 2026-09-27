@@ -192,14 +192,22 @@ class A2AMessageHandler:
         return task.executing or task.state in (TaskState.SUBMITTED,
                                                 TaskState.WORKING)
 
-    def _admission_refusal(self, caller) -> Optional[str]:
-        """The ONE bound on running turns: 'busy: ...' when this caller
+    def _admission_refusal_locked(self, caller, message_id) -> Optional[str]:
+        """The ONE bound on running turns, decided with _tasks_lock HELD so
+        the check and the insert are one step (concurrent sends cannot both
+        pass the last free place).  'busy: ...' when this caller
         (_OPEN_TASKS_PER_CALLER) or the node (_OPEN_TASKS_MAX) already holds
-        that many unfinished tasks, else None.  Finished tasks are evicted
-        by _prune; running ones only end."""
-        self._prune()
-        with self._tasks_lock:
-            running = [t for t in self.tasks.values() if self._running(t)]
+        that many executions, or when this caller already has a RUNNING task
+        under this messageId (review of f5c21ec2a: one id sent 20 times
+        replaced its own task each time, so the cap counted one task and all
+        20 turns shared one cancel binding); else None."""
+        running = [t for t in self.tasks.values() if self._running(t)]
+        same = self.tasks.get(message_id)
+        if same is not None and same.owner == caller and self._running(same):
+            logger.info(f"A2A: {caller!r} resent running messageId "
+                        f"{str(message_id)[:12]}; refused")
+            return (f"busy: task {message_id} of this caller is still "
+                    f"running; use a new messageId")
         mine = sum(1 for t in running if caller is not None and t.owner == caller)
         if caller is not None and mine >= _OPEN_TASKS_PER_CALLER:
             logger.info(f"A2A: {caller!r} holds {mine} unfinished tasks; busy")
@@ -246,20 +254,25 @@ class A2AMessageHandler:
             if part.get("kind", part.get("type")) == "text":
                 message_text += part.get("text", "")
 
-        busy = self._admission_refusal(caller)
-        if busy:
-            return {"error": {"code": -32000, "message": busy}}
-        # Create task, bound to the caller that was admitted for it.
+        # Create task, bound to the caller that was admitted for it.  The
+        # cap check and the insert are one step under the lock.
+        self._prune()
         task = A2ATask(task_id=message_id, message=message, context_id=context_id)
         task.owner = caller
         with self._tasks_lock:
+            busy = self._admission_refusal_locked(caller, message_id)
+            if busy:
+                return {"error": {"code": -32000, "message": busy}}
             existing = self.tasks.get(message_id)
             if existing is not None and existing.owner != caller:
                 # Another caller's messageId: never overwrite its task.
                 message_id = str(uuid.uuid4())
                 task.task_id = message_id
+            # Counted from here: a blocking send holds this request worker
+            # for its whole turn, a non-blocking one its thread.
+            task.executing = True
             self.tasks[message_id] = task
-        self._prune()
+        self._prune()   # the insert may have taken the table past _TASK_MAX
 
         # configuration.blocking (A2A MessageSendParams): false returns the
         # task now and runs it on a thread of its own; the caller polls
@@ -268,7 +281,6 @@ class A2AMessageHandler:
         # Review finding M2: a blocking send let a caller that timed out
         # leave a whole /chat turn running here, holding the one LLM permit.
         config = params.get("configuration") or {}
-        task.executing = True
         if isinstance(config, dict) and config.get("blocking") is False:
             threading.Thread(
                 target=lambda: run_async(self._run(task, message_text)),

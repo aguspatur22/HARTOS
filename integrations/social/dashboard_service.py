@@ -912,17 +912,25 @@ STEER_TARGET = {'pause': 'paused', 'resume': 'active', 'cancel': 'archived'}
 STATUS_VERB = {status: verb for verb, status in STEER_TARGET.items()}
 
 
+#: The status each verb may move a goal OUT of.  Named positively: pause
+#: leaves only an active goal, resume only a paused one, so a finished goal
+#: (completed / failed / error / archived) is never paused and then resumed
+#: back to life (review of dc32b1146: a denylist that named only 'archived'
+#: let pause-then-resume restart every other terminal status).  Cancel
+#: leaves anything not already archived.
+STEER_FROM = {'pause': frozenset({'active'}),
+              'resume': frozenset({'paused'})}
+
+
 def steer_transition(verb: str, prev_status: Optional[str]):
     """``(target_status, None)``, or ``(None, why)`` when ``verb`` may not
-    move a goal out of ``prev_status``.  Resume only from paused, so an
-    archived (cancelled) goal cannot be revived -- PATCH /api/goals/<id>/
-    status had no such rule (review of 924b8e9dc); nothing leaves archived.
+    move a goal out of ``prev_status`` (STEER_FROM).  Nothing leaves
+    archived; PATCH /api/goals/<id>/status goes through this too.
     """
     target = STEER_TARGET[verb]
-    if verb == 'resume' and prev_status != 'paused':
-        return None, f'resume requires paused, got {prev_status}'
-    if verb == 'pause' and prev_status == 'archived':
-        return None, 'an archived goal cannot be paused'
+    allowed = STEER_FROM.get(verb)
+    if allowed is not None and prev_status not in allowed:
+        return None, f'{verb} requires {"/".join(sorted(allowed))}, got {prev_status}'
     if verb == 'cancel' and prev_status == 'archived':
         return None, 'already archived'
     return target, None
@@ -1147,6 +1155,22 @@ STEER_REFUSED = 'agent not found, or not yours to steer'
 _LOOKUP = object()
 
 
+def find_goal(db, goal_id: str):
+    """The AgentGoal, else the CodingGoal, with this id; None when neither.
+    The ONE id -> goal lookup for the steering gate (without the CodingGoal
+    fallback the drawer's buttons 404 on every coding card)."""
+    from .models import AgentGoal
+    goal = db.query(AgentGoal).filter(AgentGoal.id == str(goal_id)).first()
+    if goal:
+        return goal
+    try:
+        from .models import CodingGoal
+        return db.query(CodingGoal).filter(CodingGoal.id == str(goal_id)).first()
+    except Exception:
+        logger.debug('CodingGoal lookup unavailable', exc_info=True)
+        return None
+
+
 def steering_caller() -> SteeringCaller:
     """Who is calling, for may_steer.  THE one reader of the request's
     identity for every route that acts on or reads one goal.
@@ -1211,15 +1235,7 @@ def goal_to_steer(db, agent_id: str, verb: str, caller: SteeringCaller,
     drawer's buttons 404 on every coding card).
     """
     if goal is _LOOKUP:
-        from .models import AgentGoal
-        goal = db.query(AgentGoal).filter(AgentGoal.id == str(agent_id)).first()
-        if not goal:
-            try:
-                from .models import CodingGoal
-                goal = db.query(CodingGoal).filter(
-                    CodingGoal.id == str(agent_id)).first()
-            except Exception:
-                logger.debug('CodingGoal lookup unavailable', exc_info=True)
+        goal = find_goal(db, agent_id)
     refusal = (may_steer(db, goal, caller) if goal
                else 'no goal with this id')
     if not refusal:

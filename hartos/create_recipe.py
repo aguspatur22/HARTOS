@@ -541,6 +541,11 @@ def send_message_to_user1(user_id, response, inp, prompt_id):
     (core.agent_tools) returns it to the model, so the model is told whether
     its message went out; the other callers here ignore it.
     """
+    # Text for the user: an elided-text pointer a model copied into its
+    # message never reaches them, on either branch below (owner ruling
+    # 2026-09-27; review of d99b1aa88: the central POST sent it).
+    from core.llm_outbound_logger import strip_elided_pointers
+    response = strip_elided_pointers(response)
     user_prompt = f'{user_id}_{prompt_id}'
     try:
         request_id = f'{request_id_list[user_prompt]}-intermediate'
@@ -1796,6 +1801,11 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         # Never-say-unavailable: always-on discovery that attaches gated-out
         # or newly-needed tools mid-conversation (owner req 2026-08-31).
         _attached_names = set(svc_tools)
+        # The ledger the per-turn attach reads (core.agent_tool_menu.
+        # attach_for_turn, called from get_response_group), as REUSE keeps
+        # it: CREATE used to attach only at build time, from the task.
+        assistant._hart_attached_tools = _attached_names
+        assistant._hart_unlocked_tags = set(goal_tags)
         from core.agent_tools import register_request_tools
         register_request_tools(helper, assistant, service_tool_registry,
                                _attached_names)
@@ -4377,6 +4387,23 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             except Exception:
                 message = ""
                 text = f'Properly Execute Action {user_tasks[user_prompt].current_action}: {message} '
+    # Tier-1 per-turn attach, the one REUSE's turn uses: a turn that drifts
+    # into a capability the build-time task never named (an agent asked to
+    # vote on an experiment) gets it before the model sees the turn.
+    try:
+        from core.agent_tool_menu import attach_for_turn
+        from integrations.service_tools import service_tool_registry
+        _new, _n = attach_for_turn(text, agents_object['helper'],
+                                   agents_object['assistant'],
+                                   service_tool_registry)
+        if _new:
+            current_app.logger.info(
+                f"Tier-1 turn attach: +{_new} -> {_n} tools")
+    except Exception as _e:
+        current_app.logger.warning(
+            f"turn attach skipped: {_e} for session: {user_prompt}",
+            exc_info=True)
+
     # Initiate or resume chat
     try:
         current_app.logger.info(f"Messages in user_prompt before init: {len(messages.get(user_prompt, []))}")

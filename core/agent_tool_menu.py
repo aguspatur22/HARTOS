@@ -829,6 +829,37 @@ def attach_for_tags(cap_tags, helper, executor, registry, attached_names):
     return n
 
 
+def attach_for_turn(message, helper, executor, registry):
+    """Tier-1 per-turn attach: the capability families THIS turn's words
+    unlock that the agents do not carry yet.  Returns (new_tags, n_attached).
+
+    ONE implementation for both pipelines' turn entry -- REUSE
+    get_agent_response and CREATE get_response_group -- so a conversation
+    that drifts into a capability its build-time goal never mentioned (an
+    agent asked mid-chat to vote on an experiment) gets that family before
+    the model sees the turn.  CREATE only attached at build time until the
+    review of d99b1aa88.  Reads the ledger the builder put on ``executor``
+    (``_hart_attached_tools``, ``_hart_unlocked_tags``); agents built
+    without one are left alone.  Idempotent: a tag already unlocked is
+    skipped and the ledger is updated in place.
+    """
+    unlocked = getattr(executor, '_hart_unlocked_tags', None)
+    attached = getattr(executor, '_hart_attached_tools', None)
+    if unlocked is None or attached is None:
+        return [], 0
+    from integrations.agent_engine.marketing_tools import detect_goal_tags
+    from integrations.agent_engine.goal_manager import get_tool_tags
+    new = [t for t in detect_goal_tags(message or '') if t not in unlocked]
+    if not new:
+        return [], 0
+    cap = set()
+    for t in new:
+        cap.update(get_tool_tags(t))
+    n = attach_for_tags(cap, helper, executor, registry, attached)
+    unlocked.update(new)
+    return new, n
+
+
 def attach_for_names(names, helper, executor, registry, attached_names,
                      core_tools=None):
     """Attach the tools a turn NAMES outright — registry AND core closures.

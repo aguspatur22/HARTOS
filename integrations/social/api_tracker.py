@@ -937,6 +937,15 @@ def interview_agent(post_id):
     goal, refused = _agent_for_post(post_id, 'interview')
     if refused:
         return refused
+    # Whose turn this is: the goal's owner; for a goal no person owns (the
+    # machine's, admitted only to this machine's callers) the caller who
+    # asked.  Never None (review of dc32b1146: an ownerless goal posted
+    # /chat with user_id=None).
+    from core.event_attribution import goal_owner_user_id
+    from .dashboard_service import steering_caller
+    run_as = goal_owner_user_id(goal) or steering_caller().user_id
+    if not run_as:
+        return _err('No user to run this interview as', 409)
 
     try:
         from core.http_pool import pooled_post
@@ -959,7 +968,7 @@ def interview_agent(post_id):
         # threads all interview turns about the same experiment
         # together for replay.
         resp = pooled_post(chat_url, json={
-            'user_id': goal.owner_id,
+            'user_id': run_as,
             'prompt_id': goal.prompt_id or 0,
             'prompt': interview_prompt,
             'channel_type': 'interview',

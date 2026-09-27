@@ -389,7 +389,9 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
                 from core.llama_scheduler import get_scheduler
                 get_scheduler().unbind_cancel(_bound)
             except Exception as e:
-                logger.debug(f"unbind_cancel({_bound}) failed: {e}")
+                # INFO: a binding left behind refuses every later call of
+                # that request id (review of f5c21ec2a).
+                logger.info(f"unbind_cancel({_bound}) failed: {e}")
         _local_llm_semaphore.release()
         try:
             _notify_watchdog_llm_end()

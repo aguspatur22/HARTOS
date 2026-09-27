@@ -917,18 +917,27 @@ def parse_elided_pointers(text: str) -> list:
             for m in _ELIDED_POINTER_RE.finditer(str(text or ''))]
 
 
-def strip_elided_pointers(text):
+def strip_elided_pointers(text, marker_line=False):
     """``text`` with every pointer removed, and the space it leaves closed.
 
-    For text that leaves for the USER (publish_agent_message, the /chat
-    reply): a model can copy a pointer from its context into its answer,
-    and a pointer is never an answer (owner ruling, 2026-09-27).  Non-text
-    is returned as it is."""
+    THE text-for-the-user step: every send of a model's text to a person
+    calls it -- both branches of CREATE's and REUSE's send_message_to_user1,
+    publish_agent_message, the /chat reply (_chat_reply), the hive expert's
+    publish and the channel router (tests/unit/
+    test_elided_pointer_never_reaches_the_user.py guards the list).  A model
+    can copy a pointer from its context into its answer, and a pointer is
+    never an answer (owner ruling, 2026-09-27).  Non-text is returned as it
+    is.
+
+    ``marker_line``: the wire's own use, where each pointer follows
+    WIRE_TRIM_MARKER on a line of its own; the line's newline goes with it,
+    so what is left is exactly the plain marker."""
     if not isinstance(text, str) or ELIDED_KEY_PREFIX not in text:
         return text
     import re as _re
     pat = _re.compile(r'[ \t]*\[' + _re.escape(ELIDED_KEY_PREFIX)
-                      + r'[0-9a-f]{12} \d+ chars of [a-z ]+\]')
+                      + r'[0-9a-f]{12} \d+ chars of [a-z ]+\]'
+                      + ('\n?' if marker_line else ''))
     return pat.sub('', text)
 
 
@@ -1285,7 +1294,8 @@ def _strip_pointers(msg: dict) -> dict:
     """``msg`` with every pointer removed (the plain WIRE_TRIM_MARKER stays),
     for a body whose elided text could not be saved."""
     # The one pointer format, removed by the one stripper.
-    sub = strip_elided_pointers
+    def sub(text):
+        return strip_elided_pointers(text, marker_line=True)
     out = dict(msg)
     if isinstance(out.get('content'), str):
         out['content'] = sub(out['content'])

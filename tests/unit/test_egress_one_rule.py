@@ -314,7 +314,8 @@ def test_the_ownership_rule_answers_for_concrete_uris():
     # 'com.hertzai.hevolve.{user_id}' would also match it
     assert own('com.hertzai.hevolve.confirmation', '') is False
     assert own('com.hertzai.hevolve.chat.new', '') is False
-    assert own('com.hertzai.hevolve.u9', 'u9') is True
+    # ...and the catch-all chat.general template attributes nobody
+    assert own('com.hertzai.hevolve.u9', 'u9') is False
 
 
 def test_a_one_person_event_bridges_only_onto_its_owners_uri(legs, monkeypatch):

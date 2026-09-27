@@ -569,6 +569,11 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
                 response = str(response)
         else:
             response = str(response)
+    # Text for the user: an elided-text pointer a model copied into its
+    # message never reaches them, on either branch below (owner ruling
+    # 2026-09-27; review of d99b1aa88: the central POST sent it).
+    from core.llm_outbound_logger import strip_elided_pointers
+    response = strip_elided_pointers(response)
 
     message_hash = get_message_hash(response, original_request_id)
     unique_message_key = f"{original_request_id}_{message_hash}"
@@ -5712,7 +5717,6 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         try:
             _unlocked = getattr(assistant, '_hart_unlocked_tags', None)
             if _unlocked is not None:
-                from integrations.agent_engine.marketing_tools import detect_goal_tags
                 from integrations.service_tools import service_tool_registry
 
                 # (a) NAMED — the tools this action's own recipe declares.
@@ -5751,18 +5755,11 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 # idempotent against the same _hart_attached_tools ledger, one
                 # selects by exact name and the other by capability tag, so the
                 # union is the same either way.
-                _new = [t for t in detect_goal_tags(message or '')
-                        if t not in _unlocked]
+                # The one per-turn attach, shared with CREATE's turn.
+                from core.agent_tool_menu import attach_for_turn
+                _new, _n = attach_for_turn(message, helper, assistant,
+                                           service_tool_registry)
                 if _new:
-                    from core.agent_tools import attach_for_tags
-                    from integrations.agent_engine.goal_manager import get_tool_tags
-                    _cap = set()
-                    for _t in _new:
-                        _cap.update(get_tool_tags(_t))
-                    _n = attach_for_tags(_cap, helper, assistant,
-                                         service_tool_registry,
-                                         assistant._hart_attached_tools)
-                    _unlocked.update(_new)
                     current_app.logger.info(
                         f"Tier-1 turn attach: +{_new} -> {_n} tools")
 

@@ -1027,7 +1027,11 @@ def test_the_poll_backs_off(monkeypatch):
                                         peer_node_id=SERVER_ID) is None
     # The whole budget is spent before the cancel: the last sleep is cut to
     # what is left, not skipped (a backed-off 2 s step would stop at ~5.8).
-    assert time.monotonic() - started >= 6.7
+    elapsed = time.monotonic() - started
+    assert elapsed >= 6.7
+    # ...and not overrun: the cancel goes out at the budget, not a backed-off
+    # step past it (mutant P2: the last sleep not cut to what is left).
+    assert elapsed <= 7.6, elapsed
     assert calls.count('message/get') <= 8, calls
     assert calls[-1] == 'task/cancel' or calls[-2] == 'task/cancel', calls
 
