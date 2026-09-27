@@ -95,9 +95,13 @@ def test_a_droppable_call_goes_with_all_of_its_results(monkeypatch):
     res_a = _result('a', 'A ' + 'x ' * 600)
     res_b = _result('b', 'B ' + 'y ' * 600)
     reply = {'role': 'assistant', 'content': 'both crawled'}
+    # A later call and result: the newest tool result is protected, so the
+    # pair under test must be an earlier one.
+    later_call, later_res = _call('c'), _result('c', 'C done')
     newest = {'role': 'user', 'name': 'User', 'content': 'now summarise'}
-    msgs = [_sys(), task, call, res_a, res_b, reply, newest]
-    keep = [_sys(), res_b, reply, newest]
+    msgs = [_sys(), task, call, res_a, res_b, reply, later_call, later_res,
+            newest]
+    keep = [_sys(), res_b, reply, later_call, later_res, newest]
     out, n_dropped, est_after, budget = _trim(
         msgs, _per_slot_fitting(keep), monkeypatch)
     assert call not in out and res_a not in out and res_b not in out, (
@@ -130,9 +134,10 @@ def test_a_result_with_no_announcing_call_is_still_droppable(monkeypatch):
     as before (the shape the older trim tests use)."""
     task = {'role': 'user', 'name': 'User', 'content': 'go'}
     stray = _result('never_announced', 'S ' + 's ' * 800)
+    call, res = _call('c9'), _result('c9', 'newest result')
     reply = {'role': 'assistant', 'content': 'done'}
-    msgs = [_sys(), task, stray, reply]
-    keep = [_sys(), task, reply]
+    msgs = [_sys(), task, stray, call, res, reply]
+    keep = [_sys(), task, call, res, reply]
     out, n_dropped, _, _ = _trim(msgs, _per_slot_fitting(keep), monkeypatch)
     assert stray not in out
     assert n_dropped == 1

@@ -64,9 +64,12 @@ def _trim_so_that_only(keep, messages, monkeypatch):
 def test_the_live_shape_keeps_the_users_text(monkeypatch):
     """[system, User task, assistant, tool, StatusVerifier verdict]."""
     sys_m, task, verdict = _sys(), _task(), _verdict()
-    msgs = [sys_m, task, _bulk('assistant', 'a1'), _bulk('tool', 't1'), verdict]
+    result = _bulk('tool', 't1')
+    msgs = [sys_m, task, _bulk('assistant', 'a1'), result, verdict]
+    # The newest tool result is protected too (owner decision 2026-09-26,
+    # test_wire_trim_protects_the_newest_tool_result.py), so it is kept.
     out, est_after, budget = _trim_so_that_only(
-        [sys_m, task, verdict], msgs, monkeypatch)
+        [sys_m, task, result, verdict], msgs, monkeypatch)
     contents = [m.get('content') for m in out]
     assert _TASK in contents, (
         "the user's input was dropped while the StatusVerifier verdict was "
@@ -75,7 +78,7 @@ def test_the_live_shape_keeps_the_users_text(monkeypatch):
     assert _VERDICT in contents, 'the newest user turn must still be kept'
     assert est_after <= budget
     # Everything else was droppable and was dropped.
-    assert [m.get('role') for m in out] == ['system', 'user', 'user']
+    assert [m.get('role') for m in out] == ['system', 'user', 'tool', 'user']
 
 
 def test_the_initiators_NEWEST_turn_is_kept_not_its_first(monkeypatch):
@@ -84,10 +87,11 @@ def test_the_initiators_NEWEST_turn_is_kept_not_its_first(monkeypatch):
     sys_m, verdict = _sys(), _verdict()
     old = _task('Summarize: an older text about a bridge. ' + 'y ' * 400)
     new = _task()
+    result = _bulk('tool', 't1')
     msgs = [sys_m, old, _bulk('assistant', 'a0'), new,
-            _bulk('assistant', 'a1'), _bulk('tool', 't1'), verdict]
+            _bulk('assistant', 'a1'), result, verdict]
     out, est_after, budget = _trim_so_that_only(
-        [sys_m, new, verdict], msgs, monkeypatch)
+        [sys_m, new, result, verdict], msgs, monkeypatch)
     contents = [m.get('content') for m in out]
     assert _TASK in contents, 'the current user input was dropped'
     assert old['content'] not in contents, (
@@ -171,9 +175,10 @@ def test_an_oversized_task_turn_is_truncated_not_left_over_budget(monkeypatch):
     newest-user anchor already is."""
     sys_m, verdict = _sys(), _verdict()
     huge = _task('HEAD ' + 'word ' * 3000 + ' TAIL 83 cyclists')
-    msgs = [sys_m, huge, _bulk('assistant', 'a1'), _bulk('tool', 't1'), verdict]
+    result = _bulk('tool', 't1')
+    msgs = [sys_m, huge, _bulk('assistant', 'a1'), result, verdict]
     out, est_after, budget = _trim_so_that_only(
-        [sys_m, _task(), verdict], msgs, monkeypatch)
+        [sys_m, _task(), result, verdict], msgs, monkeypatch)
     kept = [m for m in out if m.get('name') == 'User']
     assert len(kept) == 1, 'the task turn must survive, truncated'
     assert kept[0]['content'].startswith(WIRE_TRIM_MARKER)
@@ -218,27 +223,4 @@ def test_an_unprotected_oversized_newest_message_is_still_truncated(
          {'role': 'assistant', 'content': 'word ' * 100}], msgs, monkeypatch)
     assert out[-1]['content'].startswith(WIRE_TRIM_MARKER)
     assert out[-1]['content'].endswith('TAIL')
-    assert est_after <= budget
-
-
-def test_an_unprotected_tool_result_is_cut_before_the_users_task(monkeypatch):
-    """Review of 9ddc8b92d, probed: [system, User task 15k, assistant, tool
-    result 10.5k].  Largest-first alone cut the protected task (15018 -> 523
-    chars, its head gone) and left the unprotected tool result whole.  An
-    unprotected newest message is cut first; the task stays whole when that
-    is enough."""
-    sys_m = _sys()
-    # The task is the LARGER of the two (15k vs 10.5k chars, the probed
-    # shape), so size alone would pick it.
-    task = _task('TASKHEAD ' + 'task ' * 3000 + ' TASKTAIL')
-    result = {'role': 'tool', 'tool_call_id': 'c1',
-              'content': 'RESHEAD ' + 'row ' * 2600 + ' RESTAIL'}
-    msgs = [sys_m, task, _bulk('assistant', 'a1'), result]
-    keep = [sys_m, task, {'role': 'tool', 'tool_call_id': 'c1',
-                          'content': 'row ' * 100}]
-    out, est_after, budget = _trim_so_that_only(keep, msgs, monkeypatch)
-    kept_task = [m for m in out if m.get('name') == 'User']
-    assert kept_task and kept_task[0]['content'] == task['content'], (
-        "the user's task was cut while an unprotected tool result was not")
-    assert out[-1]['content'].startswith(WIRE_TRIM_MARKER)
     assert est_after <= budget

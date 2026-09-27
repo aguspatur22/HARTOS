@@ -905,9 +905,9 @@ def _trim_to_budget(body: dict) -> tuple:
       2. If under budget → return unchanged.
       3. Left-drop non-system messages (preserve index 0 if role=system)
          until the remaining set fits.  Never dropped: the system message,
-         the most-recent message, the newest role='user' message and the
-         task turn (:func:`_task_turn`, the initiator's newest turn).
-         An assistant message carrying tool_calls drops together with the
+         the most-recent message, the newest role='user' message, the
+         task turn (:func:`_task_turn`, the initiator's newest turn) and the
+         newest role='tool' message.  An assistant message carrying tool_calls drops together with the
          results answering it (:func:`_drop_units`), and is kept with them
          when one of them is never dropped.
       4. If still over, left-truncate the messages step 3 could not drop,
@@ -1050,7 +1050,19 @@ def _trim_to_budget(body: dict) -> tuple:
     # Unnamed bodies (langchain / raw SDK) have no speakers to tell apart and
     # keep the single newest-user anchor, unchanged.
     task = _task_turn(messages)
-    protected = [m for m in (anchor, task) if m is not None]
+    # And the newest tool result: it is what the current step produced, the
+    # thing the Assistant must use and the StatusVerifier must check.
+    # Unprotected, the cut pass took it first and floored it at 64 tokens
+    # while the task stayed whole, or the drop removed it outright when a
+    # verdict followed it (review of 9ddc8b92d, probed).  Owner decision,
+    # delegated 2026-09-26 ("use sensible defaults without creating more
+    # friction"): protect it, and let the largest-first pass below share the
+    # cut between it and the task.  Its tool_calls message stays with it
+    # (_drop_units).
+    newest_result = next((m for m in reversed(messages)
+                          if isinstance(m, dict) and m.get('role') == 'tool'),
+                         None)
+    protected = [m for m in (anchor, task, newest_result) if m is not None]
     start = 1 if has_system else 0
     n_dropped = 0
     # A tool call and its results leave together or not at all (see
@@ -1117,12 +1129,14 @@ def _trim_to_budget(body: dict) -> tuple:
     # chars/token ratio the fallback uses (3.5): conservative with tiktoken,
     # and cutting from the left means over-cutting only shrinks the payload.
     #
-    # UNPROTECTED BEFORE PROTECTED.  When the newest message is neither the
-    # anchor nor the task (a large tool result), it is cut before any
-    # protected message, whatever the sizes: size alone put a 15k task ahead
-    # of a 10.5k tool result and cut the user's request to 523 chars with its
-    # head gone (review of 9ddc8b92d, probed; the 09-25 failure mode).
-    # Largest-first decides only among the protected.
+    # UNPROTECTED BEFORE PROTECTED.  When the newest message is protected by
+    # nothing (an assistant reply), it is cut before any protected message,
+    # whatever the sizes.  Largest-first decides only among the protected.
+    # The newest tool result used to be that unprotected message, and was
+    # floored at 64 tokens ahead of a whole task (review of 9ddc8b92d); it is
+    # protected now, so a 15k task and a 10.5k result share the cut, the
+    # larger first -- which can cut the task's head, the price of the result
+    # keeping real content (owner decision above).
     candidates = []
     for m in protected + messages[-1:]:
         if not any(m is c for c in candidates):
