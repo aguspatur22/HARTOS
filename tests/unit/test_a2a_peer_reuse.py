@@ -364,7 +364,7 @@ class TestInvokePeerAgent:
                 PEER_URL, f'{PEER_PID}_0', 'collect metrics')
         assert result is not None
         assert result['state'] == 'completed'
-        assert peer_reuse._result_text(result) == 'metrics collected'
+        assert peer_reuse.result_text(result) == 'metrics collected'
 
     def test_failed_state_envelope_is_returned_as_is(self):
         failed = dict(self.HAPPY, state='failed')

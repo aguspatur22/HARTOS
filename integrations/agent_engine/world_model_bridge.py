@@ -1105,21 +1105,43 @@ class WorldModelBridge:
     def _count_if_learned(self, result: dict) -> bool:
         """Count a correction only when HevolveAI reports it LEARNED.
 
-        Sets result['success'] to that verdict (both paths return it) and
-        bumps total_corrections only when true.  HevolveAI's reply carries
-        'success' since hevolveai 2c4e622; an older server always answers
-        "status": "success", and only its 'statistics' (the provider's own
-        result) says whether the correction was learned.  Measured cause
-        (log defect M19-B): every HTTP 200 was counted, including all 5
-        live corrections on 09-22 that failed with "No sensor encoding
-        available".
+        One reader for both paths: ``result`` is the /v1/corrections reply
+        (HTTP) or the provider's own dict (in-process).  HevolveAI reports two
+        verdicts: 'success' means the correction was CAPTURED, 'learned' means
+        the learning step ran and learned.  Only a literal True counts, and
+        the verdict is written back to result['success'] and
+        result['learned'], so what callers receive matches what was counted.
+
+        Decided in this order:
+        1. 'learned' present (a server or provider that reports it): the
+           verdict is ``result['learned'] is True``.
+        2. else a top-level 'success': the hevolveai 2c4e622 reply, or an
+           in-process provider older than 'learned'.  That flag is the
+           CAPTURED flag (true even when learning was skipped), so it is not
+           a learn and is not counted.
+        3. else 'statistics' (a server older than 2c4e622, whose reply always
+           said "status": "success"): statistics.learned when present, else
+           statistics.success.  statistics.success on those servers is the
+           same captured flag, so this last fallback can still count a
+           captured-but-not-learned correction; it is kept because such a
+           server reports nothing better.
+        Measured cause (log defect M19-B): every HTTP 200 was counted,
+        including all 5 live corrections on 09-22 that failed with "No
+        sensor encoding available".
         """
-        if 'success' in result:
-            learned = result['success'] is True
+        stats = result.get('statistics')
+        if 'learned' in result:
+            learned = result['learned'] is True
+        elif 'success' in result:
+            learned = False
+        elif isinstance(stats, dict) and 'learned' in stats:
+            learned = stats['learned'] is True
+        elif isinstance(stats, dict):
+            learned = stats.get('success') is True
         else:
-            stats = result.get('statistics')
-            learned = isinstance(stats, dict) and stats.get('success') is True
+            learned = False
         result['success'] = learned
+        result['learned'] = learned
         if learned:
             with self._lock:
                 self._stats['total_corrections'] += 1

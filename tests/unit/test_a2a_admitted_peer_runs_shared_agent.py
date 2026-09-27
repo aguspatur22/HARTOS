@@ -33,6 +33,7 @@ agent executor (a spy) and the invoker's identity (a fresh key standing for
 another node) are stand-ins.
 """
 import json
+import os
 import sys
 import time
 import types
@@ -324,7 +325,7 @@ def test_reuse_signs_for_the_peer_it_matched_not_a_guess_by_url(
     # The url lookup is the last resort: with a matched peer in hand it must
     # not decide the audience (the store can change between the sweep and
     # the invoke).  Were it consulted, this answer would be refused.
-    monkeypatch.setattr(peer_reuse, '_peer_node_id_for',
+    monkeypatch.setattr(peer_reuse, 'peer_node_id_for',
                         lambda url: 'livetest-stale-0')
     verdict = peer_reuse.try_peer_recipe_reuse(
         ident, f'livetest-{uuid.uuid4().hex[:8]}',
@@ -1027,3 +1028,49 @@ def test_the_poll_backs_off(monkeypatch):
     assert time.monotonic() - started >= 5.5
     assert calls.count('message/get') <= 8, calls
     assert calls[-1] == 'task/cancel' or calls[-2] == 'task/cancel', calls
+
+
+# ── review of a4ea04651, deferred minors ─────────────────────────────────
+
+def test_the_audience_is_asked_of_the_node_when_the_store_has_no_row(
+        node, monkeypatch, caplog):
+    """peer_node_id_for(url, ask_the_node=True): the store first, then the
+    node's own /api/social/peers/health; a failed ask is LOGGED, not
+    swallowed (it used to live in hart_cli as a silent except)."""
+    import logging
+    with db_session() as db:
+        db.query(PeerNode).filter_by(node_id=SERVER_ID).delete()
+
+    class _R:
+        def json(self):
+            return {'node_id': 'livetest-asked'}
+    monkeypatch.setattr(peer_reuse, 'pooled_get', lambda url, **k: _R())
+    assert peer_reuse.peer_node_id_for(PEER_URL) == ''
+    assert peer_reuse.peer_node_id_for(PEER_URL, ask_the_node=True) == \
+        'livetest-asked'
+
+    def boom(url, **k):
+        raise ConnectionError('down')
+    monkeypatch.setattr(peer_reuse, 'pooled_get', boom)
+    with caplog.at_level(logging.INFO, logger='hevolve_social'):
+        assert peer_reuse.peer_node_id_for(PEER_URL, ask_the_node=True) == ''
+    assert any('down' in r.getMessage() for r in caplog.records), caplog.text
+
+
+def test_open_task_states_are_the_protocols():
+    from integrations.google_a2a.google_a2a_integration import TaskState
+    assert set(peer_reuse._OPEN_TASK_STATES) == {
+        TaskState.SUBMITTED.value, TaskState.WORKING.value}
+
+
+def test_source_guard_hart_cli_uses_public_peer_reuse_helpers():
+    """hart_cli imported _peer_node_id_for and _result_text: private names
+    across a package boundary drift the moment peer_reuse renames them."""
+    import ast
+    tree = ast.parse(open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))), 'hartos', 'hart_cli.py'),
+        encoding='utf-8').read())
+    private = [a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+               and (n.module or '').endswith('peer_reuse')
+               for a in n.names if a.name.startswith('_')]
+    assert private == [], private

@@ -444,12 +444,29 @@ def _discover_peer(identity, peers=None, timeout=_DIRECTORY_TIMEOUT_S,
 
 # ─── Invoke (JSON-RPC message/send, the existing contract) ──────────
 
-def _peer_node_id_for(peer_url: str) -> str:
-    """The node_id this node holds for the peer at ``peer_url`` (the
-    audience a signed invoke is bound to), or '' when none is known."""
+def peer_node_id_for(peer_url: str, ask_the_node: bool = False) -> str:
+    """The node_id of the peer at ``peer_url`` (the audience a signed
+    request is bound to), or '' when none is known.
+
+    The peer store first.  With ``ask_the_node`` (hart a2a send, which may
+    name a node this one never gossiped with), then the node's own
+    /api/social/peers/health; a failed ask is logged."""
     want = (peer_url or '').rstrip('/')
     if not want:
         return ''
+    held = _held_node_id_for(want)
+    if held or not ask_the_node:
+        return held
+    try:
+        return (pooled_get(f'{want}/api/social/peers/health',
+                           timeout=_DIRECTORY_TIMEOUT_S).json() or {}
+                ).get('node_id') or ''
+    except Exception as e:
+        logger.info(f'peer_reuse: could not ask {want} for its node_id: {e}')
+        return ''
+
+
+def _held_node_id_for(want: str) -> str:
     # The LAST RESORT: a caller that matched a peer passes its node_id
     # (try_peer_recipe_reuse).  One lookup by url in SQL, not a scan of the
     # first 1000 admitted rows.  Several identities can share a url; the
@@ -498,7 +515,7 @@ def invoke_peer_agent(peer_url: str, agent_id: str, prompt: str,
     callers decide."""
     deadline = time.monotonic() + max(float(timeout), 0.5)
     url = f"{peer_url.rstrip('/')}/a2a/{agent_id}/jsonrpc"
-    audience = peer_node_id or _peer_node_id_for(peer_url)
+    audience = peer_node_id or peer_node_id_for(peer_url)
 
     def _call(method, params):
         rpc = {'jsonrpc': '2.0', 'id': uuid.uuid4().hex, 'method': method,
@@ -571,8 +588,10 @@ def invoke_peer_agent(peer_url: str, agent_id: str, prompt: str,
     return None
 
 
-#: Task states in which a remote turn has not ended (A2A TaskState values).
-_OPEN_TASK_STATES = ('submitted', 'working')
+#: Task states in which a remote turn has not ended: the protocol's own
+#: TaskState values, not a second spelling of them.
+from .google_a2a_integration import TaskState as _TaskState  # noqa: E402
+_OPEN_TASK_STATES = (_TaskState.SUBMITTED.value, _TaskState.WORKING.value)
 _POLL_INTERVAL_S = 0.25
 _POLL_INTERVAL_MAX_S = 2.0
 
@@ -589,7 +608,7 @@ def _cancel_remote(call, task_id) -> bool:
     return bool(out and isinstance(out.get('error'), dict))
 
 
-def _result_text(result: Optional[dict]) -> str:
+def result_text(result: Optional[dict]) -> str:
     """Extract the text parts from an A2A task envelope's content."""
     try:
         content = (result or {}).get('content') or {}
@@ -1011,7 +1030,7 @@ def _record_remote_outcome(identity: Dict[str, str], local_prompt_id: str,
             user_id=identity.get('owner_id') or 'hive_peer',
             prompt_id=local_prompt_id,
             prompt=prompt_text,
-            response=_result_text(result),
+            response=result_text(result),
             goal_id=identity.get('goal_id') or '',
         )
     except Exception as e:

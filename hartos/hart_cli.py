@@ -2359,10 +2359,10 @@ def a2a_send(ctx, agent_url, message):
         'agent_id': agent_id,
     }
     try:
-        from integrations.google_a2a.peer_reuse import _peer_node_id_for
+        from integrations.google_a2a.peer_reuse import peer_node_id_for
         from integrations.social.discovery import signed_peer_request
         payload = signed_peer_request(
-            payload, audience=_peer_node_id_for(base) or _remote_node_id(base))
+            payload, audience=peer_node_id_for(base, ask_the_node=True))
     except Exception as e:
         click.echo(f'Warning: could not sign the request ({e}); sending it '
                    f'unsigned, which only a node that trusts this LAN admits',
@@ -2390,24 +2390,14 @@ def a2a_send(ctx, agent_url, message):
     if result.get('error'):
         _error_exit(f"JSON-RPC error: {result['error'].get('message')}",
                     json_output)
-    from integrations.google_a2a.peer_reuse import _result_text
+    from integrations.google_a2a.peer_reuse import result_text
     r = result.get('result') or {}
     click.echo(f"Task state: {r.get('state', '?')}")
-    text = _result_text(r)
+    text = result_text(r)
     if text:
         click.echo(text)
     if r.get('error'):
         click.echo(f"Error: {r['error']}")
-
-
-def _remote_node_id(base):
-    """The node_id a node reports for itself (/api/social/peers/health), for
-    a node this one holds no row for.  '' when it cannot be read."""
-    try:
-        return (pooled_get(f'{base}/api/social/peers/health',
-                           timeout=10).json() or {}).get('node_id') or ''
-    except Exception:
-        return ''
 
 
 @a2a.command('agents')

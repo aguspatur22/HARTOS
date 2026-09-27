@@ -1805,7 +1805,7 @@ class TestWorldModelBridge:
         from integrations.agent_engine.world_model_bridge import WorldModelBridge
         mock_post.return_value = Mock(
             status_code=200,
-            json=lambda: {'success': True, 'domain': 'general',
+            json=lambda: {'success': True, 'learned': True, 'domain': 'general',
                           'expert_id': 'expert1'})
         bridge = WorldModelBridge()
         bridge._http_disabled = False
