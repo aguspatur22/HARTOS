@@ -54,6 +54,13 @@ MIN_MASKED_SECRET_LEN = 4
 #: UserConsent.scope holds 100 characters.
 MAX_CREDENTIAL_NAME_LEN = 90
 
+#: A rejected login asks the owner again (7f3d5468f), but only this many
+#: values per credential within CREDENTIAL_ENTRY_WINDOW_S.  After that the
+#: agent is told to stop and tell the user: three wrong entries in a day is
+#: a problem for the person, not something another card will fix.
+MAX_CREDENTIAL_ENTRIES = 3
+CREDENTIAL_ENTRY_WINDOW_S = 24 * 3600
+
 # ═══════════════════════════════════════════════════════════════════════
 # Pending credential request tracking
 # ═══════════════════════════════════════════════════════════════════════
@@ -430,6 +437,18 @@ def _parse_resource_request(text) -> dict:
     return {'label': text[:100], 'description': text}
 
 
+def _recent_entries(consent_service, db, owner, scope) -> int:
+    """How many values the owner typed for this credential in the last
+    CREDENTIAL_ENTRY_WINDOW_S: the card's Accept writes one granted
+    'credential' row per value (consent_api.grant_consent, append-only), so
+    those rows are the count; no second counter is kept."""
+    from datetime import datetime, timedelta
+    since = datetime.utcnow() - timedelta(seconds=CREDENTIAL_ENTRY_WINDOW_S)
+    return sum(1 for row in consent_service.list_consents(db, owner, 'credential')
+               if row.scope == scope and row.granted_at is not None
+               and row.granted_at >= since)
+
+
 def request_credential(resource_description, agent_id=None) -> str:
     """What Request_Resource (both the LangChain tool and core.agent_tools
     request_resource) does: get the agent a credential without the agent
@@ -495,7 +514,12 @@ def request_credential(resource_description, agent_id=None) -> str:
         with db_session(commit=True) as db:
             declined = ConsentService.declined(db, owner, 'credential',
                                                scope=scope, agent_id=agent)
-            if not declined:
+            # A rejection re-asks, but not for ever: every value the owner
+            # typed is a grant row, so the rows say how often they tried.
+            entries = (_recent_entries(ConsentService, db, owner, scope)
+                       if rejected and not declined else 0)
+            exhausted = entries >= MAX_CREDENTIAL_ENTRIES
+            if not declined and not exhausted:
                 ConsentService.request_consent(db, owner, 'credential',
                                                scope=scope, agent_id=agent,
                                                reason=reason, reask=True)
@@ -506,6 +530,14 @@ def request_credential(resource_description, agent_id=None) -> str:
 
     if declined:
         return f"The owner of this computer said no to providing '{label}'."
+    if exhausted:
+        logger.info("credential %s: rejected after %d entries, not asked again",
+                    name, entries)
+        return (f"'{label}' was rejected every time: the owner has entered it "
+                f"{entries} times in the last day and {used_by} refused each "
+                f"one. It will not be asked for again today. Stop trying to "
+                f"sign in and tell the user that {label} keeps being "
+                f"rejected, so they can check it themselves.")
     return (f"Asked the owner of this computer for '{label}' on the consent "
             f"card. Once they enter it, {use}")
 

@@ -157,6 +157,134 @@ def test_a_rejection_after_the_owner_said_no_is_not_asked_again(world):
     assert [t for t, _ in world if t == 'consent.request'] == []
 
 
+REJECTED = ASK[:-1] + ', "rejected": true}'
+
+
+@pytest.fixture
+def card(monkeypatch):
+    """The consent card's own door: the /api/social/consent blueprint
+    (integrations.social.consent_api), signed in as the owner, on the same
+    database the ask was filed in.  Nunba's consentApi.grant / .decline post
+    exactly these bodies."""
+    from types import SimpleNamespace
+    from flask import Flask
+    from integrations.social import auth, consent_api
+    from integrations.social.models import get_db
+    app = Flask(__name__)
+    app.register_blueprint(consent_api.consent_bp)
+    monkeypatch.setattr(auth, '_get_user_from_token', lambda token: (
+        (SimpleNamespace(id=OWNER, is_admin=False, is_moderator=False), get_db())
+        if token == 'owner' else (None, None)))
+    client = app.test_client()
+
+    def post(path, body):
+        return client.post('/api/social/consent' + path, json=body,
+                           headers={'Authorization': 'Bearer owner'})
+    return post
+
+
+@pytest.mark.parametrize('agent', ['42', None])
+def test_a_no_on_the_card_ends_the_asking_end_to_end(world, card, agent):
+    """Owner ruling: consent must be able to say no.  The card's "Don't
+    allow" posts /consent/decline with the ask's own {consent_type, scope,
+    agent_id}; after that neither a plain nor a rejected-login call shows
+    the card again, and the agent is told the owner said no."""
+    from hartos.ai_key_vault import request_credential
+    request_credential(ASK, agent_id=agent)
+    asked = [d for t, d in world if t == 'consent.request']
+    assert len(asked) == 1
+    ask = asked[0]
+
+    resp = card('/decline', {'consent_type': ask['consent_type'],
+                             'scope': ask['scope'], 'agent_id': ask['agent_id']})
+    assert resp.status_code == 200, resp.get_json()
+    world.clear()
+
+    for call in (ASK, REJECTED):
+        out = request_credential(call, agent_id=agent)
+        assert 'said no' in out
+    assert [t for t, _ in world if t == 'consent.request'] == []
+
+
+def test_a_no_after_a_rejected_login_ends_the_asking_end_to_end(world, card):
+    """The loop F3 left open: Accept (vault + grant), the site rejects it,
+    the card comes back; a no on THAT card must end it too, although the
+    combination already holds a grant."""
+    from hartos.ai_key_vault import get_ai_key_vault, request_credential
+    request_credential(ASK, agent_id=None)
+    get_ai_key_vault().store_credential('site_password', SECRET)
+    assert card('', {'consent_type': 'credential',
+                     'scope': 'secret:SITE_PASSWORD'}).status_code == 201
+    world.clear()
+    assert 'Asked the owner' in request_credential(REJECTED, agent_id=None)
+
+    resp = card('/decline', {'consent_type': 'credential',
+                             'scope': 'secret:SITE_PASSWORD', 'agent_id': None})
+    assert resp.status_code == 200, resp.get_json()
+    world.clear()
+
+    assert 'said no' in request_credential(REJECTED, agent_id=None)
+    assert [t for t, _ in world if t == 'consent.request'] == []
+
+
+def _grant_times(n, when=None):
+    """n Accepts on the card: each one appends a granted row (agent None),
+    the same row consent_api.grant_consent writes."""
+    from integrations.social.consent_service import ConsentService
+    with db_session(commit=True) as db:
+        for _ in range(n):
+            row = ConsentService.grant_consent(db, OWNER, 'credential',
+                                               'secret:SITE_PASSWORD')
+            if when is not None:
+                row.granted_at = when
+    return n
+
+
+def test_re_asks_after_a_rejection_are_bounded(world):
+    """7f3d5468f re-asked after every rejected login with no limit.  After
+    MAX_CREDENTIAL_ENTRIES values the owner typed were all rejected, the card
+    is not shown again and the agent is told to stop and tell the user."""
+    from hartos.ai_key_vault import MAX_CREDENTIAL_ENTRIES, request_credential
+    request_credential(ASK, agent_id='42')
+    _grant_times(MAX_CREDENTIAL_ENTRIES - 1)
+    world.clear()
+    assert 'Asked the owner' in request_credential(REJECTED, agent_id='42')
+    assert len([t for t, _ in world if t == 'consent.request']) == 1
+
+    _grant_times(1)
+    world.clear()
+    out = request_credential(REJECTED, agent_id='42')
+    assert [t for t, _ in world if t == 'consent.request'] == []
+    assert f'{MAX_CREDENTIAL_ENTRIES} times' in out
+    assert 'tell the user' in out.lower()
+    assert SECRET not in out
+
+
+def test_the_bound_counts_only_recent_entries(world):
+    """Entries from an earlier day do not count: a password changed next
+    month is asked for again."""
+    from datetime import datetime, timedelta
+    from hartos.ai_key_vault import (CREDENTIAL_ENTRY_WINDOW_S,
+                                     MAX_CREDENTIAL_ENTRIES, request_credential)
+    request_credential(ASK, agent_id='42')
+    old = datetime.utcnow() - timedelta(seconds=CREDENTIAL_ENTRY_WINDOW_S + 60)
+    _grant_times(MAX_CREDENTIAL_ENTRIES, when=old)
+    world.clear()
+    assert 'Asked the owner' in request_credential(REJECTED, agent_id='42')
+    assert len([t for t, _ in world if t == 'consent.request']) == 1
+
+
+def test_the_bound_counts_this_credential_only(world):
+    from hartos.ai_key_vault import MAX_CREDENTIAL_ENTRIES, request_credential
+    from integrations.social.consent_service import ConsentService
+    request_credential(ASK, agent_id='42')
+    with db_session(commit=True) as db:
+        for _ in range(MAX_CREDENTIAL_ENTRIES):
+            ConsentService.grant_consent(db, OWNER, 'credential', 'secret:OTHER_KEY')
+    world.clear()
+    assert 'Asked the owner' in request_credential(REJECTED, agent_id='42')
+
+
 def test_with_no_owner_nothing_is_filed(world, monkeypatch):
     from hartos.ai_key_vault import request_credential
     monkeypatch.delenv('HEVOLVE_OWNER_USER_ID')
