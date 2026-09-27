@@ -860,7 +860,11 @@ class DistributedTaskCoordinator:
                 return
             user_id = str(recipient)
             message = f'Your agent contributed to "{objective}": completed "{task_description}"'
-            notif = NotificationService.create(
+            # create() pushes the notification to the person's devices once
+            # its row commits (models.after_commit): here on the commit below,
+            # or on the request's own commit when this runs inside one.  A
+            # second on_notification here pushed every card twice.
+            NotificationService.create(
                 db, user_id, 'goal_contribution',
                 source_user_id=None,
                 target_type='goal',
@@ -871,13 +875,6 @@ class DistributedTaskCoordinator:
             if owns_session:
                 db.commit()
                 db.close()
-
-            # Push real-time notification via WAMP (fires silently if Crossbar unavailable)
-            try:
-                from integrations.social.realtime import on_notification
-                on_notification(user_id, notif.to_dict())
-            except Exception:
-                pass
 
             logger.info(f"Notified user {user_id}: goal contribution for {task_id}")
         except Exception as e:
