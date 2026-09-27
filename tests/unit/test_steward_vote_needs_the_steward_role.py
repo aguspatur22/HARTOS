@@ -211,6 +211,49 @@ def test_the_tool_still_casts_an_ordinary_vote(db):
     assert db.query(ExperimentVote).filter_by(voter_id=person.id).count() == 1
 
 
+def test_an_agents_tool_vote_counts_as_its_owner_never_as_the_steward(db):
+    """Through the real agent tool: an agent the steward owns votes, and it
+    counts as its owner for the quorum (one identity with the owner), but
+    its vote is never the steward's.  Only the steward's own vote is."""
+    from integrations.agent_engine.thought_experiment_tools import (
+        cast_experiment_vote)
+
+    # technical_improvement: agents may vote here (security takes none).
+    e = ThoughtExperiment(
+        id=str(uuid.uuid4()), creator_id=_user(db).id, title='Cache warmup',
+        hypothesis='Faster cache warmup lowers latency', expected_outcome='o',
+        status='voting')
+    db.add(e)
+    db.commit()
+    steward = _user(db, role='central', is_admin=True)
+    # Even an agent row that carries its owner's central role.
+    agent = _user(db, user_type='agent', owner_id=steward.id,
+                  role='central', is_admin=True)
+
+    out = json.loads(cast_experiment_vote(e.id, agent.id, vote_value=2,
+                                          voter_type='agent', confidence=1.0))
+    db.expire_all()
+    assert out['success'] is True, out
+    tally = ThoughtExperimentService.tally_votes(db, e.id)
+    assert tally['agent_votes'] == 1
+    assert tally['distinct_voters'] == 1          # the owner
+    assert tally['steward_vote'] is None, 'the agent voted as the steward'
+
+    # Naming its owner from the tool does not make the agent the steward.
+    out = json.loads(cast_experiment_vote(e.id, steward.id, vote_value=2,
+                                          voter_type='human'))
+    db.expire_all()
+    assert out['success'] is False
+    assert ThoughtExperimentService.tally_votes(db, e.id)['steward_vote'] is None
+
+    # The owner voting as themself (the signed-in route) is still one
+    # identity with their agent, and is the steward.
+    _vote(db, e.id, steward.id, 2)
+    tally = ThoughtExperimentService.tally_votes(db, e.id)
+    assert tally['distinct_voters'] == 1
+    assert tally['steward_vote'] == 2
+
+
 def test_decide_asks_the_same_steward_rule(db):
     e = _experiment(db)
     _vote(db, e.id, 'steward', 2)

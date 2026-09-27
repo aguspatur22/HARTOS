@@ -221,7 +221,11 @@ def _observed_ip() -> str:
     move it.
     """
     from core.auth_local import client_address
-    return client_address()
+    # A trusted proxy that names no client gives '': fall back to the socket
+    # peer (the proxy), never to "unknown", which address_evidence reads as
+    # an unverifiable in-process caller and confirms (review of 291e548df,
+    # F2: the row went active on no evidence).
+    return client_address() or (request.remote_addr or '')
 
 
 @discovery_bp.route('/api/social/peers/announce', methods=['POST'])

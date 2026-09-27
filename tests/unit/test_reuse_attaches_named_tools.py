@@ -49,7 +49,10 @@ import pytest
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 _REUSE = os.path.join(_ROOT, 'hartos', 'reuse_recipe.py')
-_TOOLS = os.path.join(_ROOT, 'core', 'agent_tools.py')
+# attach_for_names, _attach_tool and register_dual live in core.agent_tool_menu
+# (split out of core/agent_tools.py, which re-exports them); the "same file,
+# same primitives" invariant below is asserted where they are defined.
+_TOOLS = os.path.join(_ROOT, 'core', 'agent_tool_menu.py')
 
 
 def _src(path):

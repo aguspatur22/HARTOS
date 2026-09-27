@@ -1,4 +1,8 @@
-""""Is this action autonomous?" has ONE rule: lifecycle_hooks.action_is_autonomous.
+""""Is this action autonomous?" has ONE rule: core.constants.action_is_autonomous.
+
+(Re-exported by hartos.lifecycle_hooks, where its opposite, autonomy_needs_user,
+also lives by re-export.  Both moved to core.constants in review of
+cc1393825 so the A2A card reads them without importing hartos.helper.)
 
 The question is asked of the recipe field ``can_perform_without_user_input``
 and was answered with a private ``== 'yes'`` at every reader, each with its
@@ -54,7 +58,7 @@ def _action(value):
 
 @pytest.mark.parametrize('value,autonomous', CENSUS, ids=_IDS)
 def test_the_rule_answers_every_census_value_as_today(value, autonomous):
-    from hartos.lifecycle_hooks import action_is_autonomous
+    from core.constants import action_is_autonomous
     assert action_is_autonomous(
         _action(value).get('can_perform_without_user_input')) is autonomous
 
@@ -114,21 +118,125 @@ def test_a2a_agent_card_answers_every_census_value_as_today(
     assert (info['autonomous_agents'] == ['71_0']) is autonomous
 
 
-# ── source guard: no sixth private copy ────────────────────────────────
+def test_lifecycle_hooks_reexports_the_same_two_rules():
+    """One definition, two import paths: callers that import from
+    hartos.lifecycle_hooks get the core.constants objects, not copies."""
+    import core.constants as cc
+    import hartos.lifecycle_hooks as lh
+    assert lh.action_is_autonomous is cc.action_is_autonomous
+    assert lh.autonomy_needs_user is cc.autonomy_needs_user
+
+
+# ── CREATE should_continue_autonomously (review of cc1393825) ──────────
+
+def _lift_should_continue(user_tasks):
+    """create_recipe cannot be imported in a bare pytest env (its import
+    waits on live services), so the function is lifted by name with ast and
+    exec'd with its collaborators injected, as the create tests do."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from core.constants import autonomy_needs_user
+    path = os.path.join(_ROOT, 'hartos', 'create_recipe.py')
+    src = open(path, encoding='utf-8').read()
+    fn = next(n for n in ast.parse(src).body
+              if isinstance(n, ast.FunctionDef)
+              and n.name == 'should_continue_autonomously')
+    ns = {'user_tasks': user_tasks, 'autonomy_needs_user': autonomy_needs_user,
+          'TaskStatus': SimpleNamespace(IN_PROGRESS='in_progress'),
+          'current_app': SimpleNamespace(logger=MagicMock())}
+    exec(ast.get_source_segment(src, fn), ns)
+    return ns['should_continue_autonomously']
+
+
+def _ledger_with_next(context, blocked_reason=None):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    task = SimpleNamespace(context=context, blocked_reason=blocked_reason,
+                           description='next', task_id='action_2')
+    ledger = MagicMock()
+    ledger.get_next_executable_task.return_value = task
+    return {'u_1': SimpleNamespace(ledger=ledger)}
+
+
+# This reader asks the OTHER question: does the value say the action needs
+# the user?  Only a leading 'no' does.  A missing value never blocks a
+# continuation (it did not before, and must not start to).  The string 'no'
+# used to be truthy here, so it did NOT block; that was the defect.
+_CONTINUE = [
+    ('yes', True),
+    ('no', False),
+    (_MISSING, True),
+    (None, True),
+    ('no - requires specific dish constraints, which the user must give', False),
+]
+
+
+@pytest.mark.parametrize('value,continues', _CONTINUE, ids=_IDS)
+def test_create_continuation_asks_the_needs_user_rule(value, continues):
+    ctx = {} if value is _MISSING else {'can_perform_without_user_input': value}
+    should_continue = _lift_should_continue(_ledger_with_next(ctx))
+    assert should_continue('u_1') is continues
+
+
+def test_create_continuation_still_stops_on_input_required():
+    should_continue = _lift_should_continue(
+        _ledger_with_next({'can_perform_without_user_input': 'yes'},
+                          blocked_reason='input_required'))
+    assert should_continue('u_1') is False
+
+
+# ── the A2A card reads the rule without importing the pipeline ──────────
+
+def test_a2a_card_reads_autonomy_without_importing_hartos_helper():
+    """Review of cc1393825: TrainedAgent.is_autonomous imported
+    hartos.lifecycle_hooks, which pulls hartos.helper (autogen, langchain):
+    7.35 s cold on the first card read.  Measured in a fresh interpreter."""
+    import subprocess
+    code = (
+        "import sys, time\n"
+        "from integrations.google_a2a.dynamic_agent_registry import TrainedAgent\n"
+        "a = TrainedAgent('71_0', 71, 0, 'p', 'a', [], 'done', 'yes', '', {}, 'f')\n"
+        "t = time.perf_counter(); v = a.is_autonomous\n"
+        "dt = time.perf_counter() - t\n"
+        "print(v, 'hartos.helper' in sys.modules,\n"
+        "      'hartos.lifecycle_hooks' in sys.modules, round(dt, 3))\n")
+    out = subprocess.run([sys.executable, '-c', code], cwd=_ROOT,
+                         capture_output=True, text=True, timeout=300)
+    last = out.stdout.strip().splitlines()[-1].split()
+    assert last[:3] == ['True', 'False', 'False'], (out.stdout, out.stderr)
+    assert float(last[3]) < 0.5, last
+
+
+# ── source guard: no private copy of either answer ─────────────────────
 
 _VOCAB = ('can_perform_without_user_input', 'autonom')
 _SKIP_DIRS = {'venv', '.venv', 'venv311', 'node_modules', '.git', 'tests',
               'build', 'dist', '__pycache__', '.claude', 'python-embed',
               'site-packages', '.cache'}
-_OWNER = ('hartos/lifecycle_hooks.py', 'action_is_autonomous')
+# The two rules themselves, and nothing else.
+_OWNERS = {('core/constants.py', 'action_is_autonomous'),
+           ('core/constants.py', 'autonomy_needs_user')}
+_FIELD = 'can_perform_without_user_input'
 
 
-def _is_yes(node):
+def _is_verdict_word(node):
+    """A 'yes' / 'no' literal (any case; a 'no - reason' too)."""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value.strip().lower() == 'yes'
+        v = node.value.strip().lower()
+        return v in ('yes', 'y') or v.startswith('no')
     if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
-        return any(_is_yes(e) for e in node.elts)
+        return any(_is_verdict_word(e) for e in node.elts)
     return False
+
+
+def _autonomous_default(node):
+    """A .get() default that answers 'autonomous' when the value is absent."""
+    if not isinstance(node, ast.Constant):
+        return False
+    v = node.value
+    if isinstance(v, str):
+        return v.strip().lower() in ('yes', 'y', 'true')
+    return bool(v)
 
 
 def _names_the_field(expr, assigned):
@@ -141,7 +249,11 @@ def _names_the_field(expr, assigned):
 
 
 def private_autonomy_checks(src, filename='<src>'):
-    """Every `<the field> == 'yes'`-shaped test in *src*, as (line, func)."""
+    """Every private answer to "autonomous?" / "needs the user?" in *src*,
+    as (line, func).  Three shapes:
+      * a compare of the field with a yes/no word (==, !=, in, ...);
+      * .startswith() / .endswith() called on the field;
+      * .get(<the field>, <a default that means autonomous>)."""
     tree = ast.parse(src, filename)
     hits = []
 
@@ -155,9 +267,19 @@ def private_autonomy_checks(src, filename='<src>'):
                     assigned[t.id] = ast.unparse(node.value)
         if isinstance(node, ast.Compare):
             operands = [node.left] + list(node.comparators)
-            if any(_is_yes(o) for o in operands) and any(
+            if any(_is_verdict_word(o) for o in operands) and any(
                     _names_the_field(o, assigned)
-                    for o in operands if not _is_yes(o)):
+                    for o in operands if not _is_verdict_word(o)):
+                hits.append((node.lineno, func))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            attr = node.func.attr
+            if (attr in ('startswith', 'endswith')
+                    and _names_the_field(node.func.value, assigned)):
+                hits.append((node.lineno, func))
+            if (attr == 'get' and len(node.args) >= 2
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value == _FIELD
+                    and _autonomous_default(node.args[1])):
                 hits.append((node.lineno, func))
         for child in ast.iter_child_nodes(node):
             visit(child, func, assigned)
@@ -183,7 +305,7 @@ def _repo_checks():
             rel = os.path.relpath(path, _ROOT).replace(os.sep, '/')
             try:
                 for line, func in private_autonomy_checks(src, rel):
-                    if (rel, func) != _OWNER:
+                    if (rel, func) not in _OWNERS:
                         found.append(f'{rel}:{line} in {func}')
             except SyntaxError:
                 continue
@@ -193,8 +315,9 @@ def _repo_checks():
 def test_source_guard_is_autonomous_has_one_rule():
     offenders = _repo_checks()
     assert offenders == [], (
-        "a private `can_perform_without_user_input == 'yes'` test; ask "
-        "hartos.lifecycle_hooks.action_is_autonomous instead:\n  "
+        "a private answer to can_perform_without_user_input; ask "
+        "core.constants.action_is_autonomous (may it run alone?) or "
+        "autonomy_needs_user (must it stop for the user?) instead:\n  "
         + '\n  '.join(offenders))
 
 
@@ -205,15 +328,28 @@ def test_source_guard_is_autonomous_has_one_rule():
     "def f(a):\n    v = a.get('can_perform_without_user_input')\n"
     "    return v in ('yes', 'true')\n",
     "def f(p, i):\n    return _reuse_action_autonomy(p, i) != 'yes'\n",
-])
+    # the three shapes the review probed past the first guard
+    "def f(t):\n    return t.context.get('can_perform_without_user_input', True)\n",
+    "def f(a):\n    return a['can_perform_without_user_input'] != 'no'\n",
+    "def f(a):\n    return a['can_perform_without_user_input'].startswith('y')\n",
+    "def f(a):\n    v = str(a.get('can_perform_without_user_input')).lower()\n"
+    "    return v.startswith('no')\n",
+    "def f(a):\n    return a.get('can_perform_without_user_input', 'yes')\n",
+], ids=['eq-yes-subscript', 'eq-Yes-get', 'eq-yes-attr', 'in-via-variable',
+        'ne-yes-reader', 'get-default-True', 'ne-no', 'startswith-y',
+        'startswith-no-via-variable', 'get-default-yes'])
 def test_source_guard_sees_every_shape_of_a_copy(snippet):
-    """Anti-vacuity: the guard above can fail."""
-    assert private_autonomy_checks(snippet) == [(2 if 'v =' not in snippet
-                                                 else 3, 'f')]
+    """Anti-vacuity: the guard above can fail, once per shape."""
+    hits = private_autonomy_checks(snippet)
+    assert hits and {fn for _, fn in hits} == {'f'}, hits
 
 
-def test_source_guard_leaves_unrelated_yes_alone():
-    src = ("def f(parts, v):\n"
-           "    ntp = v == 'yes'\n"
-           "    return parts[0] == 'yes' and ntp\n")
+@pytest.mark.parametrize('src', [
+    "def f(parts, v):\n    ntp = v == 'yes'\n    return parts[0] == 'yes' and ntp\n",
+    # loading the field with a NOT-autonomous default is data, not a verdict
+    "def f(d):\n    return d.get('can_perform_without_user_input', 'no')\n",
+    "def f(d):\n    return d.get('can_perform_without_user_input')\n",
+    "def f(s):\n    return s.startswith('no')\n",
+], ids=['unrelated-yes', 'get-default-no', 'get-no-default', 'unrelated-startswith'])
+def test_source_guard_leaves_unrelated_code_alone(src):
     assert private_autonomy_checks(src) == []

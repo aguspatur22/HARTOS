@@ -825,8 +825,7 @@ def _truncate_msg_content(msg: dict, target_chars: int, marker: str,
         tail_chars = max(0, target_chars - head_chars)
     if head_chars + tail_chars >= len(text):
         return msg, 0  # nothing left to elide without cutting the head
-    new_text = (text[:head_chars] + marker
-                + (text[-tail_chars:] if tail_chars else ''))
+    new_text = _middle_cut(text, head_chars, tail_chars, marker)
     if isinstance(new_msg.get('content'), list):
         new_parts = []
         replaced = False
@@ -843,6 +842,53 @@ def _truncate_msg_content(msg: dict, target_chars: int, marker: str,
     else:
         new_msg['content'] = new_text
     return new_msg, len(text) - len(new_text) + len(marker)
+
+
+def _middle_cut(text: str, head_chars: int, tail_chars: int,
+                marker: str) -> str:
+    """``text``'s first ``head_chars`` and last ``tail_chars`` characters with
+    ``marker`` between.  A cut never leaves half of a surrogate pair at
+    either edge: json.dumps would send it as a lone surrogate escape, which
+    llama.cpp refuses with a 500 (review of bb809af28)."""
+    head = text[:head_chars]
+    if head and 0xD800 <= ord(head[-1]) <= 0xDBFF:
+        head = head[:-1]
+    tail = text[-tail_chars:] if tail_chars else ''
+    if tail and 0xDC00 <= ord(tail[0]) <= 0xDFFF:
+        tail = tail[1:]
+    return head + marker + tail
+
+
+def _truncate_tool_call_arguments(msg: dict, target_chars: int,
+                                  marker: str) -> tuple:
+    """Cut the arguments of the tool calls ``msg`` carries so they hold about
+    ``target_chars`` together; ``(new_msg, n_cut_chars)``.
+
+    Arguments stay one strict JSON object -- llama.cpp answers 500 "Failed
+    to parse tool call arguments as JSON" to anything else -- so a cut call's
+    arguments become ``{"trimmed_arguments": <head> marker <tail>}``.  Each
+    call gets an equal share; one under its share is left as it is.  Review
+    of be96f2510: a call with 40k-char arguments kept whole with its
+    protected result sent 20,243 tokens against a 7,424 budget."""
+    calls = msg.get('tool_calls')
+    if not isinstance(calls, list) or not calls:
+        return msg, 0
+    share = max(0, target_chars) // len(calls)
+    new_calls, n_cut = [], 0
+    for tc in calls:
+        fn = tc.get('function') if isinstance(tc, dict) else None
+        args = fn.get('arguments') if isinstance(fn, dict) else None
+        if not isinstance(args, str) or len(args) <= share:
+            new_calls.append(tc)
+            continue
+        tail_chars = share // 2
+        cut = _middle_cut(args, share - tail_chars, tail_chars, marker)
+        new_calls.append({**tc, 'function': {
+            **fn, 'arguments': json.dumps({'trimmed_arguments': cut})}})
+        n_cut += len(args) - len(cut) + len(marker)
+    if not n_cut:
+        return msg, 0
+    return {**msg, 'tool_calls': new_calls}, n_cut
 
 
 def _chars_for_tokens(text: str, tokens: int, model=None) -> int:
@@ -1195,8 +1241,19 @@ def _trim_to_budget(body: dict) -> tuple:
     # protected now, so a 15k task and a 10.5k result share the cut, the
     # larger first -- which can cut the middle of the task, the price of the result
     # keeping real content (owner decision above).
+    #
+    # AND THE UNITS THEY PIN.  A protected tool result keeps its whole unit
+    # (_drop_units): the tool_calls message and every sibling result.  Those
+    # can be neither dropped nor, until the review of be96f2510, cut: a call
+    # with 40k-char arguments sent 20,243 tokens and three parallel ~16k
+    # results 8,307, each against a budget of 7,424.  They are unprotected
+    # candidates, so they are cut first, largest first; a call is cut in its
+    # arguments (_truncate_tool_call_arguments), a sibling in its content.
+    pinned = [m for m in messages
+              if any(m is k for u in (units.get(id(s), [s]) for s in must_stay)
+                     for k in u)]
     candidates = []
-    for m in protected + messages[-1:]:
+    for m in protected + messages[-1:] + pinned:
         if not any(m is c for c in candidates):
             candidates.append(m)
 
@@ -1220,9 +1277,17 @@ def _trim_to_budget(body: dict) -> tuple:
         # (review of 111c458b0).  The candidates after it are sized against
         # what it kept.
         room_for_p = max(64, budget - overhead_tokens)
-        target_chars = _chars_for_tokens(p_text, room_for_p, model)
-        new_p, n_cut = _truncate_msg_content(
-            p, target_chars, WIRE_TRIM_MARKER, _content_to_text)
+        if p.get('tool_calls') and not p_text.strip():
+            args_text = ''.join(
+                str(((tc or {}).get('function') or {}).get('arguments') or '')
+                for tc in p['tool_calls'] if isinstance(tc, dict))
+            new_p, n_cut = _truncate_tool_call_arguments(
+                p, _chars_for_tokens(args_text, room_for_p, model),
+                WIRE_TRIM_MARKER)
+        else:
+            target_chars = _chars_for_tokens(p_text, room_for_p, model)
+            new_p, n_cut = _truncate_msg_content(
+                p, target_chars, WIRE_TRIM_MARKER, _content_to_text)
         if n_cut:
             n_truncated_chars += n_cut
             messages[p_idx] = new_p

@@ -176,3 +176,18 @@ def test_the_device_ask_limiter_charges_a_lan_host_once(monkeypatch):
             allowed += discovery.check_client_rate()
     discovery._ANNOUNCE_RATE.clear()
     assert allowed == discovery._RATE_LIMIT, allowed
+
+
+def test_a_proxy_that_names_no_client_leaves_the_announce_unconfirmed(
+        monkeypatch):
+    """F2 (review of 291e548df): a TRUSTED_PROXY that sends no header made
+    the vantage '' and address_evidence(url, '') 'confirmed', so the row
+    went active on no evidence.  The vantage falls back to the socket peer,
+    which is the proxy, never the peer's own address."""
+    from integrations.social.peer_discovery import address_evidence
+    monkeypatch.setenv('TRUSTED_PROXY', GATEWAY)
+    app = Flask(__name__)
+    with app.test_request_context(environ_base={'REMOTE_ADDR': GATEWAY}):
+        vantage = discovery._observed_ip()
+    assert vantage == GATEWAY
+    assert address_evidence('http://10.1.0.5:6777', vantage)[0] == 'unconfirmed'

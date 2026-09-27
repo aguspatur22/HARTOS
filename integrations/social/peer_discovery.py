@@ -459,7 +459,7 @@ class GossipProtocol:
         _genesis = {u.rstrip('/') for u in _GENESIS_PEERS}
         seen = set()
         self.seed_peers = []
-        for url in env_peers + (_GENESIS_PEERS if _real else []):
+        for url in env_peers + _GENESIS_PEERS:
             if url not in seen and (_real or url.rstrip('/') not in _genesis):
                 seen.add(url)
                 self.seed_peers.append(url)

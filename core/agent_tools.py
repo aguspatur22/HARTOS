@@ -13,7 +13,6 @@ Pattern mirrors:
 import json
 import logging
 import os
-import re as _re
 import threading
 import time
 import uuid

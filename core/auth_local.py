@@ -29,11 +29,12 @@ Env vars:
     send `Authorization: Bearer <token>` to bypass the localhost check.
     Used by remote ops tooling and inter-node admin calls.
 
-    TRUSTED_PROXY — when HARTOS sits behind a reverse proxy (nginx,
-    Traefik), all requests appear as remote_addr=127.0.0.1 by default.
-    Setting this env to the proxy's address makes the decorator inspect
-    X-Forwarded-For instead.  Without it, only direct-connection
-    remote_addr is trusted (safe default).
+    TRUSTED_PROXY — the address (or comma-separated addresses) of a reverse
+    proxy that APPENDS the real client to X-Forwarded-For.  It decides whose
+    budget a rate-limited request is charged to and the gossip vantage
+    (client_address).  It never makes a request local: that needs a
+    loopback socket peer.  Measure before setting it (client_address
+    docstring).  Without it, the socket peer is the client (safe default).
 
     HARTOS_TRUSTED_ORIGINS — comma-separated list of origins that are
     additionally treated as same-origin for the CSRF check (e.g.
@@ -93,17 +94,46 @@ def _token_matches(candidate: str) -> bool:
     )
 
 
+def _norm_ip(value: str) -> str:
+    """An address as a comparable string: brackets stripped, IPv4-mapped
+    IPv6 (::ffff:127.0.0.1, what a dual-stack server reports) folded to
+    its IPv4 form.  A non-address (a hostname) is returned lower-cased."""
+    v = (value or '').strip().strip('[]').lower()
+    try:
+        import ipaddress
+        ip = ipaddress.ip_address(v)
+        mapped = getattr(ip, 'ipv4_mapped', None)
+        return str(mapped or ip)
+    except ValueError:
+        return v
+
+
+def _is_loopback(value: str) -> bool:
+    v = _norm_ip(value)
+    if v == 'localhost':
+        return True
+    try:
+        import ipaddress
+        return ipaddress.ip_address(v).is_loopback
+    except ValueError:
+        return False
+
+
+def _trusted_proxies() -> set:
+    """TRUSTED_PROXY: one address, or several comma-separated."""
+    return {_norm_ip(p) for p in os.environ.get('TRUSTED_PROXY', '').split(',')
+            if p.strip()}
+
+
 def _is_forwarder(peer: str) -> bool:
-    """Is the socket peer a forwarder this node runs: the configured
+    """Is the socket peer a forwarder this node runs: an address named in
     TRUSTED_PROXY, or loopback (a proxy on this machine)?  A private LAN
     address is NOT one: it is another machine, and its X-Forwarded-For is
     whatever it chose to write (review of d35926896)."""
+    peer = _norm_ip(peer)
     if not peer:
         return False
-    trusted = os.environ.get('TRUSTED_PROXY', '')
-    if trusted and peer == trusted:
-        return True
-    return peer in ('127.0.0.1', '::1') or peer.startswith('127.')
+    return peer in _trusted_proxies() or _is_loopback(peer)
 
 
 def client_address() -> str:
@@ -115,24 +145,41 @@ def client_address() -> str:
     The socket peer, unless it is a forwarder we run (_is_forwarder); then
     the LAST X-Forwarded-For hop, the one that forwarder appended (earlier
     hops were written by the client and prove nothing).  A TRUSTED_PROXY
-    that sends no header answers '' (fail closed: nothing to believe); a
-    loopback peer with no header is itself the client.
+    that sends no header answers '' (nothing to believe: callers fall back
+    to the socket peer or fail closed); a loopback peer with no header is
+    itself the client.  IPv4-mapped addresses are folded (_norm_ip).
+
+    Before trusting a proxy, MEASURE what it sends.  From a known external
+    client, request any route and read, in this node's log or a debug
+    route, request.remote_addr and the X-Forwarded-For header:
+      - remote_addr is the proxy's address and X-Forwarded-For ENDS with the
+        client's real address: set TRUSTED_PROXY to that proxy address;
+      - X-Forwarded-For is absent, or ends with the proxy's own address
+        (docker's userland proxy on -p, which is what central shows:
+        172.21.0.1 for every peer): the proxy does not name clients, and
+        TRUSTED_PROXY restores nothing; leave it unset.
+    A header never makes a request local either way (_is_local_request).
     """
-    peer = request.remote_addr or ''
+    peer = _norm_ip(request.remote_addr or '')
     if not _is_forwarder(peer):
         return peer
-    hops = [h.strip() for h in
+    hops = [_norm_ip(h) for h in
             (request.headers.get('X-Forwarded-For') or '').split(',')
             if h.strip()]
     if hops:
         return hops[-1]
-    trusted = os.environ.get('TRUSTED_PROXY', '')
-    return '' if (trusted and peer == trusted) else peer
+    return '' if peer in _trusted_proxies() else peer
 
 
 def _is_local_request() -> bool:
-    """True if the request is from localhost (client_address), honouring
-    TRUSTED_PROXY.
+    """True if the request comes from this machine.
+
+    Local means the SOCKET peer is loopback, and, when that peer is a
+    proxy on this machine, the client it names is loopback too.  An address
+    taken from a header never makes a request local by itself: behind a
+    TRUSTED_PROXY that is another machine, a forwarded request is remote
+    whatever it claims (review of 291e548df, F1: a proxy that appends
+    nothing let 'X-Forwarded-For: 127.0.0.1' through).
 
     Nunba's staging container trusts every caller (ci_trusts_every_caller:
     NUNBA_CI=1 in a build run from source), as Nunba's
@@ -140,7 +187,9 @@ def _is_local_request() -> bool:
     """
     if ci_trusts_every_caller():
         return True
-    return client_address() in ('127.0.0.1', '::1', 'localhost')
+    if not _is_loopback(request.remote_addr or ''):
+        return False
+    return _is_loopback(client_address())
 
 
 # ── CSRF defense-in-depth (Phase 9.5) ──────────────────────────────
