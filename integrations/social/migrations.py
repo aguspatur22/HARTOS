@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 58
+SCHEMA_VERSION = 59
 
 
 # Tables that hold tenant-scoped user content. v40 adds a nullable
@@ -164,6 +164,39 @@ def _rekey_legacy_consent_flag(engine) -> tuple:
         logger.info("consent re-key: %d goal(s) moved to require_consent",
                     renamed)
     return renamed, remaining
+
+
+_V59_PERSONA_COLUMNS = (
+    ('bio', 'TEXT'),
+    ('recognize_me', 'VARCHAR(280)'),
+    ('interests_discoverable', 'BOOLEAN NOT NULL DEFAULT 0'),
+)
+
+
+def _v59_persona_card(engine) -> bool:
+    """Add the persona-card columns to discoverable_prefs if absent.  True
+    when all of them exist afterwards (inspector check, v58 style)."""
+    from sqlalchemy import inspect as sa_inspect
+
+    def _missing():
+        insp = sa_inspect(engine)
+        if 'discoverable_prefs' not in insp.get_table_names():
+            return [c for c, _ in _V59_PERSONA_COLUMNS]
+        have = {c['name'] for c in insp.get_columns('discoverable_prefs')}
+        return [c for c, _ in _V59_PERSONA_COLUMNS if c not in have]
+
+    for col, ddl in _V59_PERSONA_COLUMNS:
+        if col not in _missing():
+            continue
+        try:
+            with engine.connect() as conn:
+                conn.execute(text(
+                    f"ALTER TABLE discoverable_prefs ADD COLUMN {col} {ddl}"))
+                conn.commit()
+        except Exception as e:
+            logger.warning("v59 migration: ADD COLUMN discoverable_prefs.%s "
+                           "failed: %s", col, e)
+    return not _missing()
 
 
 def _v58_consent_reopened_at(engine) -> bool:
@@ -2157,6 +2190,22 @@ def run_migrations():
         else:
             logger.warning("v58 migration: user_consents.reopened_at is still "
                            "missing; retrying on the next boot")
+
+    if current < 59:
+        # v59 (2026-09-27): the persona card on discoverable_prefs — bio,
+        # recognize_me ("how to recognise me"), interests_discoverable.  An
+        # agent tells a matched person's agent only what is on this card
+        # (owner: agents describe each user to the other so they can
+        # recognise each other; match on bio and interests).  All nullable
+        # or defaulted, so every existing row reads as an empty card with
+        # interest matching off.
+        logger.info("HevolveSocial: migrating to v59 (discoverable_prefs "
+                    "persona card)")
+        if _v59_persona_card(engine):
+            set_schema_version(engine, 59)
+        else:
+            logger.warning("v59 migration: discoverable_prefs persona columns "
+                           "are still missing; retrying on the next boot")
 
     # v56's DATA repair, deliberately OUTSIDE the version gate above.
     #

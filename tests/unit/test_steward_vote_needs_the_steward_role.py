@@ -301,7 +301,20 @@ def test_an_agents_tool_vote_counts_as_its_owner_never_as_the_steward(db):
     # Even an agent row that carries its owner's central role.
     agent = _user(db, user_type='agent', owner_id=steward.id,
                   role='central', is_admin=True)
+    agent.agent_id = '77001'
+    db.commit()
+    # The tool votes for the agent whose turn is running (thread-local
+    # prompt id, test_agent_tool_votes_as_the_agent).
+    from hartos.threadlocal import thread_local_data
+    before = thread_local_data.get_prompt_id()
+    thread_local_data.set_prompt_id('77001')
+    try:
+        _agent_turn_votes(db, e, agent, steward, cast_experiment_vote)
+    finally:
+        thread_local_data.set_prompt_id(before)
 
+
+def _agent_turn_votes(db, e, agent, steward, cast_experiment_vote):
     out = json.loads(cast_experiment_vote(e.id, agent.id, vote_value=2,
                                           voter_type='agent', confidence=1.0))
     db.expire_all()

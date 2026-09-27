@@ -149,6 +149,12 @@ _request_id_var: 'contextvars.ContextVar[str]' = contextvars.ContextVar(
     'llm_outbound_request_id', default='')
 
 
+# The user an LLM call acts for, bound by ``with_llm_context`` from the
+# decorated entry point's ``user_id`` argument.  Read by _elision_scope only.
+_user_id_var: 'contextvars.ContextVar[str]' = contextvars.ContextVar(
+    'llm_outbound_user_id', default='')
+
+
 def set_source(name: str) -> 'contextvars.Token':
     """Set the origin label for LLM calls issued from this context.
     Returns a Token; pass to ``reset_source`` to restore the prior
@@ -281,8 +287,22 @@ def with_llm_context(source_name: str, request_id_arg: str = 'request_id'):
                         rid = _tl_rid or _request_id_var.get() or ''
                     except Exception:
                         rid = _tl_rid or ''
-            with source_context(source_name), request_id_context(rid):
-                return fn(*args, **kwargs)
+            uid = ''
+            if _sig is not None:
+                try:
+                    uid = str(_sig.bind_partial(*args, **kwargs)
+                              .arguments.get('user_id') or '')
+                except (TypeError, KeyError):
+                    uid = ''
+            # The user the elided-text store scopes a pointer to (see
+            # _elision_scope): the same contextvar hop as the request id.
+            _uid_token = _user_id_var.set(uid) if uid else None
+            try:
+                with source_context(source_name), request_id_context(rid):
+                    return fn(*args, **kwargs)
+            finally:
+                if _uid_token is not None:
+                    _user_id_var.reset(_uid_token)
         return _wrapper
 
     return _deco

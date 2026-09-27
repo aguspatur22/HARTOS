@@ -165,6 +165,23 @@ def get_agent_data_dir() -> str:
     return os.path.join(get_db_dir(), 'agent_data')
 
 
+def _legacy_documents_root() -> str:
+    """~/Documents/Nunba on every platform: where a few files lived before
+    they followed the data root (hart_language.json until 2026-09-27).  On
+    Windows it IS the platform default data root; on macOS / Linux it is not."""
+    return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba')
+
+
+def legacy_documents_db_path(filename: str) -> str:
+    """Where ``filename`` lived before it moved to get_db_path(), for a
+    one-time copy by that file's own reader (core.user_lang).  Read-only use:
+    never write or delete here.  Under pytest the owner's real ~/Documents
+    tree is swapped like every other real root."""
+    real = _legacy_documents_root()
+    root = _off_the_real_root_under_test(real, real, 'Documents-Nunba')
+    return os.path.join(root, 'data', filename)
+
+
 def get_uploads_dir() -> str:
     """Return the uploads/ directory: user-uploaded files and what is derived
     from them (book page images).
@@ -350,20 +367,28 @@ def get_log_dir() -> str:
     override = os.environ.get('NUNBA_LOG_DIR', '').strip()
     if override:
         return override
-
-    if _IS_MACOS:
-        real_logs = os.path.expanduser('~/Library/Logs/Nunba')
-        base = _off_the_real_root_under_test(real_logs, real_logs, 'Library-Logs')
-    else:
-        # Windows + Linux both nest under the data dir.
-        base = os.path.join(get_data_dir(), 'logs')
-
+    base = get_installed_log_dir()
     # sys.frozen is set by cx_Freeze in the shipped build and is absent
     # from every source run — the one discriminator that needs no config
     # and cannot drift out of sync with how the app was started.
     if not getattr(sys, 'frozen', False):
         base += '-dev'
     return base
+
+
+def get_installed_log_dir() -> str:
+    """The log directory the INSTALLED (frozen) build writes, whatever this
+    process is.  For a reader in a dev run that reports on the installed
+    app (get_boot_decision falls back to it); writers use get_log_dir().
+    NUNBA_LOG_DIR overrides it as it does get_log_dir."""
+    override = os.environ.get('NUNBA_LOG_DIR', '').strip()
+    if override:
+        return override
+    if _IS_MACOS:
+        real_logs = os.path.expanduser('~/Library/Logs/Nunba')
+        return _off_the_real_root_under_test(real_logs, real_logs, 'Library-Logs')
+    # Windows + Linux both nest under the data dir.
+    return os.path.join(get_data_dir(), 'logs')
 
 
 def get_memory_graph_dir(session_key: str = '') -> str:

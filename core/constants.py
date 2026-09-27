@@ -566,6 +566,12 @@ ENCOUNTER_SIGHTING_EXPIRES_SEC: int = 24 * 60 * 60  # swipe grace window
 ENCOUNTER_MATCH_WINDOW_SEC: int = 5 * 60         # both sightings must be
                                                   # within this window to match
 ENCOUNTER_DRAFT_MAX_CHARS: int = 220             # icebreaker length cap
+# Persona card (discoverable_prefs.bio / .recognize_me / .vibe_tags) —
+# what a user's agent may tell a matched person's agent.
+ENCOUNTER_PERSONA_BIO_MAX_CHARS: int = 500
+ENCOUNTER_PERSONA_RECOGNIZE_MAX_CHARS: int = 280  # "how to recognise me"
+ENCOUNTER_PERSONA_MAX_TAGS: int = 10
+ENCOUNTER_PERSONA_TAG_MAX_CHARS: int = 40
 
 
 # ──────────────────────────────────────────────────────────────────────

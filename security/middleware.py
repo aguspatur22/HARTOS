@@ -389,8 +389,9 @@ def _apply_api_auth(app: Flask, register: bool = True):
                         file_device_access_ask(db, owner, verdict['public_key'],
                                                verdict.get('claims') or {})
                     else:
+                        from core.auth_local import client_key
                         logger.warning("device ask from %s not filed: rate limit",
-                                       request.remote_addr)
+                                       client_key())
         except Exception:
             logger.warning("device credential check failed; refusing",
                            exc_info=True)

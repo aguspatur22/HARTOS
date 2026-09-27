@@ -117,6 +117,42 @@ class SplitArgumentsAreNotCalled(_Base):
         self.assertEqual(self.calls, [])
         self._assert_json_refusal(ok, reply, ('text',))
 
+    def test_repair_that_empties_a_required_value_does_not_run(self):
+        # json_repair fills a value the model never wrote with "": a cut-off
+        # call '{"text":' became {"text": ""}, which binds, and the tool ran
+        # with nothing to say.  A required value left empty by a repair is
+        # refused like a missing one.
+        for text in ('{"text":', '{"text": }', '{"text": , "avatar_id": "a"}'):
+            with self.subTest(text=text):
+                ok, reply = self.run_sync('send_message_to_user', text)
+                self.assertEqual(self.calls, [])
+                self._assert_json_refusal(ok, reply, ('text',))
+                self.assertIn('Required argument(s) left empty: text',
+                              reply['content'])
+
+    def test_repair_that_empties_a_required_value_async(self):
+        ok, reply = self.run_async('text_2_image', '{"text": }')
+        self.assertEqual(self.calls, [])
+        self._assert_json_refusal(ok, reply, ('text',))
+        self.assertIn('Required argument(s) left empty: text', reply['content'])
+
+    def test_repaired_positional_empty_value_is_named_as_empty(self):
+        # A repaired list binds positionally; its empty first value is
+        # reported as left empty, not as missing (it was given).
+        ok, reply = self.run_sync('send_message_to_user', "['', 'a']")
+        self.assertEqual(self.calls, [])
+        self._assert_json_refusal(ok, reply, ('text',))
+        self.assertIn('Required argument(s) left empty: text', reply['content'])
+        self.assertNotIn('Missing required', reply['content'])
+
+    def test_repair_may_leave_an_optional_value_empty(self):
+        # Only a REQUIRED value must be there; an optional one the repair left
+        # empty is the model's to leave out.
+        ok, reply = self.run_sync('send_message_to_user',
+                                  '{"text": "hi", "avatar_id": ,}')
+        self.assertTrue(ok, reply)
+        self.assertEqual(self.calls, [('sync', 'hi', '', 'Neutral')])
+
 
 class ValidArgumentsStillRun(_Base):
 
@@ -151,6 +187,12 @@ class ValidArgumentsStillRun(_Base):
         self.assertIn('status', content)
         self.assertIn('text', content)
         self.assertNotIn('not valid JSON', content)
+
+    def test_strict_json_empty_required_value_still_runs(self):
+        # The model wrote "" itself, in valid JSON: its choice, not a repair.
+        ok, reply = self.run_sync('send_message_to_user', '{"text": ""}')
+        self.assertTrue(ok, reply)
+        self.assertEqual(self.calls, [('sync', '', '', 'Neutral')])
 
     def test_strict_json_missing_required_async(self):
         ok, reply = self.run_async('text_2_image', '{}')

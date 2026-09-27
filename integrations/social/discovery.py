@@ -66,7 +66,8 @@ def _rate_client_key() -> str:
     socket peer, and every LAN host escaped both limiters by rotating the
     header (review: 199/199 announces, 100/100 device asks)."""
     from core.auth_local import client_address
-    return client_address() or request.remote_addr or '0.0.0.0'
+    from core.auth_local import client_key
+    return client_key() or '0.0.0.0'
 
 
 def check_client_rate() -> bool:
@@ -225,7 +226,8 @@ def _observed_ip() -> str:
     # peer (the proxy), never to "unknown", which address_evidence reads as
     # an unverifiable in-process caller and confirms (review of 291e548df,
     # F2: the row went active on no evidence).
-    return client_address() or (request.remote_addr or '')
+    from core.auth_local import client_key
+    return client_key()
 
 
 @discovery_bp.route('/api/social/peers/announce', methods=['POST'])

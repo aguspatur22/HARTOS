@@ -155,12 +155,17 @@ _SKIP_DIRS = {'tests', 'venv', '.venv', 'python-embed', 'build', 'dist',
 
 
 def _py_files(root):
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS
-                       and not d.startswith('venv')]
-        for f in filenames:
-            if f.endswith('.py'):
-                yield os.path.join(dirpath, f)
+    """The repository's TRACKED Python files outside tests and vendored
+    trees (an IDE's plugin cache is not the product)."""
+    import subprocess
+    out = subprocess.run(['git', 'ls-files', '*.py'], cwd=root,
+                         capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr
+    for rel in out.stdout.splitlines():
+        parts = rel.split('/')   # git prints forward slashes on every OS
+        if any(p in _SKIP_DIRS or p.startswith('venv') for p in parts[:-1]):
+            continue
+        yield os.path.join(root, rel)
 
 
 def _reads(tree):

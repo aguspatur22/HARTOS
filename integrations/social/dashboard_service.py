@@ -89,55 +89,7 @@ class DashboardService:
         # Regression observed 2026-04-26: Tier-1 KeyError at boot left
         # world_model_bridge un-warmed; every dashboard poll then took
         # 57s, queueing the waitress task list and emptying the admin UI.
-        world_model = {'healthy': False, 'error': 'unavailable'}
-        try:
-            import concurrent.futures as _cf
-            def _collect_world_model():
-                from integrations.agent_engine.world_model_bridge import (
-                    get_world_model_bridge)
-                bridge = get_world_model_bridge()
-                return {
-                    'health': bridge.check_health(),
-                    'stats': bridge.get_learning_stats(),
-                }
-            # CRITICAL: do NOT use `with ThreadPoolExecutor as ex:` here.
-            # The context-manager ``__exit__`` calls ``shutdown(wait=True)``,
-            # which join()s the pool's worker thread.  When ``_fut.result``
-            # times out, the worker is still inside the heavy
-            # ``get_world_model_bridge()`` import and CAN'T finish, so the
-            # ``with`` exit blocks forever — turning the 2s timeout into
-            # an infinite hang and stacking every dashboard poll into a
-            # permanently-stuck Hypercorn worker.  Live thread dump
-            # 2026-04-28 22:08 showed 15 nunba_X workers ALL frozen at
-            # ``ThreadPoolExecutor.__exit__ → shutdown → join``.  Fix:
-            # manual try/finally + ``shutdown(wait=False,
-            # cancel_futures=True)`` so the request returns even when
-            # the worker is permanently wedged on the import lock.
-            _ex = _cf.ThreadPoolExecutor(max_workers=1)
-            try:
-                _fut = _ex.submit(_collect_world_model)
-                try:
-                    _wm = _fut.result(timeout=2.0)
-                    health = _wm['health']
-                    stats = _wm['stats']
-                    world_model = {
-                        'healthy': health.get('healthy', False),
-                        'learning_stats': stats.get('learning', {}),
-                        'hivemind_stats': stats.get('hivemind', {}),
-                        'bridge_stats': stats.get('bridge', {}),
-                    }
-                except _cf.TimeoutError:
-                    # Bridge is cold or unreachable: surface that fact
-                    # in the response without blocking the dashboard.
-                    world_model = {'healthy': False, 'error': 'cold_or_unreachable'}
-            finally:
-                # Don't wait for the (potentially permanently-stuck)
-                # worker thread.  It's a daemon — interpreter shutdown
-                # will reap it.  Cancel any not-yet-started futures so
-                # the pool doesn't pick up new work after we leave.
-                _ex.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
+        world_model = DashboardService._world_model_status()
 
         return {
             'timestamp': now.isoformat(),
@@ -145,6 +97,48 @@ class DashboardService:
             'world_model': world_model,
             'agents': agents,
             'summary': summary,
+        }
+
+    #: How long a dashboard poll waits for the world-model bridge.
+    WORLD_MODEL_TIMEOUT_S = 2.0
+
+    @staticmethod
+    def _world_model_status(timeout_s: float = WORLD_MODEL_TIMEOUT_S) -> Dict:
+        """HevolveAI world-model status, never holding the poll past timeout_s.
+
+        ``{'healthy': False, 'error': 'cold_or_unreachable'}`` when the bridge
+        does not answer in time (its first call can take 60 s+ bootstrapping
+        embodied_ai / vision / llama), ``'unavailable'`` when it raised.
+
+        On core.subprocess_safe.call_bounded since 2026-09-27 (review F7).
+        This was a one-worker ThreadPoolExecutor with shutdown(wait=False):
+        right that a `with` block would join the stuck worker (live thread
+        dump 2026-04-28 22:08, 15 nunba_X workers frozen in
+        ThreadPoolExecutor.__exit__), wrong that its worker "is a daemon" --
+        an executor's worker is joined at interpreter exit, so a wedged
+        bridge import held shutdown.  call_bounded's worker is a daemon.
+        """
+        from core.subprocess_safe import call_bounded
+
+        def _collect():
+            from integrations.agent_engine.world_model_bridge import (
+                get_world_model_bridge)
+            bridge = get_world_model_bridge()
+            return bridge.check_health(), bridge.get_learning_stats()
+
+        finished, value, error = call_bounded(
+            _collect, timeout_s, name='hart-dashboard-world-model')
+        if not finished:
+            return {'healthy': False, 'error': 'cold_or_unreachable'}
+        if error is not None:
+            logger.debug('dashboard: world model status unavailable: %s', error)
+            return {'healthy': False, 'error': 'unavailable'}
+        health, stats = value
+        return {
+            'healthy': health.get('healthy', False),
+            'learning_stats': stats.get('learning', {}),
+            'hivemind_stats': stats.get('hivemind', {}),
+            'bridge_stats': stats.get('bridge', {}),
         }
 
     @staticmethod

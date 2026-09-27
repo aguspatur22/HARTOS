@@ -297,3 +297,14 @@ def test_an_unknown_goal_and_someone_elses_answer_the_same(app, client, sf):
         missing = _post(client, uuid.uuid4().hex, verb)
         assert theirs.status_code == missing.status_code == 403, verb
         assert theirs.get_json() == missing.get_json(), verb
+
+
+def test_an_agent_no_person_owns_cannot_steer_a_persons_goal(client, sf):
+    """An ownerless agent/system account resolves to nobody; nobody is not
+    a match for anyone's goal."""
+    stray = _user(sf, user_type='agent')
+    gid, gc = _goal(sf, owner_id=_user(sf))
+    with _as_token_user(stray):
+        r = _post(client, gid, 'inject', LOCAL_TOKEN, REMOTE)
+    assert r.status_code == 403
+    assert gc.messages == []

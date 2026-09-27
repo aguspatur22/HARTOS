@@ -4098,7 +4098,9 @@ def tool_argument_error(func, func_name, arguments, repaired):
     "Consulting": "5,000", ...}`` and the tool raised "unexpected keyword
     argument 'Consulting'", which reads as a naming mistake.  So a repaired
     call that does not bind is reported as broken JSON, with the keys that
-    could be read shown as what was received, not as names to fix.
+    could be read shown as what was received, not as names to fix.  A
+    repaired call that binds but leaves a required value empty (None, or a
+    blank string json_repair filled in) is refused the same way.
     """
     import inspect
     args, kwargs = tool_call_shape(arguments)
@@ -4114,18 +4116,30 @@ def tool_argument_error(func, func_name, arguments, repaired):
         sig = inspect.signature(func)
     except (TypeError, ValueError):
         return None
-    try:
-        sig.bind(*args, **kwargs)
-        return None
-    except TypeError:
-        pass
     params =[p for p in sig.parameters.values()
               if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)]
+    try:
+        bound = sig.bind(*args, **kwargs).arguments
+    except TypeError:
+        bound = None
+    # A value json_repair filled in, not one the model wrote: a cut-off call
+    # '{"text":' repairs to {"text": ""}, which binds, and the tool ran with
+    # nothing (log RCA defect 14, leftover).  So after a repair, a REQUIRED
+    # value that is empty is refused like a missing one.  Strict JSON with
+    # "" is the model's own choice and runs.
+    def blank(value):
+        return value is None or (isinstance(value, str) and not value.strip())
+
+    emptied = ([p.name for p in params
+                if p.default is p.empty and blank(bound.get(p.name))]
+               if repaired and bound is not None else [])
+    if bound is not None and not emptied:
+        return None
     takes_any = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
     names = {p.name for p in params}
     expected = ', '.join(p.name + (' (required)' if p.default is p.empty else '')
                          for p in params) or 'none'
-    if args:
+    if args and bound is None:
         # Positional values: there are no names to report as unknown.
         return (f"Error: {func_name} was not run: its arguments were not one "
                 f"JSON object of named values. Expected parameters: "
@@ -4133,7 +4147,8 @@ def tool_argument_error(func, func_name, arguments, repaired):
                 f"using these names.")
     arguments = kwargs
     missing = [p.name for p in params
-               if p.default is p.empty and p.name not in arguments]
+               if bound is None and p.default is p.empty
+               and p.name not in arguments]
     unknown = [] if takes_any else [k for k in arguments if k not in names]
     if repaired:
         text = (f"Error: the arguments for {func_name} were not valid JSON, so "
@@ -4147,6 +4162,8 @@ def tool_argument_error(func, func_name, arguments, repaired):
             text += f" Unknown argument(s): {', '.join(map(str, unknown))}."
     if missing:
         text += f" Missing required argument(s): {', '.join(missing)}."
+    if emptied:
+        text += f" Required argument(s) left empty: {', '.join(emptied)}."
     return (text + f" Expected parameters: {expected}. Call {func_name} again "
             f"with one JSON object using these names.")
 

@@ -160,15 +160,45 @@ def client_address() -> str:
         TRUSTED_PROXY restores nothing; leave it unset.
     A header never makes a request local either way (_is_local_request).
     """
-    peer = _norm_ip(request.remote_addr or '')
+    return _client_from(request.remote_addr,
+                        request.headers.get('X-Forwarded-For'))
+
+
+def _client_from(remote, forwarded) -> str:
+    """client_address over raw values: the socket peer and the
+    X-Forwarded-For header, as a Flask request or a WSGI environ has them.
+    The only place either is interpreted."""
+    peer = _norm_ip(remote or '')
     if not _is_forwarder(peer):
         return peer
-    hops = [_norm_ip(h) for h in
-            (request.headers.get('X-Forwarded-For') or '').split(',')
-            if h.strip()]
+    hops = [_norm_ip(h) for h in (forwarded or '').split(',') if h.strip()]
     if hops:
         return hops[-1]
     return '' if peer in _trusted_proxies() else peer
+
+
+def _local_from(remote, forwarded) -> bool:
+    """_is_local_request's rule over raw values (see there)."""
+    if ci_trusts_every_caller():
+        return True
+    if not _is_loopback(remote or ''):
+        return False
+    return _is_loopback(_client_from(remote, forwarded))
+
+
+def client_key() -> str:
+    """client_address, or the socket peer when a trusted proxy named no
+    client: the key rate limiters and caller identities charge.  Never ''
+    for a request that has a socket peer (every such request would share one
+    empty key)."""
+    return client_address() or _norm_ip(request.remote_addr or '')
+
+
+def is_local_environ(environ) -> bool:
+    """_is_local_request for a raw WSGI environ (Nunba's app.py dispatcher
+    decides before any Flask app has the request).  Same rule, same code."""
+    return _local_from(environ.get('REMOTE_ADDR', ''),
+                       environ.get('HTTP_X_FORWARDED_FOR', ''))
 
 
 def _is_local_request() -> bool:
@@ -185,11 +215,8 @@ def _is_local_request() -> bool:
     NUNBA_CI=1 in a build run from source), as Nunba's
     routes.auth.is_local_environ does through the same function.
     """
-    if ci_trusts_every_caller():
-        return True
-    if not _is_loopback(request.remote_addr or ''):
-        return False
-    return _is_loopback(client_address())
+    return _local_from(request.remote_addr,
+                       request.headers.get('X-Forwarded-For'))
 
 
 # ── CSRF defense-in-depth (Phase 9.5) ──────────────────────────────

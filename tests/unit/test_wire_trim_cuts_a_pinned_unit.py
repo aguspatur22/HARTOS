@@ -90,3 +90,49 @@ def test_parallel_results_are_cut_to_fit(monkeypatch):
         assert m['content'].startswith('R'), m['content'][:40]
     # The newest (protected) result keeps at least as much as its siblings.
     assert len(kept[-1]['content']) >= max(len(m['content']) for m in kept[:-1])
+
+
+# ── review of the f97b6bed8 end state (rvtrim_probe2.py) ──────────────────
+
+def _write_call(content, body_text):
+    return {'role': 'assistant', 'content': content,
+            'tool_calls': [{'id': 'c0', 'type': 'function', 'function': {
+                'name': 'write_file',
+                'arguments': json.dumps({'path': 'x.py', 'content': body_text})}}]}
+
+
+def _write_shape(content, body_text):
+    sys_m = {'role': 'system', 'content': 'sys ' * 500}
+    task = {'role': 'user', 'name': 'User', 'content': 'task ' * 200}
+    verdict = {'role': 'user', 'name': 'StatusVerifier',
+               'content': '{"status":"pending"}'}
+    call = _write_call(content, body_text)
+    res = {'role': 'tool', 'tool_call_id': 'c0', 'content': 'written'}
+    return [sys_m, task, call, res, verdict]
+
+
+def _kept_args(out):
+    return [tc for m in out for tc in (m.get('tool_calls') or [])][0][
+        'function']['arguments']
+
+
+def test_a_call_with_text_content_has_its_arguments_cut_too(monkeypatch):
+    """The cut touched a call's arguments only when it had no text: 40k
+    arguments plus "Writing the file." ended at 20,416 tokens against 7,424."""
+    out, est_after, budget = _trim(
+        _write_shape('Writing the file.', 'print(1)\n' * 4000), monkeypatch)
+    assert est_after <= budget, (est_after, budget)
+    args = _kept_args(out)
+    assert is_wire_json(args) and isinstance(json.loads(args), dict)
+    assert _paired(out)
+
+
+def test_quote_dense_arguments_are_cut_to_fit(monkeypatch):
+    """Sized before json.dumps escaping, quote-, backslash- and emoji-dense
+    arguments stayed 10k-19k tokens against 7,424."""
+    for dense in ('"q" \ ' * 6000, '\n\t' * 8000, '\U0001F600 ' * 6000):
+        with_budget = _trim(_write_shape(None, dense), monkeypatch)
+        out, est_after, budget = with_budget
+        assert est_after <= budget, (dense[:10], est_after, budget)
+        args = _kept_args(out)
+        assert is_wire_json(args) and isinstance(json.loads(args), dict)

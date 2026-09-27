@@ -341,30 +341,30 @@ class TestCredentialEndpoints:
 # ═══════════════════════════════════════════════════════════════
 
 class TestLocalhostEnforcement:
+    """is_local_request() is core.auth_local's one local check, read from
+    the current request (review of 291e548df, F3)."""
 
-    def test_localhost_ipv4(self):
-        assert is_local_request('127.0.0.1') is True
+    @pytest.fixture
+    def app(self, monkeypatch):
+        from flask import Flask
+        monkeypatch.delenv('TRUSTED_PROXY', raising=False)
+        monkeypatch.delenv('NUNBA_CI', raising=False)
+        return Flask(__name__)
 
-    def test_localhost_ipv6(self):
-        assert is_local_request('::1') is True
+    @pytest.mark.parametrize('addr, local', [
+        ('127.0.0.1', True), ('::1', True), ('::ffff:127.0.0.1', True),
+        ('0.0.0.0', False),          # bind-any sentinel, never a client
+        ('192.168.1.100', False), ('8.8.8.8', False), ('', False)])
+    def test_the_socket_peer_decides(self, app, addr, local):
+        with app.test_request_context(environ_base={'REMOTE_ADDR': addr}):
+            assert is_local_request() is local
 
-    def test_localhost_name(self):
-        assert is_local_request('localhost') is True
-
-    def test_bind_all(self):
-        assert is_local_request('0.0.0.0') is True
-
-    def test_external_ip_rejected(self):
-        assert is_local_request('192.168.1.100') is False
-
-    def test_public_ip_rejected(self):
-        assert is_local_request('8.8.8.8') is False
-
-    def test_empty_rejected(self):
-        assert is_local_request('') is False
-
-    def test_none_rejected(self):
-        assert is_local_request(None) is False
+    def test_a_forwarded_loopback_claim_is_not_local(self, app, monkeypatch):
+        monkeypatch.setenv('TRUSTED_PROXY', '10.0.0.1')
+        with app.test_request_context(
+                environ_base={'REMOTE_ADDR': '10.0.0.1'},
+                headers={'X-Forwarded-For': '127.0.0.1'}):
+            assert is_local_request() is False
 
 
 class TestEndpointLocalhostGate:
@@ -378,7 +378,7 @@ class TestEndpointLocalhostGate:
 
         @app.route('/api/credentials/submit', methods=['POST'])
         def submit():
-            if not is_local_request(flask_request.remote_addr):
+            if not is_local_request():
                 return jsonify({'error': 'localhost only'}), 403
             data = flask_request.get_json(silent=True) or {}
             key_name = (data.get('key_name') or '').strip()
@@ -391,7 +391,7 @@ class TestEndpointLocalhostGate:
 
         @app.route('/api/credentials/pending', methods=['GET'])
         def pending():
-            if not is_local_request(flask_request.remote_addr):
+            if not is_local_request():
                 return jsonify({'error': 'localhost only'}), 403
             vault = AIKeyVault.get_instance()
             return jsonify({'pending': vault.get_pending_requests()})

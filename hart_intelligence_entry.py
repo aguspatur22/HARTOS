@@ -956,7 +956,7 @@ app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_h
 # One payload policy for app AND transport: core.serve passes the same
 # constant to Hypercorn's WSGI middleware (whose 64 KB library default
 # otherwise transport-rejects bodies Flask's own cap here would accept).
-from core.constants import MAX_PAYLOAD_BYTES
+from core.constants import MAX_PAYLOAD_BYTES, SHELL_COMMAND_TIMEOUT_S
 app.config['MAX_CONTENT_LENGTH'] = MAX_PAYLOAD_BYTES  # 2MB default, HEVOLVE_MAX_PAYLOAD_BYTES to override
 
 # ── LLM outbound logger ───────────────────────────────────────────────
@@ -1548,7 +1548,7 @@ try:
         Secrets never leave the user's device. This endpoint rejects
         any request that doesn't originate from the local machine.
         """
-        if not is_local_request(request.remote_addr):
+        if not is_local_request():
             return jsonify({'error': 'Credential endpoints are localhost only. '
                             'Secrets never leave your device.'}), 403
         data = request.get_json(silent=True) or {}
@@ -1571,7 +1571,7 @@ try:
     @_json_endpoint
     def _api_credentials_pending():
         """List pending credential requests — LOCALHOST ONLY."""
-        if not is_local_request(request.remote_addr):
+        if not is_local_request():
             return jsonify({'error': 'Credential endpoints are localhost only.'}), 403
         vault = _VaultCls.get_instance()
         return jsonify({'pending': vault.get_pending_requests()})
@@ -3430,7 +3430,7 @@ def _handle_shell_command_tool(input_text: str) -> str:
     _run.step(iteration=1, action='shell', phase='executing', caption=_caption)
     _phase, _err = 'completed', ''
     try:
-        proc = run_bounded(argv, timeout=30)
+        proc = run_bounded(argv, timeout=SHELL_COMMAND_TIMEOUT_S)
     except FileNotFoundError as e:
         _phase, _err = 'failed', f'interpreter not found — {e}'
         return f"Shell_Command: interpreter not found — {e}"
@@ -3448,7 +3448,8 @@ def _handle_shell_command_tool(input_text: str) -> str:
     # run_bounded never raises TimeoutExpired — it reports the kill this way.
     if proc.timed_out:
         return (
-            "Shell_Command timed out after 30s. For long-running work use "
+            f"Shell_Command timed out after {SHELL_COMMAND_TIMEOUT_S}s. "
+            "For long-running work use "
             "Execute_Coding_Task instead, which has a longer budget."
         )
 
@@ -4790,14 +4791,14 @@ def _handle_agentic_router_tool(input_text):
     sets thread-local flags that the /chat handler checks after get_ans() returns.
     """
     try:
-        import concurrent.futures
-        from integrations.agentic_router import build_agentic_plan
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(build_agentic_plan, input_text, PROMPTS_DIR)
-            try:
-                plan = future.result(timeout=15)
-            except concurrent.futures.TimeoutError:
-                return f"I'll help you with: {input_text}. Let me work on this directly."
+        from integrations.agentic_router import build_agentic_plan_bounded
+        # Bounded in agentic_router, on core.subprocess_safe.call_bounded.
+        # This was `with ThreadPoolExecutor(...) as ex: ex.submit(...)
+        # .result(timeout=15)`, whose `with` exit joins the stuck worker, so
+        # the 15 s never released this turn (review F7, 2026-09-27).
+        plan = build_agentic_plan_bounded(input_text, PROMPTS_DIR)
+        if plan is None:
+            return f"I'll help you with: {input_text}. Let me work on this directly."
 
         thread_local_data.set_agentic_routing(
             task_description=plan['task_description'],
@@ -9399,7 +9400,8 @@ def chat():
         from integrations.social.rate_limiter import _limiter
         # Rate limit by IP always (prevents user_id rotation bypass).
         # Authenticated user_id added as secondary key for per-user tracking.
-        rate_user = request.remote_addr
+        from core.auth_local import client_key as _client_key
+        rate_user = _client_key()
         if not _limiter.check(str(rate_user), 'chat', max_tokens=30, refill_rate=30 / 60):
             return jsonify({'error': 'Rate limit exceeded (30/min). Please wait.', 'response': None}), 429
     except ImportError:
@@ -11005,9 +11007,10 @@ def vlm_stop():
     )
 
     if data.get('scope') == 'node':
+        from core.auth_local import client_key as _client_key
         if not _is_local_request():
             app.logger.warning(f'vlm_stop: node-wide stop refused for '
-                               f'{request.remote_addr}: not on this machine')
+                               f'{_client_key()}: not on this machine')
             return jsonify({
                 'error': 'forbidden',
                 'message': 'scope=node is only accepted from this machine.',
@@ -11016,7 +11019,7 @@ def vlm_stop():
                    for uid, pid in list_active_sessions()
                    if request_stop(uid, pid)]
         app.logger.warning(f'vlm_stop: node-wide stop from '
-                           f'{request.remote_addr}: {len(stopped)} loop(s) '
+                           f'{_client_key()}: {len(stopped)} loop(s) '
                            f'{stopped}')
         return jsonify({
             'status': 'stopped' if stopped else 'no_active_session',

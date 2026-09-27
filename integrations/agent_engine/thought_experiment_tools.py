@@ -53,37 +53,49 @@ def cast_experiment_vote(experiment_id: str, voter_id: str,
                           suggestion: str = '',
                           voter_type: str = 'agent',
                           confidence: float = 0.8) -> str:
-    """Cast an AGENT's vote on a thought experiment.
+    """Cast the CALLING agent's vote on a thought experiment.
 
-    This is the agent entry (autogen, MCP); it is no signed-in person, so
-    it casts agent votes only.  ONE rule: ``voter_id`` must resolve to an
-    agent -- a users row with user_type 'agent', by its id or its prompt id
-    (User.agent_id) -- and the vote is recorded under that row's id as an
-    agent vote, whatever ``voter_type`` says (kept in the signature for
-    existing callers, and ignored).  tally_votes counts it as its owner's
-    identity: an agent is its owner, so two agents of one owner are one
-    identity, and no agent is ever the steward (voting_rules.is_steward).
-    Anything else -- a person's id, the literal 'steward', an unknown id --
-    is refused and nothing is written: that is how an agent used to cast
-    people's full-weight votes and fake the distinct-identity quorum.  A
-    person votes through the signed-in route (POST
-    /api/social/experiments/<id>/vote, voter_id from the JWT)."""
+    ONE rule: the voter is the agent whose turn is running, never the
+    argument.  It comes from the request's thread-local prompt_id
+    (hartos.threadlocal, set by the /chat handler), resolved to that agent's
+    users row (user_type 'agent', by id or prompt id); the vote is recorded
+    under that row as an agent vote, whatever ``voter_type`` says (kept in
+    the signature for existing callers, and ignored).  tally_votes counts it
+    as its owner's identity: an agent is its owner, so two agents of one
+    owner are one identity, and no agent is ever the steward
+    (voting_rules.is_steward).  ``voter_id`` may be empty or name that same
+    agent; naming anyone else -- a person, another agent, 'steward' -- is
+    refused and nothing is written.  No resolved caller, no vote: the MCP
+    bridge runs tools with no caller (an MCP call is no agent's turn), so a
+    vote there is refused.  A person votes through the signed-in route
+    (POST /api/social/experiments/<id>/vote, voter_id from the JWT)."""
     try:
         from sqlalchemy import or_
+        from hartos.threadlocal import thread_local_data
         from integrations.social.models import User, db_session
         from integrations.social.thought_experiment_service import ThoughtExperimentService
 
+        caller = thread_local_data.get_prompt_id()
         with db_session() as db:
-            name = str(voter_id)
-            agent = db.query(User).filter(
-                User.user_type == 'agent',
-                or_(User.id == name, User.agent_id == name)).first()
+            agent = None
+            if caller not in (None, ''):
+                agent = db.query(User).filter(
+                    User.user_type == 'agent',
+                    or_(User.id == str(caller),
+                        User.agent_id == str(caller))).first()
             if agent is None:
                 return json.dumps({
                     'success': False,
-                    'reason': 'voter_is_not_an_agent',
-                    'detail': 'this tool casts an agent\'s own vote; a '
-                              'person votes through the signed-in route',
+                    'reason': 'no_calling_agent',
+                    'detail': 'this tool casts the running agent\'s own '
+                              'vote; a person votes through the signed-in '
+                              'route',
+                })
+            name = str(voter_id or '')
+            if name and name not in (str(agent.id), str(agent.agent_id)):
+                return json.dumps({
+                    'success': False,
+                    'reason': 'voter_is_not_the_calling_agent',
                 })
             result = ThoughtExperimentService.cast_vote(
                 db, experiment_id, agent.id,

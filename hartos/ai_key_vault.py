@@ -659,30 +659,17 @@ def request_credential(resource_description, agent_id=None) -> str:
 
 # ── Localhost enforcement ──────────────────────────────────────────
 
-# Addresses that are "this machine" — secrets never leave the device
-_LOCAL_ADDRS = frozenset({
-    '127.0.0.1', '::1', 'localhost', '0.0.0.0',
-})
+def is_local_request() -> bool:
+    """Does the current Flask request come from this machine?
 
-
-def is_local_request(remote_addr: str) -> bool:
-    """Check if a request originates from the local device.
-
-    Credential endpoints MUST reject non-local requests.
-    Secrets never leave the user's device — no exceptions.
-
-    CI bypass: when ``NUNBA_CI=1`` (set by docker-compose.staging.yml)
-    the function trusts ALL request origins.  This is necessary
-    because the e2e probe runs from the GitHub runner host and hits
-    the container via docker NAT — the request appears to come from
-    the docker bridge IP (e.g. 172.17.0.1), not 127.0.0.1, so the
-    strict check would reject it.  Production builds NEVER set
-    NUNBA_CI=1; the env var is opt-in and explicitly gated to the
-    staging compose file.
+    Credential endpoints MUST reject non-local requests: secrets never leave
+    the user's device.  The one rule, core.auth_local._is_local_request
+    (review of 291e548df, F3).  It used to be a copy that read remote_addr
+    itself, trusted '0.0.0.0' (the bind-any sentinel, never a client
+    address; integrations.agent_engine.shell_auth records why that was a
+    privilege gap) and honoured NUNBA_CI on an installed build too; the one
+    rule keeps the staging container's bypass (ci_trusts_every_caller) for
+    builds run from source only.
     """
-    import os as _os
-    if _os.environ.get('NUNBA_CI', '') == '1':
-        return True
-    if not remote_addr:
-        return False
-    return remote_addr in _LOCAL_ADDRS
+    from core.auth_local import _is_local_request
+    return _is_local_request()

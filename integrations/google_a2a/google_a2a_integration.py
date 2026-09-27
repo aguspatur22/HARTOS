@@ -378,11 +378,8 @@ def _gate_caller() -> str:
         # Set by the gate only when the key MATCHED; a header alone is not
         # an identity (review of 436580009).
         return 'api_key'
-    try:
-        from core.auth_local import client_address
-        return f'addr:{client_address() or request.remote_addr or ""}'
-    except Exception:
-        return f'addr:{request.remote_addr or ""}'
+    from core.auth_local import client_key
+    return f'addr:{client_key()}'
 
 
 class A2AProtocolServer:

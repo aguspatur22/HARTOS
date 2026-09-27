@@ -1063,6 +1063,12 @@ class DiscoverablePref(Base):
     last_toggle_at = Column(DateTime, nullable=True)
     current_pubkey = Column(String(128), nullable=True, index=True)
     pubkey_registered_at = Column(DateTime, nullable=True)
+    # v59 persona card: what the user's agent may tell a matched person's
+    # agent.  interests_discoverable is the user's yes to being matched
+    # on interests beyond friends and nearby.
+    bio = Column(Text, nullable=True)
+    recognize_me = Column(String(280), nullable=True)
+    interests_discoverable = Column(Boolean, default=False, nullable=False)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
     user = relationship('User', foreign_keys=[user_id])
@@ -1079,6 +1085,9 @@ class DiscoverablePref(Base):
             'vibe_tags': self.vibe_tags or [],
             'toggle_count_24h': self.toggle_count_24h or 0,
             'current_pubkey': self.current_pubkey,
+            'bio': self.bio or '',
+            'recognize_me': self.recognize_me or '',
+            'interests_discoverable': bool(self.interests_discoverable),
         }
 
 

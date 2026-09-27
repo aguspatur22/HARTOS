@@ -15,6 +15,8 @@ import time
 import logging
 import re
 
+from core.constants import SHELL_COMMAND_TIMEOUT_S
+
 logger = logging.getLogger('hevolve.vlm.local_loop')
 
 # Max iterations to prevent infinite loops (same safeguard as OmniParser)
@@ -238,17 +240,67 @@ def _step_caption(action_json: dict, limit: int = 160) -> str:
     return line if len(line) <= limit else line[:limit - 1].rstrip() + '…'
 
 
+# ─── Actions still running after the loop gave up on them ───
+# An action abandoned at the time budget keeps running on its worker (an
+# in-process call such as os.startfile cannot be stopped from outside).
+# Review F3 (2026-09-27, probe vlm_probe.py q2): ten runs whose action never
+# returned left ten live 'hart-vlm-action' workers, and nothing stopped the
+# next run firing the same action at the same target while the first still
+# ran.  This counts them per target; a new action on a target with one still
+# running is refused instead of started.
+_abandoned_lock = _threading.Lock()
+_abandoned_by_target: dict = {}          # (action, target) -> still running
+
+
+def _action_target(action_payload: dict) -> tuple:
+    """What an action acts ON: the action name plus its path / command /
+    text / coordinate -- whichever it carries."""
+    act = str(action_payload.get('action') or '')
+    for key in ('path', 'command', 'text', 'coordinate'):
+        value = action_payload.get(key)
+        if value:
+            return act, str(value)
+    return act, ''
+
+
+def abandoned_actions_in_flight() -> int:
+    """How many actions the loop gave up on are still running, all targets."""
+    with _abandoned_lock:
+        return sum(_abandoned_by_target.values())
+
+
+def _action_grace_s(action: str) -> float:
+    """Extra wait past the budget for an action that bounds ITSELF.
+
+    A shell step runs through Shell_Command, which kills it at
+    SHELL_COMMAND_TIMEOUT_S, so waiting that long past the budget costs at
+    most that and returns its REAL result instead of "result unknown"
+    (review F2, 2026-09-27).  Nothing else bounds itself, so gets none.
+    """
+    return float(SHELL_COMMAND_TIMEOUT_S) if action == 'shell' else 0.0
+
+
 def _execute_within_budget(execute_action, action_payload, tier, *,
-                           safety, verify, remaining_s):
+                           safety, verify, remaining_s, cancel=None):
     """Run one action, but never past the loop's remaining time budget.
 
-    Returns the action's result dict, or None when the budget ran out first:
-    either nothing was left (the action is NOT started), or the action was
-    still running at the deadline (the caller is released; the action is
-    left to finish on its worker -- an in-process call such as os.startfile
-    cannot be stopped from outside).  An exception the action raised within
-    the budget is re-raised here, so the iteration's own error handling sees
-    it exactly as before.
+    Returns ``(outcome, result)``; ``result`` is the action's dict only for
+    ``'done'``:
+
+      * ``'done'``        -- it returned in time;
+      * ``'no_budget'``   -- nothing was left, so it was NOT started;
+      * ``'busy'``        -- NOT started: an earlier action on the same target
+                             is still running (see _abandoned_by_target);
+      * ``'abandoned'``   -- still running at the deadline (plus the action's
+                             own grace, _action_grace_s).  The caller is
+                             released; the action finishes on its worker and
+                             its result is unknown -- it may yet succeed;
+      * ``'stopped'``     -- still running when ``cancel`` (the session's
+                             Stop) was set; result unknown likewise;
+      * ``'not_started'`` -- Stop was already set; nothing ran.
+
+    An exception the action raised in time is re-raised, so the iteration's
+    own error handling sees it exactly as before.
 
     Measured live 2026-09-27 (daemon goal b18bba6f): one open_file_gui --
     os.startfile on a .py associated with pycharm64.exe -- returned after
@@ -256,25 +308,56 @@ def _execute_within_budget(execute_action, action_payload, tier, *,
 
     The action runs on a worker that adopts this thread's hartos.threadlocal
     state: the shell tool inside it checks consent against prompt_id and
-    announces itself as a step of the run stamped there.
+    announces itself as a step of the run stamped there.  When the action is
+    abandoned that stamp is marked closed, so its late steps cannot write
+    into the finished run (review F1).
     """
     if remaining_s <= 0:
-        return None
+        return 'no_budget', None
+    target = _action_target(action_payload)
+    with _abandoned_lock:
+        if _abandoned_by_target.get(target):
+            return 'busy', None
     from core.subprocess_safe import call_bounded
     from hartos.threadlocal import thread_local_data
     context = thread_local_data.snapshot()
+    state = {'started': False, 'done': False, 'abandoned': False}
 
     def _act():
-        thread_local_data.adopt(context)
-        return execute_action(action_payload, tier, safety=safety, verify=verify)
+        with _abandoned_lock:
+            state['started'] = True
+        try:
+            thread_local_data.adopt(context)
+            return execute_action(action_payload, tier, safety=safety, verify=verify)
+        finally:
+            with _abandoned_lock:
+                state['done'] = True
+                if state['abandoned']:
+                    left = _abandoned_by_target.get(target, 0) - 1
+                    if left > 0:
+                        _abandoned_by_target[target] = left
+                    else:
+                        _abandoned_by_target.pop(target, None)
 
     finished, result, error = call_bounded(
-        _act, remaining_s, name='hart-vlm-action')
-    if not finished:
-        return None
-    if error is not None:
-        raise error
-    return result
+        _act, remaining_s + _action_grace_s(action_payload.get('action')),
+        name='hart-vlm-action', cancel=cancel)
+    if finished:
+        if error is not None:
+            raise error
+        return 'done', result
+    stopped = cancel is not None and cancel.is_set()
+    with _abandoned_lock:
+        if not state['started']:
+            return 'not_started', None
+        if not state['done']:
+            state['abandoned'] = True
+            _abandoned_by_target[target] = _abandoned_by_target.get(target, 0) + 1
+        in_flight = sum(_abandoned_by_target.values())
+    from integrations.vlm.activity_stream import close_run_stamp
+    close_run_stamp(context.get('activity_run'))
+    logger.warning(f"VLM loop: {in_flight} abandoned action(s) still running")
+    return ('stopped' if stopped else 'abandoned'), None
 
 
 def run_local_agentic_loop(
@@ -458,7 +541,10 @@ def _drive_local_agentic_loop(
     # signal it.  Cleanup happens just before the final return below
     # (no try/finally — the existing iteration body wraps every error
     # in its own try/continue so exceptions never escape this scope).
-    _register_session(user_id, prompt_id)
+    # The Event is also handed to each action's bounded wait, so Stop ends
+    # the wait on a stuck action instead of the budget doing it (review F4).
+    _stop_event = _register_session(user_id, prompt_id)
+    _finish_error = ''
 
     # Each goal gets its own action budget.  The SessionGuard is one
     # process-wide object; nothing reset it, so its 100-action cap was spent
@@ -901,21 +987,48 @@ def _drive_local_agentic_loop(
             # The ETA bounds the action in flight, not only the gap between
             # iterations -- see _execute_within_budget.
             _remaining = max_eta - (time.time() - start_time)
-            result = _execute_within_budget(
+            _outcome, result = _execute_within_budget(
                 execute_action, action_payload, tier,
-                safety=_safety_on, verify=_verify_on, remaining_s=_remaining)
-            _out_of_budget = result is None
-            if _out_of_budget:
-                _why = (f"{next_action} did not finish within the {max_eta}s "
-                        f"budget; abandoned after "
-                        f"{time.time() - start_time:.0f}s"
-                        if _remaining > 0 else
-                        f"{next_action} not started: the {max_eta}s budget "
+                safety=_safety_on, verify=_verify_on, remaining_s=_remaining,
+                cancel=_stop_event)
+            # Where this iteration ends the run, and why.  An action still
+            # running when the loop lets go of it did not FAIL: nobody knows
+            # what it did, and calling it a failure invites the caller to
+            # repeat a step that may yet complete (review F2).
+            _ends_run = None
+            _why = ''
+            _unknown = _outcome in ('abandoned', 'stopped')
+            if _outcome == 'abandoned':
+                _grace = _action_grace_s(next_action)
+                _why = (f"{next_action} still running when the time ran out "
+                        f"({max_eta}s budget"
+                        + (f" + {_grace:.0f}s own cap" if _grace else '')
+                        + "); result unknown - check its effect before "
+                        "repeating it")
+                _ends_run = 'timeout'
+            elif _outcome == 'stopped':
+                _why = (f"{next_action} still running when Stop was pressed; "
+                        "result unknown - check its effect before repeating it")
+                _ends_run = 'stopped'
+            elif _outcome == 'no_budget':
+                _why = (f"{next_action} not started: the {max_eta}s budget "
                         f"was spent before it")
+                _ends_run = 'timeout'
+            elif _outcome == 'not_started':
+                _why = f"{next_action} not started: Stop was pressed"
+                _ends_run = 'stopped'
+            elif _outcome == 'busy':
+                _why = (f"{next_action} not started: an earlier {next_action} "
+                        f"on the same target is still running (abandoned at "
+                        f"its time budget; {abandoned_actions_in_flight()} "
+                        f"abandoned action(s) in flight)")
+            if _outcome != 'done':
                 logger.warning(
                     f"VLM loop: {_why} (iteration {iteration + 1}, "
                     f"user={user_id}, prompt={prompt_id})")
-                result = {'output': '', 'status': 'error', 'error': _why}
+                result = ({'output': _why} if _unknown else
+                          {'output': '', 'status': 'blocked', 'error': _why,
+                           'block_reason': _why})
             # A result carrying an error did not happen on the machine: the
             # safety guard refused it (status 'safety_blocked') or the
             # executor failed ({'error': ...}, often with no status).  Both
@@ -926,23 +1039,32 @@ def _drive_local_agentic_loop(
             _out = result.get('output', '') or ''
             if _err:
                 _out = (f"{_out}\n" if _out else '') + f"FAILED: {_err}"
-            if action_ok:
+            if _unknown:
+                action_ok = None      # neither done nor failed: unknown
+            elif action_ok:
                 consecutive_action_errors = 0
             else:
                 consecutive_action_errors += 1
 
-            _phase = ('completed' if action_ok else
+            # A step whose result is unknown gets no outcome phase of its
+            # own; the run's close below carries why (finish error).  Stop
+            # keeps the 'stopped' step the pre-execution Stop path records.
+            _phase = ('stopped' if _outcome == 'stopped' else
+                      None if _unknown else
+                      'completed' if action_ok else
                       ('blocked' if result.get('block_reason') or
                        result.get('status') == 'safety_blocked' else 'failed'))
-            record_activity(
-                user_id=user_id, prompt_id=prompt_id, run_id=activity_run_id,
-                iteration=iteration + 1, action=next_action, phase=_phase,
-                agent_id=message.get('agent_id') or message.get('daemon_id') or '',
-                steering_agent_id=steering_agent_id,
-                audit_ref={'activity_id': action_payload['_activity_id']},
-                error=str(_err or result.get('block_reason') or ''),
-                caption=_caption,
-            )
+            if _phase is not None:
+                record_activity(
+                    user_id=user_id, prompt_id=prompt_id, run_id=activity_run_id,
+                    iteration=iteration + 1, action=next_action, phase=_phase,
+                    agent_id=message.get('agent_id') or message.get('daemon_id') or '',
+                    steering_agent_id=steering_agent_id,
+                    audit_ref={'activity_id': action_payload['_activity_id']},
+                    error=str(_err or result.get('block_reason')
+                              or (_why if _unknown else '')),
+                    caption=_caption,
+                )
 
             # Surface coordinate + strategy in the response content so
             # observers (benchmark, audit, /visual_agent telemetry,
@@ -965,8 +1087,9 @@ def _drive_local_agentic_loop(
                 "iteration": iteration + 1,
             })
 
-            if _out_of_budget:
-                exit_reason = 'timeout'
+            if _ends_run:
+                exit_reason = _ends_run
+                _finish_error = _why
                 break
 
             # Bail after 3 consecutive action errors — something is structurally
@@ -1009,7 +1132,8 @@ def _drive_local_agentic_loop(
     # the caller receives, and the same call takes the ribbon down.  Steps
     # above never change the task's status, so without this the run would sit
     # IN_PROGRESS forever.
-    run.finish(exit_reason=exit_reason, iteration=len(extracted_responses))
+    run.finish(exit_reason=exit_reason, iteration=len(extracted_responses),
+               error=_finish_error)
 
     # status mirrors exit_reason: only 'done' is a real success. Callers
     # (LangChain router, autogen) can inspect exit_reason to craft an honest

@@ -248,6 +248,14 @@ def _names_the_field(expr, assigned):
         v in assigned.get(n.id, '') for v in _VOCAB) for n in ast.walk(expr))
 
 
+def _reads_field_with_get(node):
+    """`<x>.get('can_perform_without_user_input', ...)`."""
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == 'get' and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value == _FIELD)
+
+
 def private_autonomy_checks(src, filename='<src>'):
     """Every private answer to "autonomous?" / "needs the user?" in *src*,
     as (line, func).  Three shapes:
@@ -276,10 +284,16 @@ def private_autonomy_checks(src, filename='<src>'):
             if (attr in ('startswith', 'endswith')
                     and _names_the_field(node.func.value, assigned)):
                 hits.append((node.lineno, func))
-            if (attr == 'get' and len(node.args) >= 2
-                    and isinstance(node.args[0], ast.Constant)
-                    and node.args[0].value == _FIELD
-                    and _autonomous_default(node.args[1])):
+            if _reads_field_with_get(node):
+                defaults = list(node.args[1:2]) + [
+                    k.value for k in node.keywords if k.arg == 'default']
+                if any(_autonomous_default(d) for d in defaults):
+                    hits.append((node.lineno, func))
+        # `.get(field) or 'yes'`: the same autonomous default, spelled with
+        # `or` (review of d8fe536b2, F2).
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+            if (any(_reads_field_with_get(v) for v in node.values)
+                    and any(_autonomous_default(v) for v in node.values)):
                 hits.append((node.lineno, func))
         for child in ast.iter_child_nodes(node):
             visit(child, func, assigned)
@@ -335,9 +349,13 @@ def test_source_guard_is_autonomous_has_one_rule():
     "def f(a):\n    v = str(a.get('can_perform_without_user_input')).lower()\n"
     "    return v.startswith('no')\n",
     "def f(a):\n    return a.get('can_perform_without_user_input', 'yes')\n",
+    # review of d8fe536b2, F2
+    "def f(a):\n    return a.get('can_perform_without_user_input') or 'yes'\n",
+    "def f(a):\n    return a.get('can_perform_without_user_input', default=True)\n",
 ], ids=['eq-yes-subscript', 'eq-Yes-get', 'eq-yes-attr', 'in-via-variable',
         'ne-yes-reader', 'get-default-True', 'ne-no', 'startswith-y',
-        'startswith-no-via-variable', 'get-default-yes'])
+        'startswith-no-via-variable', 'get-default-yes', 'get-or-yes',
+        'get-default-kw-True'])
 def test_source_guard_sees_every_shape_of_a_copy(snippet):
     """Anti-vacuity: the guard above can fail, once per shape."""
     hits = private_autonomy_checks(snippet)
@@ -350,6 +368,9 @@ def test_source_guard_sees_every_shape_of_a_copy(snippet):
     "def f(d):\n    return d.get('can_perform_without_user_input', 'no')\n",
     "def f(d):\n    return d.get('can_perform_without_user_input')\n",
     "def f(s):\n    return s.startswith('no')\n",
-], ids=['unrelated-yes', 'get-default-no', 'get-no-default', 'unrelated-startswith'])
+    "def f(d):\n    return (d.get('can_perform_without_user_input') or '').strip()\n",
+    "def f(d):\n    return d.get('can_perform_without_user_input', default='no')\n",
+], ids=['unrelated-yes', 'get-default-no', 'get-no-default', 'unrelated-startswith',
+        'get-or-empty', 'get-default-kw-no'])
 def test_source_guard_leaves_unrelated_code_alone(src):
     assert private_autonomy_checks(src) == []

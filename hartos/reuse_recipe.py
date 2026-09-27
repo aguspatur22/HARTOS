@@ -647,7 +647,7 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
     return f'Message sent successfully to user with request_id: {original_request_id}'
 
 
-def _reuse_speaker_says_to_user(user_id, message, prompt_id):
+def _reuse_speaker_says_to_user(user_id, message, prompt_id, inp=''):
     """Send a group member's mid-round message2userfinal to the user, but
     only when it IS something the user can read.
 
@@ -658,7 +658,9 @@ def _reuse_speaker_says_to_user(user_id, message, prompt_id):
     which on the desktop land in the user's chat (review of 31ea54045).
     The question "is this for the user?" already has one answer,
     _reuse_message_is_user_answer; this asks it first.  Returns whether it
-    sent."""
+    sent.  Also the one door for the scheduled (time_based_execution) and
+    visual (visual_based_execution) runs' results, which have no /chat
+    reply; ``inp`` is the task they ran."""
     if not _reuse_message_is_user_answer(message):
         _ctx_safe_log(
             'info',
@@ -668,7 +670,7 @@ def _reuse_speaker_says_to_user(user_id, message, prompt_id):
     json_obj = retrieve_json((message or {}).get('content') or '')
     if not isinstance(json_obj, dict) or 'message2userfinal' not in json_obj:
         return False
-    send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
+    send_message_to_user1(user_id, json_obj['message2userfinal'], inp, prompt_id)
     return True
 
 
@@ -830,26 +832,24 @@ def time_based_execution(task_description: str, user_id: int, prompt_id: int, ac
         text = f'This is the time now {current_time}\n you must perform this task {task_description}'
         result = time_user.initiate_chat(manager_1, message=text, speaker_selection={"speaker": "assistant"},
                                          clear_history=False)
-        last_message = group_chat.messages[-1]
-        if last_message['content'] == 'TERMINATE':
-            last_message = group_chat.messages[-2]
-        # sending response to receiver agent
-        if f'message2userfinal'.lower() in last_message['content'].lower():
-            try:
-                json_obj = retrieve_json(last_message['content'])
-                if json_obj and 'message2userfinal' in json_obj:
-                    last_message['content'] = json_obj['message2userfinal']
-                    send_message_to_user1(user_id, last_message['content'], task_description, prompt_id)
-
-            except Exception as e:
-                current_app.logger.error(f"Error extracting JSON: {e}")
-                # Fallback to a basic pattern match if retrieve_json fails
-                pattern = r'@user\s*{[\'"]message2userfinal[\'"]\s*:\s*[\'"](.+?)[\'"]}'
-                match = re.search(pattern, last_message['content'], re.DOTALL)
-                if match:
-                    last_message['content'] = match.group(1)
-                    send_message_to_user1(user_id, last_message['content'], task_description, prompt_id)
-        # At this point, don't process messages with message2userfinal as they were already sent
+        # The tail of the group this run happened in: manager_1's
+        # group_chat_1.  It read group_chat, the MAIN conversation, so a
+        # scheduled task could deliver the main chat's last message as its
+        # own result (review of d8fe536b2, F1b).  Brought up to date first
+        # through the one #725 sync, as the main loop does for its group.
+        _reuse_sync_group_log(group_chat_1, manager_1)
+        if not group_chat_1.messages:
+            return 'done'
+        last_message = group_chat_1.messages[-1]
+        if last_message['content'] == 'TERMINATE' and len(group_chat_1.messages) > 1:
+            last_message = group_chat_1.messages[-2]
+        # Sent only when it is something the user can read: not the
+        # verifier's verdict, not an unfilled template (F1).  The regex
+        # fallback that sat here ran only if retrieve_json raised, which it
+        # does not for a str.
+        if 'message2userfinal' in str(last_message.get('content') or '').lower():
+            _reuse_speaker_says_to_user(user_id, last_message, prompt_id,
+                                        inp=task_description)
         return 'done'
     return 'done'
 
@@ -927,9 +927,9 @@ def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
                 last_message = chat.messages[-2]
             if 'message2userfinal' in last_message['content'].lower():
                 try:
-                    json_obj = retrieve_json(last_message['content'])
-                    if json_obj and 'message2userfinal' in json_obj:
-                        send_message_to_user1(user_id, json_obj['message2userfinal'], task_description, prompt_id)
+                    # Only what the user can read (review of d8fe536b2, F1).
+                    _reuse_speaker_says_to_user(user_id, last_message, prompt_id,
+                                                inp=task_description)
                 except Exception as e:
                     current_app.logger.error(f"Error processing visual agent response: {e}")
 

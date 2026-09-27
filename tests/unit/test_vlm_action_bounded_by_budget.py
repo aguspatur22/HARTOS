@@ -105,6 +105,12 @@ def _run_loop(execute_action, *, budget=BUDGET_S, call_api=None,
     return result, elapsed, lct
 
 
+def _pause(seconds):
+    """Block for real.  _run_loop patches local_loop.time.sleep, and that IS
+    time.sleep, so a test tool that slept with it would not wait at all."""
+    threading.Event().wait(seconds)
+
+
 def _drain(timeout=10.0):
     """Wait until no abandoned action is still running (see F3)."""
     deadline = time.monotonic() + timeout
@@ -196,7 +202,7 @@ class TestTheBudgetBoundsTheActionInFlight:
             return {'output': 'Opened'}
 
         def _slow_vlm(_messages):
-            time.sleep(0.6)
+            _pause(0.6)
             return _OPEN_FILE
 
         result, _, _ = _run_loop(_execute, budget=0.3, call_api=_slow_vlm)
@@ -229,7 +235,7 @@ class TestAnAbandonedActionIsNotCalledAFailure:
         """A shell step bounds itself (SHELL_COMMAND_TIMEOUT_S), so the loop
         waits that long past its budget and reports the REAL result."""
         def _slow_shell(action, tier, **_kw):
-            time.sleep(1.6)
+            _pause(1.6)
             return {'output': 'Exit code: 0\npushed', 'status': 'ok'}
 
         with patch.object(local_loop, 'SHELL_COMMAND_TIMEOUT_S', 2.0):
@@ -259,7 +265,7 @@ class TestAnAbandonedActionIsNotCalledAFailure:
 
     def test_a_gui_action_gets_no_grace(self):
         def _slow_open(action, tier, **_kw):
-            time.sleep(1.6)
+            _pause(1.6)
             return {'output': 'Opened'}
 
         with patch.object(local_loop, 'SHELL_COMMAND_TIMEOUT_S', 2.0):
@@ -328,7 +334,7 @@ class TestStopEndsTheWait:
 
         def _press_stop():
             stuck_tool.entered.wait(5)
-            time.sleep(0.3)
+            _pause(0.3)
             marks['stop'] = time.monotonic()
             local_loop.request_stop('', 'p-stop')
 
@@ -366,7 +372,7 @@ class TestALateStepCannotReopenTheRun:
                                   prompt_id=tld.get_prompt_id() or '')
             run.step(iteration=1, action='shell', phase='executing',
                      caption='Shell command: git push')
-            time.sleep(1.5)          # its own bounded wait, past the budget
+            _pause(1.5)          # its own bounded wait, past the budget
             run.step(iteration=1, action='shell', phase='failed',
                      caption='Shell command: git push', error='rc 1')
             run.finish(exit_reason='action_error')

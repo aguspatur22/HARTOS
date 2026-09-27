@@ -232,7 +232,10 @@ def get_boot_decision() -> Dict[str, Any]:
 
     Reads the last line of `<get_log_dir()>/draft_decision.jsonl`
     (written by Nunba's `LlamaConfig._log_draft_decision` into the same
-    core.platform_paths.get_log_dir()).
+    core.platform_paths.get_log_dir()).  A dev run's log dir is `logs-dev`;
+    when this process has written none (HARTOS on its own, asked about the
+    installed app), it reads the one the installed build writes
+    (get_installed_log_dir).  `log_path` in the answer names the file read.
 
     Use when the user asks: "why is speculation off on my 8GB GPU?",
     "why didn't Nunba load the draft model?", "what's the cohort
@@ -240,8 +243,10 @@ def get_boot_decision() -> Dict[str, Any]:
     """
     import json
     from pathlib import Path
-    from core.platform_paths import get_log_dir
+    from core.platform_paths import get_installed_log_dir, get_log_dir
     log_path = Path(get_log_dir()) / 'draft_decision.jsonl'
+    if not log_path.exists():
+        log_path = Path(get_installed_log_dir()) / 'draft_decision.jsonl'
     if not log_path.exists():
         return {
             'available': False,
@@ -266,6 +271,7 @@ def get_boot_decision() -> Dict[str, Any]:
             'vram_free_gb': last.get('vram_free_gb'),
             'active_tts': last.get('active_tts'),
             'ts': last.get('ts'),
+            'log_path': str(log_path),
             'summary': (
                 f"Last boot decision (ts={last.get('ts')}): "
                 f"{last.get('decision')} — reason: {last.get('reason')}.  "

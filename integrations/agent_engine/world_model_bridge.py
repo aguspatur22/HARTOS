@@ -1102,6 +1102,29 @@ class WorldModelBridge:
 
     # ─── Expert corrections (RL-EF) ─────────────────────────────────
 
+    def _count_if_learned(self, result: dict) -> bool:
+        """Count a correction only when HevolveAI reports it LEARNED.
+
+        Sets result['success'] to that verdict (both paths return it) and
+        bumps total_corrections only when true.  HevolveAI's reply carries
+        'success' since hevolveai 2c4e622; an older server always answers
+        "status": "success", and only its 'statistics' (the provider's own
+        result) says whether the correction was learned.  Measured cause
+        (log defect M19-B): every HTTP 200 was counted, including all 5
+        live corrections on 09-22 that failed with "No sensor encoding
+        available".
+        """
+        if 'success' in result:
+            learned = result['success'] is True
+        else:
+            stats = result.get('statistics')
+            learned = isinstance(stats, dict) and stats.get('success') is True
+        result['success'] = learned
+        if learned:
+            with self._lock:
+                self._stats['total_corrections'] += 1
+        return learned
+
     def submit_correction(self, original_response: str,
                           corrected_response: str,
                           expert_id: str = 'hevolve_user',
@@ -1151,9 +1174,11 @@ class WorldModelBridge:
                     explanation=explanation[:2000] if explanation else None,
                     valid_until=valid_until,
                 )
-                with self._lock:
-                    self._stats['total_corrections'] += 1
-                return result if isinstance(result, dict) else {'success': True}
+                if not isinstance(result, dict):
+                    result = {'success': False,
+                              'reason': 'provider returned no result'}
+                self._count_if_learned(result)
+                return result
             except Exception as e:
                 logger.debug(f"In-process correction failed: {e}")
 
@@ -1190,9 +1215,11 @@ class WorldModelBridge:
             )
             self._cb_record_success()
             if resp.status_code == 200:
-                with self._lock:
-                    self._stats['total_corrections'] += 1
-                return resp.json()
+                body = resp.json()
+                if not isinstance(body, dict):
+                    return {'success': False, 'reason': 'unreadable reply'}
+                self._count_if_learned(body)
+                return body
             return {'success': False, 'reason': f'HTTP {resp.status_code}'}
         except requests.RequestException as e:
             self._cb_record_failure()
