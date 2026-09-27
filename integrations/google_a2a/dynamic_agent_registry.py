@@ -22,6 +22,10 @@ from typing import Dict, List, Any, Optional, Set
 from dataclasses import dataclass
 from pathlib import Path
 
+# core.constants, not hartos.lifecycle_hooks: the latter pulls hartos.helper
+# (autogen + langchain), 7.35 s cold on the first agent-card read.
+from core.constants import action_is_autonomous
+
 logger = logging.getLogger(__name__)
 
 # ── What we have already REPORTED, per prompts directory ────────────────────
@@ -71,9 +75,7 @@ class TrainedAgent:
     @property
     def is_autonomous(self) -> bool:
         """The recipe's can_perform_without_user_input, read by the ONE
-        rule (hartos.lifecycle_hooks.action_is_autonomous).  Imported here,
-        not at module top: lifecycle_hooks pulls hartos.helper."""
-        from hartos.lifecycle_hooks import action_is_autonomous
+        rule (core.constants.action_is_autonomous)."""
         return action_is_autonomous(self.can_perform_without_user_input)
 
 

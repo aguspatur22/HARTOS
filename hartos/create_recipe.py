@@ -3810,12 +3810,16 @@ def should_continue_autonomously(user_prompt: str) -> bool:
     next_task = ledger.get_next_executable_task()
 
     if next_task:
-        # Check if task requires user input based on context
-        can_do_without_user = next_task.context.get('can_perform_without_user_input', True)
+        # Does the task need the user?  The ONE rule (core.constants.
+        # autonomy_needs_user): a leading 'no'.  A missing value does not
+        # block, as before.  This read `.get(..., True)` and a truthiness
+        # test, so the string 'no' continued (review of cc1393825).
+        needs_user = autonomy_needs_user(
+            next_task.context.get('can_perform_without_user_input'))
         blocked_reason = next_task.blocked_reason
 
         # Don't continue if task needs user input
-        if blocked_reason == 'input_required' or not can_do_without_user:
+        if blocked_reason == 'input_required' or needs_user:
             current_app.logger.info(f'[Autonomous] Next task requires user input: {next_task.description}')
             return False
 

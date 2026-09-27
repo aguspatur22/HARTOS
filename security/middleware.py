@@ -315,6 +315,10 @@ def _apply_api_auth(app: Flask, register: bool = True):
         if expected_key:
             api_key = request.headers.get('X-API-Key')
             if api_key and _constant_time_compare(api_key, expected_key):
+                # Recorded like 'jwt' below: who the gate verified.  A route
+                # binding state to a caller reads THIS, never the raw header
+                # (review of 436580009: an unchecked X-API-Key was an identity).
+                g.auth_source = 'api_key'
                 return None
             # Fall through to Bearer check so API-key-configured deploys
             # still accept JWTs (useful for admin UI + k8s probes).

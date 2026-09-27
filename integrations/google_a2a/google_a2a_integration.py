@@ -10,6 +10,7 @@ SDK: https://github.com/a2aproject/a2a-python
 
 import inspect
 import json
+import os
 import threading
 import uuid
 import logging
@@ -25,15 +26,17 @@ logger = logging.getLogger(__name__)
 # A2A Protocol Version
 A2A_PROTOCOL_VERSION = "0.2.6"
 
-import os as _os
-
 # The task table is bounded (review finding M5: it grew by one entry per
 # message/send and was never pruned).  A FINISHED task is kept this long
 # after its last update so its caller can read the verdict, and past
 # _TASK_MAX entries the oldest finished tasks go first.  A task still
 # running is never evicted: its caller may be polling it.
-_TASK_TTL_S = float(_os.environ.get('HEVOLVE_A2A_TASK_TTL_S', '600'))
-_TASK_MAX = int(_os.environ.get('HEVOLVE_A2A_TASK_MAX', '1024'))
+_TASK_TTL_S = float(os.environ.get('HEVOLVE_A2A_TASK_TTL_S', '600'))
+_TASK_MAX = int(os.environ.get('HEVOLVE_A2A_TASK_MAX', '1024'))
+# Running tasks are never evicted, so the table is bounded per caller too: a
+# caller holding this many unfinished tasks is told 'busy' (review of
+# 436580009: one admitted peer could grow memory and threads without limit).
+_OPEN_TASKS_PER_CALLER = int(os.environ.get('HEVOLVE_A2A_OPEN_TASKS_PER_CALLER', '4'))
 
 
 class TaskState(str, Enum):
@@ -210,6 +213,16 @@ class A2AMessageHandler:
             if part.get("kind", part.get("type")) == "text":
                 message_text += part.get("text", "")
 
+        if caller is not None:
+            open_states = (TaskState.SUBMITTED, TaskState.WORKING)
+            with self._tasks_lock:
+                held = sum(1 for t in self.tasks.values()
+                           if t.owner == caller and t.state in open_states)
+            if held >= _OPEN_TASKS_PER_CALLER:
+                logger.info(f"A2A: {caller!r} holds {held} unfinished tasks; "
+                            f"busy")
+                return {"error": {"code": -32000, "message": (
+                    f"busy: {held} tasks of this caller are still running")}}
         # Create task, bound to the caller that was admitted for it.
         task = A2ATask(task_id=message_id, message=message, context_id=context_id)
         task.owner = caller
@@ -338,15 +351,17 @@ def _gate_caller() -> str:
     signed-in user (a JWT or an owner-allowed device token), the API-key
     holder, else the client address (core.auth_local.client_address; a
     desktop's own callers and LAN-trusted tiers carry no other identity)."""
+    from flask import g
     try:
-        from flask import g
         payload = getattr(g, 'jwt_payload', None) or {}
         uid = payload.get('user_id') or payload.get('sub')
         if uid:
             return f'user:{uid}'
     except Exception:
         pass
-    if request.headers.get('X-API-Key'):
+    if getattr(g, 'auth_source', None) == 'api_key':
+        # Set by the gate only when the key MATCHED; a header alone is not
+        # an identity (review of 436580009).
         return 'api_key'
     try:
         from core.auth_local import client_address

@@ -142,3 +142,103 @@ def test_another_callers_message_id_does_not_replace_the_task():
     theirs = _run(h.handle_message_send(params, caller='user:mallory'))
     assert theirs['id'] != mid
     assert h.tasks[mid].owner == 'user:alice'
+
+
+# ── review of 436580009: the identity must be a VERIFIED one ────────────
+
+def _unsigned(method, params):
+    return {'jsonrpc': '2.0', 'id': uuid.uuid4().hex, 'method': method,
+            'params': params}
+
+
+def _start(node, environ, headers=None):
+    with _server():
+        r = node.client.post(f'/a2a/{AGENT}/jsonrpc', json=_unsigned(
+            'message/send', {'message': {'messageId': uuid.uuid4().hex,
+                                         'parts': [{'kind': 'text',
+                                                    'text': 'x'}]}}),
+            environ_base=environ, headers=headers or {})
+    assert r.status_code == 200, r.get_json()
+    return r.get_json()['result']['id']
+
+
+def _read(node, task_id, environ, headers=None):
+    with _server():
+        r = node.client.post(f'/a2a/{AGENT}/jsonrpc', json=_unsigned(
+            'message/get', {'taskId': task_id}),
+            environ_base=environ, headers=headers or {})
+    return r.status_code, r.get_json()
+
+
+def _server():
+    from tests.unit import test_a2a_admitted_peer_runs_shared_agent as h
+    return h._AsServer()
+
+
+def _hidden(resp):
+    code, body = resp
+    return code != 200 or 'not found' in (
+        (body.get('result') or {}).get('error') or {}).get('message', '')
+
+
+def test_an_unverified_key_header_is_not_an_identity(node, monkeypatch):
+    """Finding 2: a local caller sending 'X-API-Key: bogus' read the task a
+    remote holder of the REAL key started (both came out 'api_key')."""
+    monkeypatch.setenv('HEVOLVE_API_KEY', 'the-real-key')
+    remote = {'REMOTE_ADDR': '198.51.100.23'}
+    local = {'REMOTE_ADDR': '127.0.0.1'}
+    tid = _start(node, remote, {'X-API-Key': 'the-real-key'})
+    assert not _hidden(_read(node, tid, remote, {'X-API-Key': 'the-real-key'}))
+    assert _hidden(_read(node, tid, local, {'X-API-Key': 'bogus'}))
+
+
+def test_two_lan_addresses_are_two_callers(node, monkeypatch):
+    """Finding 3: on a flat node the gate admits the LAN; each address is
+    its own caller."""
+    monkeypatch.delenv('NUNBA_BUNDLED', raising=False)
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'flat')
+    a, b = {'REMOTE_ADDR': '10.0.0.5'}, {'REMOTE_ADDR': '10.0.0.9'}
+    tid = _start(node, a)
+    assert not _hidden(_read(node, tid, a))
+    assert _hidden(_read(node, tid, b))
+    assert _hidden(_read(node, tid, b, {'X-API-Key': 'something-else'}))
+
+
+def test_two_signed_in_users_are_two_callers(node, monkeypatch):
+    from unittest.mock import patch
+    remote = {'REMOTE_ADDR': '198.51.100.23'}
+    users = {'Bearer alice': {'user_id': 'alice'},
+             'Bearer bob': {'user_id': 'bob'}}
+    with patch('integrations.social.auth.decode_jwt',
+               side_effect=lambda t: users.get('Bearer ' + t)):
+        tid = _start(node, remote, {'Authorization': 'Bearer alice'})
+        assert not _hidden(_read(node, tid, remote,
+                                 {'Authorization': 'Bearer alice'}))
+        assert _hidden(_read(node, tid, remote,
+                             {'Authorization': 'Bearer bob'}))
+
+
+def test_one_caller_cannot_hold_unbounded_open_tasks(monkeypatch):
+    """Finding 4: every task running meant no eviction at all; one caller
+    now gets 'busy' past its open-task cap, others are unaffected."""
+    monkeypatch.setattr(gai, '_OPEN_TASKS_PER_CALLER', 3)
+    release = threading.Event()
+
+    async def slow(text, ctx):
+        while not release.is_set():
+            await asyncio.sleep(0.02)
+        return {'role': 'model', 'parts': [{'text': 'x'}]}
+    h = A2AMessageHandler(slow)
+    try:
+        for _ in range(3):
+            _send_as(h, 'peer:a', blocking=False)
+        params = {'message': {'messageId': uuid.uuid4().hex,
+                              'parts': [{'kind': 'text', 'text': 'x'}]},
+                  'configuration': {'blocking': False}}
+        busy = _run(h.handle_message_send(params, caller='peer:a'))
+        assert 'busy' in busy['error']['message'], busy
+        assert len(h.tasks) == 3
+        _send_as(h, 'peer:b', blocking=False)
+        assert len(h.tasks) == 4
+    finally:
+        release.set()

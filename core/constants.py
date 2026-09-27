@@ -1342,6 +1342,40 @@ def tool_reply_failed(content) -> bool:
     return any(failure in body for failure in TOOL_FAILURE_RESULTS)
 
 
+# ── A recipe action's can_perform_without_user_input: the TWO questions ──
+# One rule each, here in core.constants so every reader can ask without
+# importing the pipeline (hartos.lifecycle_hooks pulls hartos.helper:
+# autogen + langchain, 7.35 s cold on the A2A card's first read, review of
+# cc1393825).  hartos.lifecycle_hooks re-exports both.  A missing value is
+# NEITHER autonomous NOR a request for the user.  Guarded, with a source
+# guard against private copies, by tests/unit/test_is_autonomous_is_one_rule.py.
+
+def autonomy_needs_user(value) -> bool:
+    """True when a ``can_perform_without_user_input`` value says the action
+    needs the user.  The CREATE prompt asks for "no" WITH a reason ("no-i
+    need user's likes and dislike"), so the rule is a leading 'no', not
+    equality: 1 of the 15 explicit 'no' values in the banked recipes is
+    'no - requires specific dish constraints, ...'.  A missing value is not
+    a 'no'.  One rule for every reader of the question (the verifier hook,
+    REUSE's declared-pause check, CREATE's should_continue_autonomously)."""
+    return str(value or '').strip().lower().startswith('no')
+
+
+def action_is_autonomous(value) -> bool:
+    """True when a ``can_perform_without_user_input`` value lets the action
+    run without the user: an explicit 'yes', ignoring case and surrounding
+    space.  Missing, None, 'no' and 'no - <reason>' are all False, so an
+    action the recipe does not clearly mark is never auto-driven.  Not the
+    negation of autonomy_needs_user: a missing value is neither.
+
+    One rule for every reader (REUSE's session reader and both of its
+    state_transitions, CREATE's timer paths, the A2A agent card).  Those were
+    ten private ``== 'yes'`` compares, raw or strip().lower(); every value in
+    the banked recipes (census 2026-09-26: 'yes', 'no', missing, None,
+    'no - ...') gets the same answer from each."""
+    return str(value or '').strip().lower() == 'yes'
+
+
 # Tools that record, recall or look up the agent's OWN state -- the scratchpad
 # around an action, never the action's work.  A call to one proves only that
 # the agent kept notes.

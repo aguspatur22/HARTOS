@@ -561,31 +561,10 @@ ACTION_STATES_AWAITING_USER = frozenset({
     ActionState.PREVIEW_PENDING})
 
 
-def autonomy_needs_user(value):
-    """True when a ``can_perform_without_user_input`` value says the action
-    needs the user.  The CREATE prompt asks for "no" WITH a reason ("no-i
-    need user's likes and dislike"), so the rule is a leading 'no', not
-    equality: 1 of the 15 explicit 'no' values in the banked recipes is
-    'no - requires specific dish constraints, ...'.  A missing value is not
-    a 'no'.  One rule for every reader of the question (the verifier hook
-    here, REUSE's declared-pause check)."""
-    return str(value or '').strip().lower().startswith('no')
-
-
-def action_is_autonomous(value):
-    """True when a ``can_perform_without_user_input`` value lets the action
-    run without the user: an explicit 'yes', ignoring case and surrounding
-    space.  Missing, None, 'no' and 'no - <reason>' are all False, so an
-    action the recipe does not clearly mark is never auto-driven.  Not the
-    negation of autonomy_needs_user: a missing value is neither.
-
-    One rule for every reader (REUSE's session reader and both of its
-    state_transitions, CREATE's timer paths, the A2A agent card).  Those were
-    five-plus private ``== 'yes'`` compares, raw or strip().lower(); every
-    value in the banked recipes (census 2026-09-26: 'yes', 'no', missing,
-    None, 'no - ...') gets the same answer from each.  Guarded by
-    tests/unit/test_is_autonomous_is_one_rule.py."""
-    return str(value or '').strip().lower() == 'yes'
+# The two answers to an action's can_perform_without_user_input live in
+# core.constants (cheap to import: the A2A card reads them without pulling
+# this module's hartos.helper).  Re-exported here for existing callers.
+from core.constants import action_is_autonomous, autonomy_needs_user  # noqa: E402,F401
 
 
 # ── No-progress stall guard for the CREATE loop ───────────────────────────
