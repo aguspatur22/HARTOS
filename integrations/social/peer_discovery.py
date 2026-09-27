@@ -84,6 +84,76 @@ def is_unroutable_peer_url(url):
 logger = logging.getLogger('hevolve_social')
 
 
+def _is_loopback_host(host):
+    """localhost / 127.x / ::1: an address that means "this machine" to
+    whoever reads it."""
+    host = (host or '').strip('[]').lower()
+    if host == 'localhost':
+        return True
+    try:
+        return _ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_this_host(ip):
+    """Is ``ip`` (a measured source address) this machine: loopback, or the
+    LAN address core.port_registry.get_lan_ip reports for it."""
+    ip = (ip or '').strip().strip('[]').lower()
+    if not ip:
+        return False
+    if _is_loopback_host(ip):
+        return True
+    try:
+        from core.port_registry import get_lan_ip
+        return ip == (get_lan_ip() or '').lower()
+    except Exception:
+        return False
+
+
+def address_evidence(url, observed_ip='', relayed=False):
+    """What this node has SEEN of ``url`` reaching it: (verdict, reason).
+
+    'confirmed'    a direct announce came from the host the url names, or
+                   from this machine for a loopback url, or the vantage is
+                   unknown (no measured source; judged as before);
+    'unconfirmed'  a relayed hint, or a direct announce from some other
+                   address: the row is kept, but only the health round's ping
+                   can make it active;
+    'refused'      a loopback url relayed by another node or announced from
+                   another machine: from here it names this machine, never
+                   the subject.
+
+    Reachability, not address class: a 10.x or 192.168.x url is never
+    refused (they are real LANs, test_peer_url_hygiene); it waits for a ping.
+    Measured 2026-09-26: 81% of this desktop's integrity challenges timed
+    out against relayed rows that had been stored 'active' on hearsay.
+    """
+    host = ''
+    try:
+        host = (_urlparse(url if '://' in url else 'http://' + url).hostname
+                or '').lower()
+    except Exception:
+        pass
+    if _is_loopback_host(host):
+        if relayed:
+            return 'refused', ('loopback url in a relayed peer list: it names '
+                               'the relayer\'s machine or this one, never the '
+                               'subject')
+        if observed_ip and not _is_this_host(observed_ip):
+            return 'refused', (f'loopback url announced from {observed_ip}, '
+                               f'another machine: from here it would name '
+                               f'this node')
+        return 'confirmed', ''
+    if relayed:
+        return 'unconfirmed', ''
+    if not observed_ip:
+        return 'confirmed', ''
+    if host == observed_ip.strip().strip('[]').lower():
+        return 'confirmed', ''
+    return 'unconfirmed', ''
+
+
 # The reason prefix an announcer reads when a node_id it announces is held
 # under another key (#140 B).  Stable: the sender acts on it (_consume_key_reply).
 KEY_CONFLICT = 'key_conflict'
@@ -1876,15 +1946,21 @@ class GossipProtocol:
         if node_id == self.node_id:
             return _reject('announcement is from this node itself')
 
-        # Structural gate: a peer whose URL is loopback / docker-bridge / :677
-        # can never be dialed as a REMOTE node (it points at self or nowhere).
-        # This is the source of the localhost:6777 flood — the Sybil check
-        # below deliberately EXEMPTS loopback, so without this gate those rows
-        # accumulate without limit and then fool the age-based health check
-        # (a local ping to them succeeds). Reject at ingest; #38.
+        # Structural gate: a peer whose URL is docker-bridge / :677 /
+        # unspecified can never be dialed as a REMOTE node (it points at self
+        # or nowhere).  Reject at ingest; #38.  Loopback is decided just
+        # below by address_evidence, from where the record came from: the
+        # Sybil check further down deliberately EXEMPTS loopback, so a
+        # loopback url from another machine must be refused there or those
+        # rows accumulate without limit (898 on the owner's desktop).  The
+        # same measurement says whether the address has been seen to reach
+        # this node, which decides 'active' vs 'stale' below.
         _bad_url, _bad_why = is_unroutable_peer_url(url)
         if _bad_url:
             return _reject('unroutable peer url (%s)' % _bad_why)
+        _evidence, _evidence_why = address_evidence(url, observed_ip, relayed)
+        if _evidence == 'refused':
+            return _reject(_evidence_why)
 
         # A node we already hold is not a NEW identity for its host, so the
         # per-host cap below does not apply to it.  Looked up here, before the
@@ -1906,10 +1982,8 @@ class GossipProtocol:
         try:
             from urllib.parse import urlparse
             host = (urlparse(url).hostname or '').lower()
-            _is_loopback = host in (
-                'localhost', '127.0.0.1', '::1', '0.0.0.0',
-            ) or host.startswith('127.')
-            if host and not _is_loopback and existing is None:
+            # (0.0.0.0 never reaches here: is_unroutable_peer_url refused it.)
+            if host and not _is_loopback_host(host) and existing is None:
                 same_host_count = db.query(PeerNode).filter(
                     PeerNode.url.contains(host),
                     PeerNode.integrity_status != 'banned',
@@ -2246,10 +2320,15 @@ class GossipProtocol:
             # Update X25519 public key for E2E encryption
             if peer_data.get('x25519_public'):
                 existing.x25519_public = peer_data['x25519_public']
-            if existing.status == 'dead':
+            if existing.status in ('dead', 'stale'):
                 # Only resurrect if announcement is recent (not stale gossip)
                 if (datetime.utcnow() - existing.last_seen).total_seconds() < 60:
-                    existing.status = 'active'
+                    # Alive, but 'active' only when the announce came from
+                    # the address on file (as good as a ping); otherwise
+                    # 'stale', so the health round pings that address before
+                    # anything dials it.
+                    existing.status = ('active' if _evidence == 'confirmed'
+                                       else 'stale')
             # Direct announces update the observed-address hint; relayed
             # records carry the RELAYER's vantage, not the subject's, so
             # they must not overwrite what a direct announce established.
@@ -2262,14 +2341,21 @@ class GossipProtocol:
             return False
 
         _obs = '' if relayed else self._observed_url_for(url, observed_ip)
-        _new_meta = dict(peer_data.get('metadata', {}) or {})
+        # A relayed record is a PeerNode.to_dict() of the RELAYER's row: its
+        # metadata is the relayer's bookkeeping and the relayer's vantage
+        # (central's observed_url 172.21.0.1, its docker gateway, sat on every
+        # relayed 10.1.x row on the owner's desktop).  None of it is ours.
+        _new_meta = {} if relayed else dict(peer_data.get('metadata', {}) or {})
         if _obs:
             _new_meta['observed_url'] = _obs
         new_peer = PeerNode(
             node_id=node_id, url=url,
             name=peer_data.get('name', ''),
             version=peer_data.get('version', ''),
-            status='active',
+            # 'active' only on evidence the address reaches this node; the
+            # integrity round challenges 'active' rows only, and the health
+            # round's successful ping promotes a 'stale' one.
+            status='active' if _evidence == 'confirmed' else 'stale',
             agent_count=peer_data.get('agent_count', 0),
             post_count=peer_data.get('post_count', 0),
             metadata_json=_new_meta,
@@ -3170,7 +3256,9 @@ class AutoDiscovery:
             # peer that reached this line and was then refused, or crashed the
             # handler, looked identical to one that joined.
             try:
-                self._gossip.handle_announce(payload)
+                # addr[0] is where the beacon actually came from: the
+                # measured vantage address_evidence judges the url against.
+                self._gossip.handle_announce(payload, observed_ip=addr[0])
             except Exception as e:
                 logger.warning(
                     f"AutoDiscovery: handing {node_id[:8]} to gossip failed: "

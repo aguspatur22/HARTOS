@@ -165,12 +165,15 @@ def test_with_no_owner_nothing_is_filed(world, monkeypatch):
     assert '{{secret:' not in out
 
 
-def test_a_value_stored_by_another_vault_is_masked_once_it_was_resolved(monkeypatch):
-    """Nunba's desktop vault exports its tool keys to os.environ; this vault
-    never stored them.  The value reached a tool through the alias, so it must
-    be masked on the way back all the same."""
+def test_a_value_the_card_stored_resolves_and_is_masked_once_granted(world, monkeypatch):
+    """The card's value lands in os.environ (Nunba /api/vault/store); the
+    grant that follows is what makes it the owner's credential.  An env var
+    with no grant is not one (tests/unit/test_secret_owner_entered.py)."""
     from hartos.ai_key_vault import get_ai_key_vault
+    from integrations.social.consent_service import ConsentService
     monkeypatch.setenv('SITE_PASSWORD', SECRET)
+    with db_session(commit=True) as db:
+        ConsentService.grant_consent(db, OWNER, 'credential', 'secret:SITE_PASSWORD')
     vault = get_ai_key_vault()
     assert vault.resolve_aliases('pass {{secret:SITE_PASSWORD}}') == f'pass {SECRET}'
     assert vault.mask_secrets(f'echo {SECRET}') == 'echo {{secret:SITE_PASSWORD}}'

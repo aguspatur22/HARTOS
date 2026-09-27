@@ -27,6 +27,7 @@ Usage:
     token = vault.get_channel_secret('discord', 'BOT_TOKEN')
 """
 
+import json
 import logging
 import os
 import re
@@ -211,36 +212,94 @@ class AIKeyVault:
             return type(value)(cls._map_strings(v, fn) for v in value)
         return value
 
-    def resolve_aliases(self, value):
-        """Replace every known alias in ``value`` with the real credential.
+    def owner_credential_names(self) -> set:
+        """The names of the credentials the owner of this computer entered:
+        the only names an alias resolves and "is stored" answers for.
 
-        An alias with no stored value is left as written, so a missing
-        credential shows up as the alias, never as an empty string.
+        - what store_credential stored this process (/api/credentials/submit,
+          localhost only), and
+        - what the owner gave on the consent card: a granted, unrevoked
+          'credential' row with scope 'secret:NAME' for this computer's owner
+          (HEVOLVE_OWNER_USER_ID).  The card puts the value in Nunba's
+          desktop vault (/api/vault/store, which exports it to os.environ)
+          and only then grants the row.  The row is the durable,
+          cross-process record of "the owner entered NAME": it survives a
+          restart, the privacy page lists it, and revoking it stops the
+          alias resolving.  The value stores stay where they are; this is
+          the one answer to WHICH names are the owner's.
 
-        A name that resolves is remembered for mask_secrets: the value may
-        live in a store this vault never wrote (Nunba's desktop vault exports
-        its keys to os.environ), and it has just been handed to a tool.
+        Never "any environment variable": os.environ also holds API keys,
+        database URLs and key material nobody entered for an agent, and an
+        alias that reached them let a model (or a page it read) put them in
+        a tool URL.  A consent lookup that fails counts no grants.
         """
+        names = set(self._stored)
+        owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+        if not owner:
+            return names
+        try:
+            from integrations.social.consent_service import (
+                CREDENTIAL_SCOPE_PREFIX, ConsentService)
+            from integrations.social.models import db_session
+            with db_session(commit=False) as db:
+                for row in ConsentService.list_consents(db, owner, 'credential'):
+                    scope = row.scope or ''
+                    if (row.granted and row.revoked_at is None
+                            and scope.startswith(CREDENTIAL_SCOPE_PREFIX)):
+                        names.add(scope[len(CREDENTIAL_SCOPE_PREFIX):])
+        except Exception:
+            logger.warning("credential grants could not be read; only "
+                           "credentials stored this session resolve",
+                           exc_info=True)
+        return names
+
+    def owner_credential(self, name: str, names=None) -> str:
+        """The value of an owner-entered credential, '' for any other name.
+
+        ``names`` is owner_credential_names(), passed by a caller that asks
+        about several names at once.
+        """
+        if name not in (self.owner_credential_names() if names is None
+                        else names):
+            return ''
+        return self.get_tool_key(name)
+
+    def resolve_aliases(self, value):
+        """Replace every alias of an owner-entered credential in ``value``
+        with the real value.
+
+        Any other alias (a missing credential, or a name that is only an
+        environment variable) is left as written, never as an empty string.
+        """
+        names = None
+
         def _real(match):
-            value = self.get_tool_key(match.group(1))
-            if not value:
-                return match.group(0)
-            self._stored.add(match.group(1))
-            return value
+            nonlocal names
+            if names is None:
+                names = self.owner_credential_names()
+            real = self.owner_credential(match.group(1), names)
+            return real or match.group(0)
         return self._map_strings(value, lambda s: SECRET_ALIAS_RE.sub(_real, s))
 
     def mask_secrets(self, value):
-        """Replace every stored credential value in ``value`` with its alias.
+        """Replace every credential value in ``value`` with its alias.
 
-        Exact-value matching, longest value first so a credential that
-        contains another is masked whole.
+        Covers every value resolve_aliases can hand a tool (the owner-entered
+        credentials) and the encrypted vault's own.  A value is matched both
+        as written and as json.dumps spells it (a quote, backslash or
+        non-ASCII character is escaped there), longest first so a credential
+        that contains another is masked whole.
         """
-        names = set(self._stored) | set(self._secrets_manager()._cache)
+        names = self.owner_credential_names() | set(self._secrets_manager()._cache)
         pairs = []
         for name in names:
             real = self.get_tool_key(name)
             if real and len(real) >= MIN_MASKED_SECRET_LEN:
-                pairs.append((real, '{{secret:' + name + '}}'))
+                alias = '{{secret:' + name + '}}'
+                pairs.append((real, alias))
+                escaped = json.dumps(real)[1:-1]
+                if escaped != real:
+                    pairs.append((escaped, alias))
         pairs.sort(key=lambda p: -len(p[0]))
 
         def _mask(text):
@@ -398,7 +457,9 @@ def request_credential(resource_description, agent_id=None) -> str:
     # The site refused the stored value: never hand it back, ask again.
     rejected = req.get('rejected') is True
 
-    if vault.get_tool_key(name) and not rejected:
+    # Only an owner-entered credential is "stored": answering for any
+    # environment variable told the agent which ones exist.
+    if vault.owner_credential(name) and not rejected:
         return f"'{label}' is stored on this computer. To use it, {use}"
 
     # The pending list behind /api/credentials/pending.
@@ -424,10 +485,9 @@ def request_credential(resource_description, agent_id=None) -> str:
     ]))
     try:
         from integrations.social.consent_service import (
-            CREDENTIAL_SCOPE_PREFIX, ConsentService)
+            CREDENTIAL_SCOPE_PREFIX, ConsentService, known_agent_id)
         from integrations.social.models import db_session
-        from integrations.vlm.safety import _known_agent
-        agent = _known_agent(agent_id)
+        agent = known_agent_id(agent_id)
         scope = CREDENTIAL_SCOPE_PREFIX + name
         # Only reached with no usable value (missing, or rejected), so an
         # earlier Accept does not settle it: ask again unless the owner said

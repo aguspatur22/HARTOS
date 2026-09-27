@@ -5847,16 +5847,22 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
         # "Execute Action N:" when it wraps a round, so an action's work can
         # sit in an earlier window while its last window holds only a closing
         # reply.
-        starts = []
-        for i, m in enumerate(msgs):
-            c = m.get('content') if isinstance(m, dict) else None
-            # Trailing ':' delimiter is required — dispatch markers are
-            # 'Execute Action N: ...', so without the colon 'Execute Action 2'
-            # also matches 'Execute Action 20:'..'29:' and banks the wrong
-            # action's tool calls for flows with >=10 actions (CREATE routinely
-            # decomposes into 11-23).
-            if isinstance(c, str) and f'Execute Action {action_id}:' in c:
-                starts.append(i)
+        #
+        # A dispatch is what hartos.lifecycle_hooks.dispatch_action_id says it
+        # is -- the one parser, used for every window below.  It reads only a
+        # LEADING marker (colon-delimited, so 2 never matches 20), because
+        # CREATE's own dispatch appends the user's text after its marker and
+        # that text can quote another one: "Execute Action 5: ... ,Latest User
+        # message: Properly Execute Action 2: ...".  The containment test that
+        # stood here opened action 2's window on that message and banked
+        # action 5's post_to_social as action 2's recipe (review, 2026-09-26).
+        from hartos.lifecycle_hooks import dispatch_action_id
+
+        def _dispatched(m):
+            return dispatch_action_id(m.get('content')) if isinstance(m, dict) else None
+
+        starts = [i for i, m in enumerate(msgs)
+                  if _dispatched(m) == int(action_id)]
         if not starts:
             # No dispatch marker: this run never started the action, so the
             # trace holds none of its work.  The IN-RUN rule above, enforced
@@ -5873,10 +5879,11 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
             # The window ENDS at the next dispatch marker, so a later action's
             # tool calls don't bleed into this one (the trace can hold later
             # dispatches when banking runs at/after a flow boundary).
+            # Any dispatch ends it, by the same parser: text that only QUOTES
+            # a marker is not a dispatch and must not cut the action's work.
             end = len(msgs)
             for j in range(start + 1, len(msgs)):
-                cj = msgs[j].get('content') if isinstance(msgs[j], dict) else None
-                if isinstance(cj, str) and 'Execute Action ' in cj:
+                if _dispatched(msgs[j]) is not None:
                     end = j
                     break
             # Only work that SUCCEEDED is a step (CR3, live 2026-09-25).  Two

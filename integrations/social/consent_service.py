@@ -305,6 +305,20 @@ def _validate_consent_type(consent_type: str):
 _AGENT_ID_RE = re.compile(r'[A-Za-z0-9_-]+')
 
 
+def known_agent_id(agent_id):
+    """The asking agent's id for a consent row, or None when no agent is
+    known.
+
+    Callers pass the prompt id they hold: None or '' when there is none, and
+    hart_intelligence_entry._handle_computer_action_tool sends
+    str(prompt_id or 0), so '0' too.  An unknown agent is never guessed.
+    The one normaliser every ask uses (computer control, capability asks,
+    credential asks), so they file under the same agent_id.
+    """
+    text = '' if agent_id is None else str(agent_id).strip()
+    return None if text in ('', '0', 'None') else text
+
+
 def _is_a_name(name, aid):
     """False for the placeholders the agent mirror manufactures when a
     prompt has no name ("Agent <id>", "agent-<id>", hart_intelligence_entry

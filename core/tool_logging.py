@@ -43,6 +43,7 @@ from contextlib import contextmanager
 import inspect
 import json
 import logging
+import traceback
 from functools import partial, wraps
 from typing import get_type_hints
 
@@ -253,12 +254,18 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
 
     def _on_error(e, _t0=None):
         _took = '' if _t0 is None else f" latency_ms={round((time.perf_counter() - _t0) * 1000, 1)}"
+        # The exception was raised with the resolved arguments in hand, so
+        # its text and traceback can carry a credential: mask both before
+        # anything is written, and mask BEFORE cutting to 200 characters (a
+        # value straddling the cut leaves a prefix no exact-value mask finds).
+        message = _mask(str(e))
         tool_logger.error(
-            f"TOOL EXECUTION ERROR: {tool_name} - {e}{_took}"
+            f"TOOL EXECUTION ERROR: {tool_name} - {message}{_took}"
             f"{_session_suffix()}")
-        tool_logger.exception("Exception details:")
+        tool_logger.error("Exception details:\n%s", _mask(''.join(
+            traceback.format_exception(type(e), e, e.__traceback__))))
         if plain_errors:
-            return _mask(f"Tool '{tool_name}' encountered an error: {str(e)[:200]}")
+            return f"Tool '{tool_name}' encountered an error: {message[:200]}"
         envelope = _mask(_error_envelope(tool_name, e))
         tool_logger.info(f"Returning error response: {envelope}")
         return envelope
