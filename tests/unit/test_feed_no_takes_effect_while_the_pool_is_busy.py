@@ -223,10 +223,13 @@ def test_a_yes_after_a_no_lets_frames_in_again(consent_db, admin, hardware):
     from integrations.vision.frame_store import FrameStore
     store = FrameStore()
     _answer(consent_db, 'camera_capture', True)
+    store.put_frame(UID, b'taken-before-the-no')
     _answer(consent_db, 'camera_capture', False)
+    assert store.get_frame(UID) is None
     store.put_frame(UID, b'refused')
     _answer(consent_db, 'camera_capture', True)
-    assert store.get_frame(UID) is None, 'a frame refused under the No came back'
+    assert store.get_frame(UID) is None, (
+        'a frame from before the No, or refused under it, came back')
     store.put_frame(UID, b'allowed')
     assert store.get_frame(UID) == b'allowed'
     assert _saved_embodied(admin[1]).get('camera_enabled') is True
@@ -236,6 +239,7 @@ def test_the_eye_button_cannot_lift_the_owners_no(consent_db, admin, hardware):
     """Two different answers: the eye button's wake must not undo a consent
     No, and a consent Yes must not undo the eye button's cut."""
     from core import ai_sensing
+    _answer(consent_db, 'screen_capture', True)
     _answer(consent_db, 'screen_capture', False)
     ai_sensing.enable_all()
     assert ai_sensing.allowed('screen') is False

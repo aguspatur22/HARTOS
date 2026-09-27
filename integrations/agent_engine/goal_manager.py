@@ -12,6 +12,8 @@ import logging
 from typing import Dict, List, Optional, Callable
 from sqlalchemy.orm import Session
 
+from core.error_advice import FAILED_STEP_SETUP_OFFER
+
 logger = logging.getLogger('hevolve_social')
 
 # ─── Goal Type Groups ───
@@ -1106,7 +1108,7 @@ def _build_self_heal_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None
         )
 
     if (category == 'subprocess.tool_load' and missing_package and not backend
-            and ctx.get('failed_step') == 'setup_offer'):
+            and ctx.get('failed_step') == FAILED_STEP_SETUP_OFFER):
         # gpu_worker._setup_offer_failed: an engine that lives in its own
         # venv is not installed, and offering its setup to the owner failed.
         # No pip was run (the shared site is where its venv keeps it out
@@ -1136,7 +1138,7 @@ def _build_self_heal_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None
         # can never summon a package, so the generic "read source, write
         # fix" path below just loops.  The runtime already tried a
         # deterministic `pip install` and it FAILED (gpu_worker's
-        # failed_step 'pip_install'; a goal filed before that key existed
+        # failed_step FAILED_STEP_PIP_INSTALL; a goal filed before that key existed
         # is the same case).  Route to dependency remediation, not code
         # editing.
         return base + (

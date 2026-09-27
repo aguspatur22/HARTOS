@@ -74,6 +74,7 @@ Usage:
 import json
 import logging
 import os
+from core.error_advice import FAILED_STEP_PIP_INSTALL, FAILED_STEP_SETUP_OFFER
 from core.subprocess_safe import no_window_kwargs
 import queue
 import subprocess
@@ -624,7 +625,7 @@ class GPUWorker:
                 f"the appropriate _<X>_deps tuple) AND to "
                 f"tts/package_installer.py legacy fallback "
                 f"plan so the next build bundles it.",
-                failed_step='pip_install',
+                failed_step=FAILED_STEP_PIP_INSTALL,
             )
 
         threading.Thread(
@@ -746,14 +747,14 @@ class GPUWorker:
             f"Do NOT pip '{pkg}' into the shared site. Diagnose why "
             f"capability_setup.request_capability_setup failed so the owner "
             f"can be asked to set up tts:{self.name}.",
-            failed_step='setup_offer',
+            failed_step=FAILED_STEP_SETUP_OFFER,
         )
 
     def _raise_missing_package_goal(self, pkg: str, hint: str, *,
                                     failed_step: str) -> None:
         """Raise the agentic self-heal goal for a package this worker could
         not import (``core.error_advice``, throttled per failure shape).
-        ``failed_step`` ('pip_install' / 'setup_offer') is what the goal's
+        ``failed_step`` (core.error_advice.FAILED_STEP_*) is what the goal's
         prompt reads to say which step failed.  The context names no
         ``backend``, so the prompt takes the missing-dependency route,
         never ``repair_backend_venv`` (an install without the owner's yes)."""

@@ -183,17 +183,20 @@ class TestFindMatchingAgent:
         from integrations.agentic_router import find_matching_agent
 
         mock_llm = MagicMock()
-        mock_llm.invoke.return_value = MagicMock(content='test_agent_42')
+        mock_llm.invoke.return_value = MagicMock(content='4242')
         mock_get_llm.return_value = mock_llm
 
         with tempfile.TemporaryDirectory() as tmpdir:
+            # An agent record is {prompt_id}.json with no '_' in the name
+            # (core.prompt_files.local_agent_prompts): '_' joins the flow,
+            # action and recipe files, and a prompt id is an int or a UUID.
             recipe = {'name': 'Portfolio Builder', 'goal': 'Build portfolio websites'}
-            with open(os.path.join(tmpdir, 'test_agent_42.json'), 'w') as f:
+            with open(os.path.join(tmpdir, '4242.json'), 'w') as f:
                 json.dump(recipe, f)
 
             result = find_matching_agent('build me a portfolio website', tmpdir)
             assert result is not None
-            assert result['agent_id'] == 'test_agent_42'
+            assert result['agent_id'] == '4242'
             assert result['name'] == 'Portfolio Builder'
             assert result['source'] == 'recipe'
             assert result['score'] == 15  # LLM-selected = high confidence

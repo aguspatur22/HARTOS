@@ -4585,7 +4585,7 @@ def tool_argument_error(func, func_name, arguments, repaired, as_written=None):
     declared = {p.name for p in params}
     invented, suspect = [], []
     if written is not None:
-        as_keys = [e.key for e in written if not e.doubtful]
+        as_keys = [e.key for e in written]
         quoted = {e.key for e in written if e.quoted}
         invented = [k for k in kwargs
                     if k not in (as_keys if k in declared else quoted)]

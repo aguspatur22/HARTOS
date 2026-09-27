@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from integrations.service_tools import gpu_worker
+from core.error_advice import FAILED_STEP_PIP_INSTALL, FAILED_STEP_SETUP_OFFER
 from integrations.agent_engine.goal_manager import _build_self_heal_prompt
 
 
@@ -436,7 +437,7 @@ def test_an_offer_that_cannot_be_made_raises_the_missing_package_goal(
     assert ctx['worker_name'] == 'f5_tts'
     assert 'backend' not in ctx
     assert 'no capability_setup here' in ctx['remediation_hint']
-    assert ctx['failed_step'] == 'setup_offer'
+    assert ctx['failed_step'] == FAILED_STEP_SETUP_OFFER
     said = [r.getMessage() for r in caplog.records
             if r.levelno == logging.ERROR and 'could not be offered' in r.getMessage()]
     assert said and 'no capability_setup here' in said[0], said
@@ -475,7 +476,7 @@ def test_an_offer_nobody_could_be_asked_raises_the_goal(
     assert exc.name == 'vocos'
     ctx = kwargs['context']
     assert ctx['missing_package'] == 'vocos'
-    assert ctx['failed_step'] == 'setup_offer'
+    assert ctx['failed_step'] == FAILED_STEP_SETUP_OFFER
     assert 'backend' not in ctx
     assert "'unavailable'" in ctx['remediation_hint']
     said = [r.getMessage() for r in caplog.records
@@ -505,12 +506,12 @@ def test_the_pip_failed_goal_says_pip_was_the_step_that_failed(
 
     w._maybe_self_heal_from_line(_MODNOTFOUND_LINE)
 
-    assert he_mock.call_args[1]['context']['failed_step'] == 'pip_install'
+    assert he_mock.call_args[1]['context']['failed_step'] == FAILED_STEP_PIP_INSTALL
 
 
 def test_prompt_for_a_failed_setup_offer_does_not_claim_a_pip_install():
     p = _build_self_heal_prompt(_goal('subprocess.tool_load', {
-        'missing_package': 'vocos', 'failed_step': 'setup_offer'}))
+        'missing_package': 'vocos', 'failed_step': FAILED_STEP_SETUP_OFFER}))
     assert 'vocos' in p
     assert 'NOT a source-code bug' in p
     assert 'pip install' not in p
@@ -521,10 +522,45 @@ def test_prompt_for_a_failed_setup_offer_does_not_claim_a_pip_install():
 
 
 @pytest.mark.parametrize('ctx', [
-    {'missing_package': 'pyloudnorm', 'failed_step': 'pip_install'},
+    {'missing_package': 'pyloudnorm', 'failed_step': FAILED_STEP_PIP_INSTALL},
     {'missing_package': 'pyloudnorm'},          # goals filed before the key
 ])
 def test_prompt_for_a_failed_pip_install_still_says_so(ctx):
     p = _build_self_heal_prompt(_goal('subprocess.tool_load', ctx))
     assert '`pip install pyloudnorm` was already attempted' in p
     assert 'capability_setup' not in p
+
+
+def test_a_goal_that_cannot_be_raised_is_logged_at_error(monkeypatch, caplog):
+    """The last step of a failure that would otherwise be silent: if the
+    goal itself cannot be raised, that is said at ERROR, with the package
+    and the cause, never a DEBUG line."""
+    import types
+    ea = types.ModuleType('core.error_advice')
+
+    def handle_exception(*a, **k):
+        raise RuntimeError('goal store unreachable')
+
+    ea.handle_exception = handle_exception
+    monkeypatch.setitem(sys.modules, 'core.error_advice', ea)
+    w = _make_worker()
+
+    with caplog.at_level(logging.DEBUG, logger=gpu_worker.logger.name):
+        w._raise_missing_package_goal('vocos', 'hint',
+                                      failed_step=FAILED_STEP_PIP_INSTALL)
+
+    said = [r for r in caplog.records if 'goal store unreachable' in r.getMessage()]
+    assert said, [r.getMessage() for r in caplog.records]
+    assert all(r.levelno == logging.ERROR for r in said)
+    assert "'vocos'" in said[0].getMessage()
+
+
+def test_the_step_names_are_the_ones_the_prompt_reads():
+    """One value per step, shared by the writer and the reader."""
+    assert FAILED_STEP_PIP_INSTALL != FAILED_STEP_SETUP_OFFER
+    offer = _build_self_heal_prompt(_goal('subprocess.tool_load', {
+        'missing_package': 'vocos', 'failed_step': FAILED_STEP_SETUP_OFFER}))
+    pip = _build_self_heal_prompt(_goal('subprocess.tool_load', {
+        'missing_package': 'vocos', 'failed_step': FAILED_STEP_PIP_INSTALL}))
+    assert 'could not be offered' in offer
+    assert 'was already attempted' in pip

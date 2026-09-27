@@ -743,7 +743,8 @@ class SplitKeysNeverReplaceAWrittenValue(_KwargsChat):
     def test_a_split_that_repeats_a_declared_key_is_refused(self):
         content = self._assert_refused_and_marked(
             '{"command": ls -la, command: rm -rf /tmp/x}')
-        self.assertIn('command', content.split('value before them', 1)[1])
+        self.assertIn('may be part of the value before them: command.',
+                      content)
 
     def test_a_split_that_repeats_the_message_text_is_not_sent(self):
         self._assert_refused_and_marked('{"text": Hi there, text: again}',
@@ -757,11 +758,28 @@ class SplitKeysNeverReplaceAWrittenValue(_KwargsChat):
     def test_a_quoted_key_written_twice_is_refused_after_a_repair(self):
         content = self._assert_refused_and_marked(
             '{"text": "Hi", "text": "again",}', name='send_message_to_user')
-        self.assertIn('text', content.split('value before them', 1)[1])
+        self.assertIn('may be part of the value before them: text.', content)
 
     def test_a_quoted_word_inside_an_unquoted_value_is_not_a_key(self):
         # Review of 30042a2b6, problem 6: ran as ('echo the', status='ok').
         self._assert_refused_and_marked('{"command": echo the "status": ok}')
+
+    def test_a_quoted_declared_word_inside_a_value_is_not_a_key(self):
+        # The same split onto a name the tool declares: text 'say the'.
+        self._assert_refused_and_marked(
+            '{"text": say the "response_type": Happy}',
+            name='send_message_to_user')
+
+    def test_a_key_needs_a_comma_before_it_even_after_a_list(self):
+        # No comma: "cwd" does not sit where a key starts, as in problem 6.
+        self._assert_refused_and_marked('{"command": ["ls"] "cwd": "/tmp"}')
+
+    def test_a_value_cut_off_at_the_end_is_not_one_left_empty(self):
+        # '{..., "cwd": /tmp' (no closing brace) repairs to cwd ''; the model
+        # wrote /tmp, so the emptied value is refused like any other.
+        content = self._assert_refused_and_marked(
+            '{"command": "ls", "cwd": /tmp')
+        self.assertIn('came out empty: cwd.', content)
 
     def test_a_bare_key_after_a_whole_value_still_runs(self):
         self.call('send_message_to_user',

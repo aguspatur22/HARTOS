@@ -148,6 +148,17 @@ def reset_state_machine():
         pass
 
 
+@pytest.fixture(autouse=True)
+def reopen_owner_feed_answers():
+    """A real camera/screen revoke in one test closes core.ai_sensing's
+    process-wide gate (the owner's No); the next test starts with no answer
+    on record, as a fresh process does."""
+    yield
+    from core import ai_sensing
+    for sensor in ('camera', 'screen'):
+        ai_sensing.withhold(sensor, False)
+
+
 @pytest.fixture
 def computer_control_granted(monkeypatch):
     """The desktop owner has allowed agents to control this computer.

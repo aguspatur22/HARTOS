@@ -11332,7 +11332,7 @@ def agent_approval():
 
         try:
             from integrations.channels.admin.api import (
-                get_api, _apply_embodied_toggle,
+                get_api, apply_embodied_answer,
             )
             api = get_api()
             cfg = api._global_config.embodied_ai
@@ -11353,7 +11353,9 @@ def agent_approval():
                 elif feed == 'audio':
                     cfg.audio_enabled = True
                 api._save_config()
-                _apply_embodied_toggle(feed, True, cfg)
+                # The one way in: the capture gate now, the VisionService
+                # start on the feed's own worker, never on this request.
+                apply_embodied_answer(feed, True, cfg)
             # Stage-C (Symptom #6, 2026-04-16) — publish the consent
             # event on Crossbar WAMP so subscribers (VisionService,
             # frontend, mobile) never have to poll or watch a raw WS
