@@ -28,7 +28,14 @@ _VAULT_PATH = os.path.join(os.path.dirname(__file__), '..', 'secrets.enc')
 _SALT_PATH = os.path.join(os.path.dirname(__file__), '..', 'secrets.salt')
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), '..', 'config.json')
 
-# Known secret keys that should be loaded from the vault
+# Known secret keys that should be loaded from the vault: the names this
+# process legitimately reads from its environment.  THE one list of them.
+# A vault value reaches os.environ only for a name here (HARTOS
+# AIKeyVault.store_credential / preload_env, Nunba desktop ai_key_vault
+# export_to_env); any other value the owner entered (a site password asked
+# for on the consent card) stays in the vault and reaches a tool only
+# through its {{secret:NAME}} alias, so a card entry named NUNBA_CI or
+# HTTPS_PROXY can never become configuration.
 SECRET_KEYS = [
     'OPENAI_API_KEY',
     'GROQ_API_KEY',
@@ -43,6 +50,10 @@ SECRET_KEYS = [
     'SOCIAL_DB_KEY',
     'REDIS_URL',
     'DATABASE_URL',
+    # Nunba desktop vault tool keys migrated from config.json
+    # (desktop.ai_key_vault._MIGRATABLE_KEYS), read from the environment.
+    'GOOGLE_OAUTH2_CLIENT_ID',
+    'GOOGLE_OAUTH2_CLIENT_SECRET',
 ]
 
 

@@ -254,7 +254,8 @@ def test_boot_decision_handles_missing_log(tool):
     import tempfile
     # Point the log dir at a temp dir that definitely lacks the log file
     with tempfile.TemporaryDirectory() as tmp:
-        with patch('core.platform_paths.get_log_dir', return_value=tmp), \n               patch('core.platform_paths.get_installed_log_dir', return_value=tmp):
+        with patch('core.platform_paths.get_log_dir', return_value=tmp), \
+               patch('core.platform_paths.get_installed_log_dir', return_value=tmp):
             result = tool.get_boot_decision()
         assert result['available'] is False
         assert 'not yet written' in result['summary'] or 'empty' in result['summary']
@@ -284,7 +285,8 @@ def test_a_dev_run_with_no_log_of_its_own_reads_the_installed_one(tool, tmp_path
     # get_log_dir is logs-dev in a source run; HARTOS alone never writes this
     # log, so asking it about the installed app must read logs/.
     _decision(tmp_path / 'logs', 'draft_enabled')
-    with patch('core.platform_paths.get_log_dir', return_value=str(tmp_path / 'logs-dev')), \n            patch('core.platform_paths.get_installed_log_dir', return_value=str(tmp_path / 'logs')):
+    with patch('core.platform_paths.get_log_dir', return_value=str(tmp_path / 'logs-dev')), \
+            patch('core.platform_paths.get_installed_log_dir', return_value=str(tmp_path / 'logs')):
         result = tool.get_boot_decision()
     assert result['available'] is True
     assert result['decision'] == 'draft_enabled'
@@ -294,15 +296,20 @@ def test_a_dev_run_with_no_log_of_its_own_reads_the_installed_one(tool, tmp_path
 def test_this_runs_own_log_wins_over_the_installed_one(tool, tmp_path):
     _decision(tmp_path / 'logs', 'draft_enabled')
     _decision(tmp_path / 'logs-dev', 'main_only')
-    with patch('core.platform_paths.get_log_dir', return_value=str(tmp_path / 'logs-dev')), \n            patch('core.platform_paths.get_installed_log_dir', return_value=str(tmp_path / 'logs')):
+    with patch('core.platform_paths.get_log_dir', return_value=str(tmp_path / 'logs-dev')), \
+            patch('core.platform_paths.get_installed_log_dir', return_value=str(tmp_path / 'logs')):
         result = tool.get_boot_decision()
     assert result['decision'] == 'main_only'
 
 
 def test_the_installed_log_dir_is_the_log_dir_without_the_dev_suffix(monkeypatch):
+    import os
     import sys
     import core.platform_paths as pp
     monkeypatch.delenv('NUNBA_LOG_DIR', raising=False)
+    monkeypatch.setattr(pp, '_IS_MACOS', False)
+    # The documented installed path: <data root>/logs.
+    assert pp.get_installed_log_dir() == os.path.join(pp.get_data_dir(), 'logs')
     monkeypatch.setattr(sys, 'frozen', False, raising=False)
     assert pp.get_log_dir() == pp.get_installed_log_dir() + '-dev'
     monkeypatch.setattr(sys, 'frozen', True, raising=False)

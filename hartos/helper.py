@@ -1068,9 +1068,37 @@ def load_wire_json(text):
 # constants.STRING_DELIMITERS: " ' and the curly pair), each with its closer.
 _BARE_NUMBER = re.compile(r'-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?')
 _STRING_CLOSER = {'"': '"', "'": "'", '“': '”', '”': '”'}
-# The JSON delimiters a whole value sits between (whitespace too).
-_BEFORE_A_VALUE = '{[,:'
-_AFTER_A_VALUE = ',}]:'
+# What a bare token is made of: a number with one of these next to it is
+# part of a longer token (a UUID, a word, a path), never a number of its own.
+_TOKEN_CHARS = '_.-+'
+# Where a comment may open: after whitespace or ``{ [ ,`` -- not inside an
+# unquoted value, and not after ':', which the '//' of a URL follows.
+_BEFORE_A_COMMENT = '{[,'
+
+
+_NON_FINITE_WORDS = ('Infinity', '-Infinity', 'NaN')
+
+
+def _invents_a_constant(value, original):
+    """True when ``value`` holds Infinity / NaN (as a number or as the string
+    load_wire_json keeps it as) that ``original`` never contains: repair_json
+    writing Infinity for a number it could not hold.  Such a repair is
+    refused, never sent -- the model did not write that value (review of
+    3ea611862)."""
+    if isinstance(value, dict):
+        return any(_invents_a_constant(k, original)
+                   or _invents_a_constant(v, original) for k, v in value.items())
+    if isinstance(value, list):
+        return any(_invents_a_constant(v, original) for v in value)
+    if isinstance(value, float) and not math.isfinite(value):
+        return True
+    return (isinstance(value, str) and value in _NON_FINITE_WORDS
+            and value not in str(original))
+
+
+def _joins_a_token(ch):
+    """True when ``ch`` next to a number makes it part of a longer token."""
+    return ch.isalnum() or ch in _TOKEN_CHARS
 
 
 def _quote_overflowing_numbers(text):
@@ -1082,12 +1110,14 @@ def _quote_overflowing_numbers(text):
     as they are; a string or comment that never closes swallows the rest,
     which is then left as it was.
 
-    Only a WHOLE token is quoted: one with a JSON delimiter (the start,
-    ``{ [ , :`` or whitespace) before it and one (the end, ``, } ] :`` or
-    whitespace) after it.  Review of ed31c7c53, probed: reading '-' and '+'
-    as delimiters turned an unquoted UUID ``550e8400-e29b-...`` into
-    ``"550e8400"`` (its first group reads as an overflowing number) and lost
-    the rest; ``x-1e999`` became ``"x-"``."""
+    Only a WHOLE token is quoted: one with no letter, digit or ``_ . - +``
+    on either side (_joins_a_token).  Review of ed31c7c53, probed: reading
+    '-' and '+' as delimiters turned an unquoted UUID ``550e8400-e29b-...``
+    into ``"550e8400"`` and lost the rest.  Review of 3ea611862: a list of
+    allowed neighbours (``, } ] :``) left a number before a quote, ``)`` or
+    ``;`` unquoted, and repair_json then wrote Infinity; and a comment is
+    opened only where one can start (_BEFORE_A_COMMENT), since the ``//``
+    of an unquoted URL is not one."""
     out, i, closer = [], 0, None
     while i < len(text):
         ch = text[i]
@@ -1109,28 +1139,25 @@ def _quote_overflowing_numbers(text):
             out.append(ch)
             i += 1
             continue
-        if text.startswith('/*', i) or text.startswith('//', i):
+        if ((text.startswith('/*', i) or text.startswith('//', i))
+                and (i == 0 or text[i - 1].isspace()
+                     or text[i - 1] in _BEFORE_A_COMMENT)):
             closer = '*/' if text[i + 1] == '*' else '\n'
             out.append(text[i:i + 2])
             i += 2
             continue
         match = _BARE_NUMBER.match(text, i)
-        if match and (i == 0 or text[i - 1] in _BEFORE_A_VALUE
-                      or text[i - 1].isspace()):
+        if match and not (i and _joins_a_token(text[i - 1])):
             token, end = match.group(), match.end()
-            bounded = (end == len(text) or text[end] in _AFTER_A_VALUE
-                       or text[end].isspace())
-            if bounded:
+            if end == len(text) or not _joins_a_token(text[end]):
                 out.append(json.dumps(token)
                            if not math.isfinite(float(token)) else token)
                 i = end
                 continue
             # Part of a longer token (a UUID, a word): copy the whole run
             # so no later position inside it is read as a number.
-            run_end = i
-            while (run_end < len(text) and not text[run_end].isspace()
-                   and text[run_end] not in _AFTER_A_VALUE
-                   and text[run_end] not in _STRING_CLOSER):
+            run_end = end
+            while run_end < len(text) and _joins_a_token(text[run_end]):
                 run_end += 1
             out.append(text[i:run_end])
             i = run_end
@@ -1270,7 +1297,7 @@ def ensure_tool_call_arguments_json(messages):
                     obj = load_wire_json(candidate())
                 except Exception:
                     continue
-                if isinstance(obj, dict):
+                if isinstance(obj, dict) and not _invents_a_constant(obj, args):
                     fixed = json.dumps(obj)
                     break
             if fixed is None:
@@ -1447,6 +1474,31 @@ def _context_limiter_classes():
             kept = restore_protected('MessageTokenLimiter', messages, kept,
                                      bound=self._bound_message)
             return [self._bound_tool_responses(m) for m in kept]
+
+        def _truncate_tokens(self, text, n_tokens):
+            # autogen keeps a message's first n tokens.  A REUSE dispatch
+            # turn keeps its marker and the user's words whole instead and
+            # loses only steps -- the rule the wire trim applies
+            # (core.llm_outbound_logger.must_keep_head).  Review of
+            # f97b6bed8: words over the 1,000-token per-message cap were cut
+            # here first, the "follow these steps:" boundary with them.
+            from core.llm_outbound_logger import keep_head_cut, must_keep_head
+            from core.constants import WIRE_TRIM_MARKER
+            keep = must_keep_head(text)
+            if not keep:
+                return super()._truncate_tokens(text, n_tokens)
+            util = transforms.transforms_util
+            if util.count_text_tokens(text) <= n_tokens:
+                return text
+            room = (n_tokens - util.count_text_tokens(text[:keep])
+                    - util.count_text_tokens(WIRE_TRIM_MARKER))
+            rest = text[keep:]
+            tail = ''
+            if room > 0 and rest:
+                tail = rest[-max(1, int(len(rest) * room
+                                        / max(1, util.count_text_tokens(rest))
+                                        * 0.9)):]
+            return keep_head_cut(text, keep, len(tail), WIRE_TRIM_MARKER)
 
         def _bound_message(self, msg):
             # The per-message cut autogen gives every message it keeps (head

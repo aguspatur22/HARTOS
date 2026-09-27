@@ -810,7 +810,7 @@ def _truncate_msg_content(msg: dict, target_chars: int, marker: str,
     (6 of 77 calls); the reply was off-topic.  A tool result's head is where
     its status and failure text sit, and a system message's head is the
     persona, so every kind of message keeps both ends.  The head gets the
-    larger half -- and never less than :func:`_must_keep_head`: a REUSE
+    larger half -- and never less than :func:`must_keep_head`: a REUSE
     dispatch turn keeps its marker and the user's words whole, and only the
     steps after ``ACTION_STEPS_SEPARATOR`` are elided (review of 111c458b0,
     probed: a fixed half/half split cut the words to 250 chars).
@@ -830,7 +830,7 @@ def _truncate_msg_content(msg: dict, target_chars: int, marker: str,
     target_chars = max(0, target_chars)
     tail_chars = target_chars // 2
     head_chars = target_chars - tail_chars
-    keep = _must_keep_head(text)
+    keep = must_keep_head(text, msg.get('role'))
     if keep > head_chars:
         # The words stay whole even past target_chars: a request over its
         # budget is reported by the caller; a request without the user's
@@ -876,9 +876,11 @@ def _truncate_msg_content(msg: dict, target_chars: int, marker: str,
 ELIDED_NAMESPACE = 'elided'
 ELIDED_KEY_PREFIX = 'elided:'
 _ELIDED_POINTER_RE = None  # compiled on first use
-_ELIDED_MAX_CHARS = 4_000_000   # the whole namespace; oldest entries go first
+_ELIDED_MAX_ITEMS = 5000        # items kept on disk; the oldest go first
 _ELIDED_TTL_S = 24 * 3600       # a REUSE replay reads it within the day
-_elided_lock = threading.Lock()
+_ELIDED_EVICT_EVERY = 50        # writes between eviction sweeps
+_elided_writes = 0
+_elided_evict_lock = threading.Lock()
 _ELIDED_KINDS = {'tool': 'a tool result', 'user': 'a user turn',
                  'assistant': 'an assistant turn', 'system': 'the system prompt'}
 _ELIDED_LISTED_DROPS = 5        # dropped tool results named in the explanation
@@ -916,42 +918,101 @@ def _elided_id(text: str) -> str:
         text.encode('utf-8', 'surrogatepass')).hexdigest()[:12]
 
 
+def elision_scope(user_id=None, request_id=None) -> str:
+    """Whose elided text a pointer may read: a digest of the user the LLM
+    call acted for, else of its request id, else 'anon'.
+
+    A pointer resolves only in the scope that wrote it, so one user's
+    elided text is never readable through another user's get_data_by_key
+    (review of f97b6bed8: the one shared store let anyone with an id read
+    it).  With no argument, the scope of the current LLM call: the user id
+    ``with_llm_context`` bound, else the thread-local one, else the request
+    id."""
+    import hashlib
+    if user_id is None and request_id is None:
+        user_id = _user_id_var.get() or ''
+        if not user_id:
+            try:
+                from hartos.threadlocal import thread_local_data as _tl
+                user_id = _tl.get_user_id() or ''
+            except Exception:
+                user_id = ''
+        request_id = '' if user_id else _get_request_id()
+    if user_id:
+        return 'u' + hashlib.sha256(str(user_id).encode()).hexdigest()[:12]
+    if request_id:
+        return 'r' + hashlib.sha256(str(request_id).encode()).hexdigest()[:12]
+    return 'anon'
+
+
+def _elided_item(scope: str, pointer_id: str) -> str:
+    """The agent-data namespace of ONE elided item: ``elided_<scope>_<id>``."""
+    return f'{ELIDED_NAMESPACE}_{scope}_{pointer_id}'
+
+
+def _evict_elided() -> None:
+    """Remove elided items older than _ELIDED_TTL_S and, past
+    _ELIDED_MAX_ITEMS, the oldest.  One sweep at a time; never raises."""
+    if not _elided_evict_lock.acquire(blocking=False):
+        return
+    try:
+        from core.cache_loaders import AGENT_DATA_DIR
+        prefix, suffix = ELIDED_NAMESPACE + '_', '_agent_data.json'
+        items = []
+        for entry in os.scandir(AGENT_DATA_DIR):
+            if entry.name.startswith(prefix) and entry.name.endswith(suffix):
+                try:
+                    items.append((entry.stat().st_mtime, entry.path))
+                except OSError:
+                    pass
+        items.sort()
+        now = time.time()
+        excess = max(0, len(items) - _ELIDED_MAX_ITEMS)
+        for n, (mtime, path) in enumerate(items):
+            if n < excess or now - mtime > _ELIDED_TTL_S:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+    except Exception as e:
+        logger.debug("wire-trim: elided eviction skipped: %s", e)
+    finally:
+        _elided_evict_lock.release()
+
+
 def _save_elided(records: dict) -> bool:
-    """Merge ``records`` into the ``elided`` namespace and write it; prune
-    entries older than _ELIDED_TTL_S and, past _ELIDED_MAX_CHARS, the oldest.
-    Never raises; False when the store could not be written (the caller then
+    """Write each record as its own item in the current elision_scope --
+    one small atomic file per item, no shared file rewritten, no global lock
+    on the hot path -- and sweep old items every _ELIDED_EVICT_EVERY writes.
+    Never raises; False when any item could not be written (the caller then
     sends plain markers, never a pointer to nothing)."""
+    global _elided_writes
     if not records:
         return True
     try:
-        from core.cache_loaders import load_agent_data, save_agent_data
-        with _elided_lock:
-            data = load_agent_data(ELIDED_NAMESPACE)
-            data = dict(data) if isinstance(data, dict) else {}
-            data.update(records)
-            now = time.time()
-            live = sorted(((k, v) for k, v in data.items()
-                           if isinstance(v, dict)
-                           and now - float(v.get('at') or 0) < _ELIDED_TTL_S),
-                          key=lambda kv: -float(kv[1].get('at') or 0))
-            kept, total = {}, 0
-            for k, v in live:
-                total += len(str(v.get('text') or ''))
-                if total > _ELIDED_MAX_CHARS and kept:
-                    break
-                kept[k] = v
-            return save_agent_data(ELIDED_NAMESPACE, kept)
+        from core.cache_loaders import save_agent_data
+        scope = elision_scope()
+        ok = all(save_agent_data(_elided_item(scope, pid), rec)
+                 for pid, rec in records.items())
+        _elided_writes += len(records)
+        if _elided_writes >= _ELIDED_EVICT_EVERY:
+            _elided_writes = 0
+            _evict_elided()
+        return ok
     except Exception as e:
         logger.warning("wire-trim: could not save elided text: %s", e)
         return False
 
 
-def read_elided(pointer_id: str):
-    """The original text a pointer names, or None when it is not stored."""
+def read_elided(pointer_id: str, scope=None):
+    """The original text a pointer names in ``scope`` (default: the current
+    call's elision_scope), or None when that scope holds no such item."""
     try:
         from core.cache_loaders import load_agent_data
-        data = load_agent_data(ELIDED_NAMESPACE)
-        entry = (data or {}).get(str(pointer_id).strip()) if isinstance(data, dict) else None
+        pid = str(pointer_id).strip()
+        if not pid.isalnum():
+            return None
+        entry = load_agent_data(_elided_item(scope or elision_scope(), pid))
         return entry.get('text') if isinstance(entry, dict) else None
     except Exception:
         return None
@@ -972,33 +1033,50 @@ def _middle_cut(text: str, head_chars: int, tail_chars: int,
     return head + marker + tail
 
 
-def _truncate_tool_call_arguments(msg: dict, target_chars: int,
-                                  marker: str) -> tuple:
-    """Cut the arguments of the tool calls ``msg`` carries so they hold about
-    ``target_chars`` together; ``(new_msg, n_cut_chars)``.
+def _truncate_tool_call_arguments(msg: dict, room_tokens: int, marker,
+                                  model=None) -> tuple:
+    """Cut the arguments of the tool calls ``msg`` carries so they cost about
+    ``room_tokens`` together AS SENT; ``(new_msg, n_cut_chars)``.
 
     Arguments stay one strict JSON object -- llama.cpp answers 500 "Failed
     to parse tool call arguments as JSON" to anything else -- so a cut call's
     arguments become ``{"trimmed_arguments": <head> marker <tail>}``.  Each
-    call gets an equal share; one under its share is left as it is.  Review
-    of be96f2510: a call with 40k-char arguments kept whole with its
-    protected result sent 20,243 tokens against a 7,424 budget."""
+    call gets an equal share of the room; one under its share is left as it
+    is.  Review of be96f2510: a call with 40k-char arguments kept whole with
+    its protected result sent 20,243 tokens against a 7,424 budget.
+
+    Sized on the ESCAPED result, not the raw text: json.dumps writes a quote
+    or a backslash as two characters and an emoji as a 12-character
+    surrogate escape, so a cut sized on the raw text stayed 10k-19k tokens
+    against 7,424 (review of f97b6bed8).  The cut shrinks until the sent
+    arguments fit, a few rounds at most.  ``marker`` is a string, or a
+    callable given the original arguments (it names the pointer)."""
+    from core.token_utils import count_tokens_for_text
     calls = msg.get('tool_calls')
     if not isinstance(calls, list) or not calls:
         return msg, 0
-    share = max(0, target_chars) // len(calls)
+    share = max(1, int(room_tokens) // len(calls))
     new_calls, n_cut = [], 0
     for tc in calls:
         fn = tc.get('function') if isinstance(tc, dict) else None
         args = fn.get('arguments') if isinstance(fn, dict) else None
-        if not isinstance(args, str) or len(args) <= share:
+        if (not isinstance(args, str)
+                or count_tokens_for_text(json.dumps(args), model) <= share):
             new_calls.append(tc)
             continue
-        tail_chars = share // 2
         mark = marker(args) if callable(marker) else marker
-        cut = _middle_cut(args, share - tail_chars, tail_chars, mark)
-        new_calls.append({**tc, 'function': {
-            **fn, 'arguments': json.dumps({'trimmed_arguments': cut})}})
+        chars = _chars_for_tokens(args, share, model)
+        for _ in range(8):
+            tail_chars = chars // 2
+            cut = _middle_cut(args, chars - tail_chars, tail_chars, mark)
+            sent = json.dumps({'trimmed_arguments': cut})
+            # As the body is counted and sent: the arguments are a JSON
+            # string INSIDE the tool_calls JSON, so escaped once more.
+            cost = count_tokens_for_text(json.dumps(sent), model)
+            if cost <= share or chars <= 0:
+                break
+            chars = int(chars * share / cost * 0.9)
+        new_calls.append({**tc, 'function': {**fn, 'arguments': sent}})
         n_cut += len(args) - len(cut) + len(mark)
     if not n_cut:
         return msg, 0
@@ -1017,13 +1095,29 @@ def _chars_for_tokens(text: str, tokens: int, model=None) -> int:
     return int(max(0, tokens) * ratio * 0.9)
 
 
-def _must_keep_head(text: str) -> int:
+def must_keep_head(text: str, role='user') -> int:
     """How many leading characters of ``text`` no cut may take: a REUSE
     dispatch turn's marker and the user's words, up to and including
-    ``ACTION_STEPS_SEPARATOR``.  0 for any other message."""
+    ``ACTION_STEPS_SEPARATOR``.  0 for any other message.
+
+    The ONE rule for both places that shorten a turn: the wire trim (which
+    passes the message's role) and the seats' token limiter (whose messages
+    are conversation turns only: autogen adds the system prompt after the
+    transforms).  Only a user turn is a dispatch turn: a system prompt that
+    happens to contain the separator is cut like any other (review of
+    f97b6bed8)."""
+    if role != 'user' or not isinstance(text, str):
+        return 0
     from core.constants import ACTION_STEPS_SEPARATOR
     at = text.find(ACTION_STEPS_SEPARATOR)
     return at + len(ACTION_STEPS_SEPARATOR) if at >= 0 else 0
+
+
+def keep_head_cut(text: str, keep: int, tail_chars: int, marker: str) -> str:
+    """``text``'s first ``keep`` characters whole, then ``marker``, then its
+    last ``tail_chars``: the cut both the trim and the limiter make of a
+    dispatch turn (must_keep_head)."""
+    return _middle_cut(text, keep, max(0, tail_chars), marker)
 
 
 def ensure_user_turn(messages: list) -> bool:
@@ -1213,7 +1307,7 @@ def _trim_to_budget(body: dict, _reserve: int = 0) -> tuple:
          when nothing protects it, then the protected ones, largest first.
          Each is cut only as far as the others at their current size
          require, never below 64 tokens nor below a dispatch turn's marker
-         and words (:func:`_must_keep_head`), with ``WIRE_TRIM_MARKER`` where
+         and words (:func:`must_keep_head`), with ``WIRE_TRIM_MARKER`` where
          its middle was so the LLM sees the truncation.
       5. If STILL over, cut the middle of the system message the same way.
       A cut keeps each message's head and tail (_truncate_msg_content).
@@ -1472,23 +1566,33 @@ def _trim_to_budget(body: dict, _reserve: int = 0) -> tuple:
                            + marker_tokens)
         p_text = _content_to_text(p.get('content'))
         # A dispatch turn keeps its marker and words whatever its room
-        # (_truncate_msg_content / _must_keep_head): sized against a
+        # (_truncate_msg_content / must_keep_head): sized against a
         # full-size tool result it went to the 64-token floor and lost them
         # (review of 111c458b0).  The candidates after it are sized against
         # what it kept.
         room_for_p = max(64, budget - overhead_tokens)
-        if p.get('tool_calls') and not p_text.strip():
-            args_text = ''.join(
-                str(((tc or {}).get('function') or {}).get('arguments') or '')
-                for tc in p['tool_calls'] if isinstance(tc, dict))
+        new_p, n_cut = p, 0
+        if p.get('tool_calls'):
+            # A call is cut in its arguments AND its text, each in proportion
+            # to what it costs (review of f97b6bed8: a call carrying "Writing
+            # the file." was cut in neither, 20,416 tokens against 7,424).
+            args_tokens = count_tokens_for_text(
+                json.dumps(p['tool_calls'], ensure_ascii=False), model)
+            text_tokens = (count_tokens_for_text(p_text, model)
+                           if p_text.strip() else 0)
+            args_room = max(1, room_for_p * args_tokens
+                            // max(1, args_tokens + text_tokens))
             new_p, n_cut = _truncate_tool_call_arguments(
-                p, _chars_for_tokens(args_text, room_for_p, model),
+                p, args_room,
                 lambda t: (WIRE_TRIM_MARKER
-                           + _remember(t, 'tool call arguments') + '\n'))
-        else:
+                           + _remember(t, 'tool call arguments') + '\n'),
+                model)
+            room_for_p = max(64, room_for_p - args_room)
+        if p_text.strip():
             target_chars = _chars_for_tokens(p_text, room_for_p, model)
-            new_p, n_cut = _truncate_msg_content(
-                p, target_chars, _marker_for(p), _content_to_text)
+            new_p, n_text = _truncate_msg_content(
+                new_p, target_chars, _marker_for(p), _content_to_text)
+            n_cut += n_text
         if n_cut:
             n_truncated_chars += n_cut
             messages[p_idx] = new_p

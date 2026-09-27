@@ -84,7 +84,7 @@ def test_trim_that_cannot_reach_budget_says_so(caplog):
     # The trim now sizes each cut at the message's own chars/token and can
     # cut the system message too, so an oversized system prompt alone no
     # longer makes it fail.  What it still will not cut is a dispatch turn's
-    # marker and words (_must_keep_head), so words longer than the budget are
+    # marker and words (must_keep_head), so words longer than the budget are
     # the untrimmable shape.
     from core.constants import ACTION_STEPS_SEPARATOR
     body = {

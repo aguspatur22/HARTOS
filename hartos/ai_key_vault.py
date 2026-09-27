@@ -165,7 +165,9 @@ class AIKeyVault:
 
     def store_credential(self, key_name: str, value: str,
                          channel_type: str = '') -> str:
-        """Store a credential in vault + inject into os.environ.
+        """Store a credential in the vault.  It reaches a tool through its
+        {{secret:NAME}} alias; it is put in os.environ too only when the
+        process reads that name from its environment (reads_from_env).
 
         Returns the resolved key name.
         """
@@ -196,8 +198,13 @@ class AIKeyVault:
                     "(will not persist across restarts)"
                 )
 
-            # Inject into current process
-            os.environ[resolved] = value
+            # The vault holds it (set_secret fills the cache even when it
+            # cannot persist); the environment only for a name the process
+            # reads from it.  A card entry named NUNBA_CI or HTTPS_PROXY must
+            # never become configuration.
+            self._secrets_manager()._cache[resolved] = value
+            if reads_from_env(resolved):
+                os.environ[resolved] = value
             self._stored.add(resolved)
 
             # Clear pending request
@@ -216,6 +223,17 @@ class AIKeyVault:
 
         logger.info(f"Credential stored: {resolved}")
         return resolved
+
+    def hold_credential(self, key_name: str, value: str) -> None:
+        """Hold a value another store keeps, so its alias can resolve here:
+        Nunba's desktop vault (export_to_env) hands over what the consent
+        card stored instead of putting it in os.environ.  In memory only;
+        never the environment.  It resolves once the owner's grant names it
+        (owner_credential_names)."""
+        if not key_name or not value:
+            return
+        with self._lock:
+            self._secrets_manager()._cache[str(key_name)] = value
 
     # ── Alias (the only form the model sees) ───────────────────────
 
@@ -385,7 +403,10 @@ class AIKeyVault:
     # ── Boot Preload ───────────────────────────────────────────────
 
     def preload_env(self) -> int:
-        """Load all vault secrets into os.environ.
+        """Load the vault secrets the process reads from its environment
+        (reads_from_env) into os.environ.  Any other vault value (a
+        credential entered for an agent) stays in the vault and resolves
+        through its alias.
 
         Called at boot BEFORE config_cache runs.
         Skips keys already present in os.environ.
@@ -396,7 +417,7 @@ class AIKeyVault:
 
         # Load from encrypted vault cache
         for key, value in sm._cache.items():
-            if key not in os.environ and value:
+            if key not in os.environ and value and reads_from_env(key):
                 os.environ[key] = value
                 loaded += 1
 
@@ -470,6 +491,24 @@ class AIKeyVault:
         resolved = key_name.upper()
         with self._lock:
             return resolved in self._pending
+
+
+def reads_from_env(name) -> bool:
+    """True when this process legitimately reads ``name`` from its
+    environment: an API key in security.secrets_manager.SECRET_KEYS, or a
+    channel token/credential (FlaskChannelIntegration.env_names, the
+    adapters' env fallbacks).  Only those vault values are ever put in
+    os.environ; anything else the owner entered stays in the vault."""
+    from security.secrets_manager import SECRET_KEYS
+    if name in SECRET_KEYS:
+        return True
+    try:
+        from integrations.channels.flask_integration import FlaskChannelIntegration
+        return name in FlaskChannelIntegration.env_names()
+    except Exception:
+        logger.warning("channel env names unavailable; %s stays in the vault",
+                       name, exc_info=True)
+        return False
 
 
 # ── Module-level singleton (HARTOS convention) ─────────────────────

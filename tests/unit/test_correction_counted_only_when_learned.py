@@ -51,6 +51,9 @@ OLD_LEARNED = {'status': 'success', 'message': 'Correction received and learned'
 @pytest.mark.parametrize('body,learned', [
     (FAILED, False), (LEARNED, True), (OLD_FAILED, False), (OLD_LEARNED, True),
     ({'status': 'success'}, False),
+    # only a literal True is a verdict of learned
+    ({'status': 'success', 'success': None,
+      'statistics': {'success': True}}, False),
 ])
 def test_http_correction_counts_only_a_learned_reply(body, learned):
     bridge = _http_bridge()

@@ -109,3 +109,28 @@ def test_the_history_limiter_keeps_a_task_that_is_not_first():
 def test_a_buffer_that_fits_is_returned_unchanged():
     msgs = _live_seat_buffer()[:3]
     assert token_limiter(**_TOKENS).apply_transform(msgs) == msgs
+
+
+def test_words_over_the_per_message_cap_keep_the_steps_boundary():
+    """Review of f97b6bed8: user words over the 1,000-token cap were cut
+    head-first by the limiter, and the "follow these steps:" boundary went
+    with them before the wire trim saw the turn.  The limiter keeps the
+    marker and the words whole and cuts only the steps -- the rule the trim
+    uses (core.llm_outbound_logger.must_keep_head)."""
+    from core.constants import ACTION_STEPS_SEPARATOR
+    words = ' '.join('word%d' % i for i in range(1500))
+    head = 'Perform this action -> Action #1:summarize\n\n' + words
+    turn = {'role': 'user', 'name': 'User',
+            'content': head + ACTION_STEPS_SEPARATOR
+            + "{'s': 'step'}, " * 400 + 'LAST'}
+    out = token_limiter(**_TOKENS).apply_transform([turn])
+    kept = out[0]['content']
+    assert kept.startswith(head + ACTION_STEPS_SEPARATOR), kept[-200:]
+    assert len(kept) < len(turn['content'])
+
+
+def test_a_turn_without_the_separator_is_cut_as_autogen_cuts_it():
+    long = 'plain ' * 3000
+    msgs = [{'role': 'user', 'name': 'User', 'content': long}]
+    assert (token_limiter(**_TOKENS).apply_transform(msgs)
+            == ag.MessageTokenLimiter(**_TOKENS).apply_transform(msgs))

@@ -199,6 +199,45 @@ class StrictNumbers(unittest.TestCase):
                 out = _out_args(ensure_tool_call_arguments_json(_call(text)))
                 self.assertEqual(_strict_loads(out), expected)
 
+    def test_repair_never_invents_infinity_the_model_did_not_write(self):
+        # Review of 3ea611862 (rv3ea_probe.py): each of these kept the id at
+        # its parent and turned it into the string "Infinity" there -- a
+        # number before a quote, ')' or ';' was not a whole token, and a
+        # '//' or '/*' inside an unquoted value (a URL) was read as a
+        # comment.  Each must keep the token the model wrote, or be refused;
+        # never carry a value the model did not write.
+        from hartos.helper import REFUSED_ARGUMENTS_KEY
+        rows = (
+            '{"id": 620e51403072992921"}',
+            '{"id": 620e51403072992921", "n": 2}',
+            '{"url": https://example.com/a, "id": 620e51403072992921}',
+            '{"q": a//b, "id": 620e51403072992921}',
+            '{"q": x/*y, "id": 620e51403072992921}',
+            "{'v': 1e999)}", "{'v': (1e999)}", "{'v': 1e999;}",
+            "{\"v\": 1e999'}",
+        )
+        for text in rows:
+            with self.subTest(text=text):
+                out = _out_args(ensure_tool_call_arguments_json(_call(text)))
+                parsed = _strict_loads(out)
+                flat = json.dumps(parsed)
+                for invented in ('Infinity', 'NaN'):
+                    self.assertNotIn(invented, flat, out)
+                if REFUSED_ARGUMENTS_KEY not in parsed:
+                    self.assertTrue('620e51403072992921' in flat
+                                    or '1e999' in flat, out)
+
+    def test_repair_keeps_an_id_before_a_quote_or_bracket(self):
+        for text, key, token in (
+                ('{"id": 620e51403072992921"}', 'id', '620e51403072992921'),
+                ('{"url": https://example.com/a, "id": 620e51403072992921}',
+                 'id', '620e51403072992921'),
+                ("{'v': 1e999)}", 'v', '1e999'),
+                ("{'v': 1e999;}", 'v', '1e999')):
+            with self.subTest(text=text):
+                out = _out_args(ensure_tool_call_arguments_json(_call(text)))
+                self.assertIn(token, str(_strict_loads(out).get(key)), out)
+
     def test_repair_leaves_digits_in_a_comment_alone(self):
         from hartos.helper import _quote_overflowing_numbers
         self.assertEqual(_quote_overflowing_numbers("{'v': 2 /* 1e999 */}"),

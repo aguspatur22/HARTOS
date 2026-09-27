@@ -1061,9 +1061,16 @@ def build_core_tool_closures(ctx):
         # A pointer the wire trim put where it elided text
         # ([elided:<id> ...], core.llm_outbound_logger): the original, whole,
         # from the store's `elided` namespace -- no per-item cap.
-        from core.llm_outbound_logger import ELIDED_KEY_PREFIX, read_elided
+        from core.llm_outbound_logger import (
+            ELIDED_KEY_PREFIX, elision_scope, read_elided)
         if str(key).strip().startswith(ELIDED_KEY_PREFIX):
-            value = read_elided(str(key).strip()[len(ELIDED_KEY_PREFIX):])
+            # Only this user's elided text (or, when the call that elided it
+            # knew no user, this request's): never another user's.
+            pid = str(key).strip()[len(ELIDED_KEY_PREFIX):]
+            value = read_elided(pid, elision_scope(user_id=user_id))
+            if value is None and request_id_list.get(user_prompt):
+                value = read_elided(pid, elision_scope(
+                    request_id=request_id_list.get(user_prompt)))
             if value is None:
                 return (f'Nothing is stored for {key}: the elided text is kept '
                         f'for a day, and this one is gone or never existed.')

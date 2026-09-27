@@ -164,3 +164,17 @@ def test_dense_text_is_cut_to_fit(monkeypatch):
     out, est_after, got = _trim(msgs, 700, monkeypatch)
     assert est_after <= got, (est_after, got)
     _assert_head_and_tail(out[-1]['content'], 'HEAD', 'TAIL')
+
+
+def test_a_system_prompt_holding_the_separator_is_still_cut(monkeypatch):
+    """Review of f97b6bed8: the separator was honoured in any message, so a
+    system prompt that contained it kept everything before it whole.  Only a
+    user turn is a dispatch turn."""
+    from core.constants import ACTION_STEPS_SEPARATOR
+    sys_text = ('PERSONA ' + 'rule ' * 4000 + ACTION_STEPS_SEPARATOR
+                + 'recipe ' * 50 + 'TAIL')
+    out, est_after, budget = _trim_any(
+        [{'role': 'system', 'content': sys_text},
+         {'role': 'user', 'content': 'go'}], 700, monkeypatch)
+    assert est_after <= budget, (est_after, budget)
+    assert WIRE_TRIM_MARKER in out[0]['content']

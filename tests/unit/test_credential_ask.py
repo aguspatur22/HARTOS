@@ -484,7 +484,54 @@ def test_store_credential_replaces_its_own_value(world):
     vault = get_ai_key_vault()
     vault.store_credential('site_password', 'wrong')
     vault.store_credential('site_password', 'right')
-    assert os.environ['SITE_PASSWORD'] == 'right'
+    assert vault.get_tool_key('SITE_PASSWORD') == 'right'
+
+
+# ── A value entered for an agent stays in the vault, not the environment ──
+#
+# A card entry for an unset name (NUNBA_CI, HTTPS_PROXY...) used to reach
+# os.environ (Nunba export_to_env's setdefault; store_credential's own
+# injection), where the process reads it as configuration.  Now a value the
+# owner enters for an agent lives in the vault and reaches a tool only
+# through its alias.  Only a name the process legitimately reads from its
+# environment (security.secrets_manager.SECRET_KEYS) is also put there.
+
+@pytest.mark.parametrize('name', ['SITE_PASSWORD', 'NUNBA_CI', 'HTTPS_PROXY'])
+def test_a_stored_credential_never_enters_the_environment(world, monkeypatch, name):
+    from hartos.ai_key_vault import get_ai_key_vault
+    monkeypatch.delenv(name, raising=False)
+    vault = get_ai_key_vault()
+    vault.store_credential(name, 'typed-by-the-owner')
+    assert name not in os.environ
+    assert vault.get_tool_key(name) == 'typed-by-the-owner'
+    assert vault.resolve_aliases('{{secret:%s}}' % name) == 'typed-by-the-owner'
+
+
+def test_a_name_the_process_reads_from_env_still_reaches_it(world, monkeypatch):
+    from hartos.ai_key_vault import get_ai_key_vault
+    from security.secrets_manager import SECRET_KEYS
+    assert 'NEWS_API_KEY' in SECRET_KEYS
+    monkeypatch.delenv('NEWS_API_KEY', raising=False)
+    get_ai_key_vault().store_credential('NEWS_API_KEY', 'news-DUMMY')
+    assert os.environ['NEWS_API_KEY'] == 'news-DUMMY'
+
+
+@pytest.mark.parametrize('name', ['SITE_PASSWORD', 'NUNBA_CI'])
+def test_a_held_card_value_resolves_without_the_environment(world, card, monkeypatch, name):
+    """Nunba's desktop vault keeps what the card stored and hands it to this
+    vault (hold_credential) instead of os.environ; once the card's grant
+    names it, the alias resolves to it."""
+    from hartos.ai_key_vault import get_ai_key_vault
+    monkeypatch.delenv(name, raising=False)
+    vault = get_ai_key_vault()
+    vault.hold_credential(name, 'held-DUMMY-value')
+    assert name not in os.environ
+    assert vault.resolve_aliases('{{secret:%s}}' % name) == '{{secret:%s}}' % name
+    card('', {'consent_type': 'credential', 'scope': 'secret:' + name})
+    assert vault.resolve_aliases('{{secret:%s}}' % name) == 'held-DUMMY-value'
+    vault.hold_credential(name, 'held-again-DUMMY')
+    assert vault.resolve_aliases('{{secret:%s}}' % name) == 'held-again-DUMMY'
+    assert name not in os.environ
 
 
 # ── A no on a re-ask card wins for every agent ─────────────────────
@@ -497,7 +544,7 @@ def test_a_no_on_a_re_ask_card_ends_the_saved_value_for_every_agent(world, card,
     from hartos.ai_key_vault import get_ai_key_vault, request_credential
     request_credential(ASK, agent_id=agent)
     get_ai_key_vault()._stored.discard('SITE_PASSWORD')
-    os.environ['SITE_PASSWORD'] = SECRET          # what the card's vault exports
+    get_ai_key_vault().hold_credential('SITE_PASSWORD', SECRET)  # the card's vault
     card('', {'consent_type': 'credential', 'scope': 'secret:SITE_PASSWORD'})
     assert 'is stored' in request_credential(ASK, agent_id=agent)
     request_credential(REJECTED, agent_id=agent)
@@ -517,12 +564,12 @@ def test_a_no_for_one_agent_wins_over_a_value_entered_for_another(world, card):
     """Review m1: agent 42 was told no, then the owner entered the value on
     agent 7's card.  The no still stands for 42 (and the privacy page keeps
     listing it); 7 gets the alias."""
-    from hartos.ai_key_vault import request_credential
+    from hartos.ai_key_vault import get_ai_key_vault, request_credential
     request_credential(ASK, agent_id='42')
     card('/decline', {'consent_type': 'credential',
                       'scope': 'secret:SITE_PASSWORD', 'agent_id': '42'})
     request_credential(ASK, agent_id='7')
-    os.environ['SITE_PASSWORD'] = SECRET
+    get_ai_key_vault().hold_credential('SITE_PASSWORD', SECRET)
     card('', {'consent_type': 'credential', 'scope': 'secret:SITE_PASSWORD'})
 
     assert 'said no' in request_credential(ASK, agent_id='42')

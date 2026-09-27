@@ -439,3 +439,15 @@ class TestAFastActionIsUnchanged:
         assert result['exit_reason'] == 'action_error'
         assert result['extracted_responses'][0]['type'] == 'error'
         assert 'pyautogui exploded' in result['extracted_responses'][0]['content']
+
+
+@pytest.fixture(autouse=True)
+def _spy_ledger_factory():
+    import traceback, agent_ledger.factory as f
+    real = f.create_production_ledger
+    def spy(*a, **k):
+        print('CREATE_PRODUCTION_LEDGER', a, k, flush=True)
+        traceback.print_stack(limit=14)
+        return real(*a, **k)
+    with patch.object(f, 'create_production_ledger', side_effect=spy):
+        yield
