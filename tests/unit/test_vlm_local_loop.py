@@ -22,35 +22,9 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-import contextlib
-
-_MISSING = object()
-
-
-@contextlib.contextmanager
-def _swap_modules(replacements):
-    """Put these sys.modules entries in place, and restore ONLY them.
-
-    Was patch.dict('sys.modules', ...), whose exit restores the WHOLE dict:
-    every module first imported inside it (qwen3vl_backend,
-    activity_stream, ...) is dropped while its stale object stays on its
-    package.  A later `from integrations.vlm import qwen3vl_backend` then
-    returns the stale one, a test patches it, and the loop's call-time
-    import loads a fresh, unpatched copy.  Measured 2026-09-27: after this
-    file, test_vlm_loop_feeds_back_action_output sent real requests to
-    127.0.0.1:8080.
-    """
-    saved = {k: sys.modules.get(k, _MISSING) for k in replacements}
-    sys.modules.update(replacements)
-    try:
-        yield
-    finally:
-        for key, value in saved.items():
-            if value is _MISSING:
-                sys.modules.pop(key, None)
-            else:
-                sys.modules[key] = value
-
+# One shared helper; see tests/unit/module_swap.py for why not
+# patch.dict('sys.modules').
+from tests.unit.module_swap import swap_modules as _swap_modules  # noqa: E402
 
 from integrations.vlm.local_loop import (
     _parse_vlm_response,

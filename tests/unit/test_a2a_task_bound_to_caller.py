@@ -383,8 +383,13 @@ def test_blocking_sends_are_capped_too(monkeypatch):
         assert entered.wait(5)
         again = {'message': {'messageId': uuid.uuid4().hex,
                              'parts': [{'kind': 'text', 'text': 'x'}]}}
-        out = _run(h.handle_message_send(again, caller='peer:a'))
-        assert 'busy' in out['error']['message'], out
+        got = []
+        t2 = threading.Thread(target=lambda: got.append(_run(
+            h.handle_message_send(again, caller='peer:a'))), daemon=True)
+        t2.start()
+        t2.join(3)
+        # Admitted, it would block on the running turn: no answer in 3 s.
+        assert got and 'busy' in got[0]['error']['message'], got
     finally:
         release.set()
         t.join(5)
