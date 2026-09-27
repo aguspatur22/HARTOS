@@ -302,9 +302,9 @@ def _run_is_closed(user_id: str, prompt_id: str, run_id: str) -> bool:
         logger.debug('computer-use: run %s closed-check unavailable', run_id,
                      exc_info=True)
         return False
-    if task is None:
-        return False
-    status = task.status
+    status = getattr(task, 'status', None)
+    if status is None:
+        return False          # no task, or none whose state can be read: open
     return (getattr(status, 'name', '') in _CLOSED_STATUS_NAMES
             or TaskStatus.is_terminal_state(status))
 

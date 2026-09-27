@@ -99,17 +99,13 @@ def orch(monkeypatch):
 def _fresh_module_state(monkeypatch):
     # No model cached, CUDA not yet known-bad, and the retry gates out of the
     # way (their own contract is pinned by tests/test_whisper_backoff.py).
-    for name, value in (('_faster_whisper_model', None),
-                        ('_faster_whisper_model_size', None),
-                        ('_whisper_load_breaker', None),
-                        ('_whisper_load_backoff', None),
-                        ('_whisper_last_error', None)):
-        monkeypatch.setattr(wt, name, value)
-    for name in ('_faster_whisper_model_device',
+    for name in ('_faster_whisper_model', '_faster_whisper_model_size',
+                 '_faster_whisper_model_device',
                  '_faster_whisper_model_loaded_size',
-                 '_faster_whisper_cuda_error'):
-        if hasattr(wt, name):
-            monkeypatch.setattr(wt, name, None)
+                 '_faster_whisper_cuda_error',
+                 '_whisper_load_breaker', '_whisper_load_backoff',
+                 '_whisper_last_error'):
+        monkeypatch.setattr(wt, name, None)
 
 
 def _modules(engine):

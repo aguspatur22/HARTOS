@@ -482,6 +482,14 @@ def test_discoverable_string_false_is_false(client):
                        headers=_as_user(53)).get_json()['data']
     assert state['enabled'] is True
     assert state['face_visible'] is False
+    # 'false' for enabled turns the broadcast off, it does not keep it on.
+    r = client.post('/api/social/encounter/discoverable',
+                    json={'enabled': 'false', 'age_claim_18': 'true'},
+                    headers=_as_user(53))
+    assert r.status_code == 200
+    state = client.get('/api/social/encounter/discoverable',
+                       headers=_as_user(53)).get_json()['data']
+    assert state['enabled'] is False
 
 
 def test_source_guard_recognize_me_limit_is_the_constant():
