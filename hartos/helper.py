@@ -1245,6 +1245,12 @@ def ensure_tool_call_arguments_json(messages):
     can see and correct its own call (it used to be ``"{}"``, which erased
     it: review of 86e580b99).  ``None`` arguments, where nothing was written,
     still become ``"{}"``.
+
+    This guard has no tool signatures, so its repair cannot tell a benign fix
+    (a trailing comma) from json_repair splitting an unquoted value into
+    keys.  The executor can: a call it refused as broken JSON is already
+    marked refused in the conversation (bind_tool_call_arguments, ``call``),
+    and a strict JSON object is kept here as it is.
     """
     if not messages:
         return messages
@@ -4220,8 +4226,18 @@ def tool_argument_error(func, func_name, arguments, repaired):
             f"with one JSON object using these names.")
 
 
+def mark_call_refused(call, input_string):
+    """Write the refused stand-in (refused_arguments_json: what the model
+    wrote, marked refused, and why) into ``call``, the conversation's own
+    record of a tool call whose arguments were not valid JSON and were
+    refused.  A no-op when there is no record to mark."""
+    if isinstance(call, dict):
+        call['arguments'] = refused_arguments_json(
+            input_string if isinstance(input_string, str) else str(input_string))
+
+
 def bind_tool_call_arguments(func, func_name, input_string, format_json_str,
-                             where=''):
+                             where='', call=None):
     """Parse a tool call's arguments and check them against the tool.
 
     Returns ``(arguments, None)`` when the tool may be called with them and
@@ -4230,6 +4246,20 @@ def bind_tool_call_arguments(func, func_name, input_string, format_json_str,
     strict parse first, retrieve_json only when that fails, then
     ``tool_argument_error`` on whatever came back, including the ``{}``
     used when nothing could be recovered.
+
+    ``call`` is the conversation's own record of the call: autogen hands the
+    executor the very function dict of the stored message
+    (generate_tool_calls_reply: ``tool_call.get("function")`` of
+    ``messages[-1]``), and every copy of that message shares it.  When
+    arguments that were not valid JSON are refused, it is marked refused
+    (mark_call_refused).  Log RCA defect 14, leftover: the TOOL-ARGS-GUARD
+    (ensure_tool_call_arguments_json), which has no tool signatures, repaired
+    the same text on its own and wrote json_repair's split dict back into
+    every later request, so the model saw its broken call as a well-formed
+    one next to a reply saying it was not valid JSON.  The guard keeps a
+    strict JSON object as it is, so the stand-in is what the model sees.
+    Refused well-formed JSON (a wrong name) stays as the model wrote it:
+    that is what the reply names.
     """
     try:
         arguments = json.loads(format_json_str(input_string))
@@ -4245,12 +4275,15 @@ def bind_tool_call_arguments(func, func_name, input_string, format_json_str,
                 arguments = json.loads(arguments)
         except Exception as fallback_error:
             print(f" FALLBACK{where} FAILED: {fallback_error}")
+            mark_call_refused(call, input_string)
             return None, f"Error: {e}\n The argument must be in JSON format."
         print(f" FALLBACK{where} PARSED: arguments for {func_name}: {arguments}")
         repaired = True
     error = tool_argument_error(func, func_name, arguments, repaired)
     if error is not None:
         print(f" ARGUMENTS REFUSED{where}: {func_name} not run: {error}")
+        if repaired:
+            mark_call_refused(call, input_string)
         return None, error
     return arguments, None
 
@@ -4279,7 +4312,8 @@ def force_apply_autogen_json_fix():
             # Extract arguments from a json-like string and put it into a dict.
             input_string = func_call.get("arguments", "{}")
             arguments, content = bind_tool_call_arguments(
-                func, func_name, input_string, self._format_json_str)
+                func, func_name, input_string, self._format_json_str,
+                call=func_call)
 
             # ========== PRESERVE ORIGINAL EXECUTION LOGIC ==========
             if arguments is not None:
@@ -4329,7 +4363,7 @@ def force_apply_autogen_json_fix():
             input_string = func_call.get("arguments", "{}")
             arguments, content = bind_tool_call_arguments(
                 func, func_name, input_string, self._format_json_str,
-                where=' ASYNC')
+                where=' ASYNC', call=func_call)
 
             if arguments is not None:
                 iostream.print(f"\n>>>>>>>> EXECUTING ASYNC FUNCTION {func_name}...", flush=True)

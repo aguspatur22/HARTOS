@@ -180,5 +180,64 @@ class CallsThatWerePossibleStayAsWritten(_Chat):
         self.assertEqual(self.next_request_arguments(), text)
 
 
+
+class GroupChatSeesTheMark(unittest.TestCase):
+    """The mark reaches every seat of a real autogen GroupChat: the speaker
+    that wrote the call, the executor, and groupchat.messages (speaker
+    selection), because the manager broadcasts the one message object."""
+
+    def test_every_seat_holds_the_marked_call(self):
+        from autogen import GroupChat, GroupChatManager
+        orig = (ConversableAgent.execute_function,
+                ConversableAgent.a_execute_function)
+
+        def restore():
+            (ConversableAgent.execute_function,
+             ConversableAgent.a_execute_function) = orig
+        self.addCleanup(restore)
+        self.assertTrue(force_apply_autogen_json_fix())
+        calls = []
+
+        def send_message_to_user(text: str) -> str:
+            calls.append(text)
+            return 'sent'
+
+        user = ConversableAgent('user', llm_config=False,
+                                human_input_mode='NEVER', default_auto_reply='')
+        assistant = ConversableAgent('assistant', llm_config=False,
+                                     human_input_mode='NEVER')
+        turns = []
+
+        def reply(recipient, messages=None, sender=None, config=None):
+            turns.append(1)
+            if len(turns) == 1:
+                return True, {'role': 'assistant', 'content': None,
+                              'tool_calls': [{
+                                  'id': 'call_1', 'type': 'function',
+                                  'function': {'name': 'send_message_to_user',
+                                               'arguments': UNQUOTED}}]}
+            return True, 'TERMINATE'
+        assistant.register_reply([ConversableAgent, None], reply, position=0)
+        executor = ConversableAgent('executor', llm_config=False,
+                                    human_input_mode='NEVER')
+        executor.register_function({'send_message_to_user':
+                                    executor._wrap_function(send_message_to_user)})
+        chat = GroupChat(agents=[user, assistant, executor], messages=[],
+                         max_round=4, speaker_selection_method='round_robin')
+        manager = GroupChatManager(chat, llm_config=False)
+        user.initiate_chat(manager, message='report', silent=True)
+
+        self.assertEqual(calls, [])
+        views = {'assistant': assistant._oai_messages[manager],
+                 'executor': executor._oai_messages[manager],
+                 'groupchat': chat.messages}
+        for seat, history in views.items():
+            sent = [tc['function']['arguments'] for m in history
+                    for tc in (m.get('tool_calls') or [])]
+            self.assertEqual(len(sent), 1, seat)
+            self.assertEqual(json.loads(sent[0])[REFUSED_ARGUMENTS_KEY],
+                             UNQUOTED, seat)
+
+
 if __name__ == '__main__':
     unittest.main()
