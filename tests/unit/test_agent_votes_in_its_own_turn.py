@@ -350,6 +350,7 @@ def test_a_vote_in_a_routed_turn_is_the_matched_agents(db):
     try:
         thread_local_data.set_prompt_id('66601')      # what /chat stamped
         thread_local_data.set_user_id('owner-x')
+        thread_local_data.set_ui_actions([])          # the handler's, pre-turn
         with thread_local_data.turn_of('66602'):      # the routed turn
             out = json.loads(cast_experiment_vote(e.id, '', vote_value=2))
             thread_local_data.set_ui_actions([{'route': '/x'}])

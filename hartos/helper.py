@@ -1125,9 +1125,8 @@ def _written_value_counts(original):
             # in {"q": Infinity war} it is the start of an unquoted string.
             before = segments[k - 1] if k else None
             after = segments[k + 1] if k + 1 < len(segments) else None
-            if before is not None and before[0] != "char":
-                continue
-            if before is not None and before[1] not in "{[,:":
+            if before is not None and (before[0] != "char"
+                                       or before[1] not in "{[,:"):
                 continue
             if after is not None and (after[0] != "char"
                                       or after[1] not in ",}]"):
@@ -1270,7 +1269,7 @@ def refused_arguments_reason(text):
                 'would become one key')
     except Exception:
         return 'it is not valid JSON'
-    return 'it is not one JSON object of named values'
+    return NOT_AN_OBJECT_REASON
 
 
 def refused_arguments_json(text):
@@ -1285,10 +1284,21 @@ def refused_arguments_json(text):
     return json.dumps({
         REFUSED_ARGUMENTS_KEY: shown,
         REFUSED_BECAUSE_KEY: ('these arguments were refused and the call was '
-                              'not run: ' + refused_arguments_reason(text)
-                              + '. Call it again with one JSON object of '
-                              'named values.'),
+                              'not run: '
+                              + refusal_sentence(refused_arguments_reason(text))),
     })
+
+
+# The reason, and what to do instead, for arguments that are not one JSON
+# object: ONE wording for the history's stand-in (refused_arguments_json)
+# and the executor's reply (tool_argument_error), so the model reads the
+# same refusal in both (review of 1bf298f5b).
+NOT_AN_OBJECT_REASON = 'it is not one JSON object of named values'
+
+
+def refusal_sentence(reason):
+    """``reason`` and the one instruction that follows every refusal."""
+    return reason + '. Call it again with one JSON object of named values.'
 
 
 def call_functions(msg):
@@ -1318,7 +1328,10 @@ def wire_tool_arguments(args):
         args = json.dumps(args)
         if is_wire_json(args):
             return args, False
-    if args is None:
+    if args is None or (isinstance(args, str) and not args.strip()):
+        # Nothing written is no arguments: {} -- what the executor runs a
+        # zero-parameter tool with, so history and execution agree (review
+        # of 1bf298f5b: "" became the refused stand-in while the tool ran).
         return '{}', True
     if not isinstance(args, str):
         args = str(args)
@@ -4287,37 +4300,46 @@ def _exact_int_token(value):
     return None
 
 
+def _number_for(value, types):
+    """What a number-typed parameter admitting ``types`` gets for ``value``:
+    ``(True, value)`` to pass it as it is, ``(True, exact_int)`` for an exact
+    whole number an int parameter can hold, ``(False, None)`` to refuse a
+    number no double can hold, or NaN / Infinity.  THE one rule, for a
+    single value and for each element of a list (review of 1bf298f5b:
+    List[int] refused what int took)."""
+    if str in types or not any(t in (int, float) for t in types):
+        return True, value
+    if not _unholdable_token(value):
+        return True, value
+    if int in types:
+        exact = _exact_int_token(value)
+        if exact is not None:
+            return True, exact
+    return False, None
+
+
 def _numbers_out_of_range(params, bound):
     """Names of number-typed parameters bound to the token of a number no
-    double can hold, or to NaN / Infinity, which the reader keeps as text.
-
-    Review of dbfef4360: a parameter that also accepts text (Union[int, str],
-    Optional[str]) takes the token as the text it is; an int parameter takes
-    an exact whole number (see _exact_int_arguments); and a List[float]
-    element is checked like a single value."""
+    double can hold, or to NaN / Infinity, which the reader keeps as text
+    (_number_for decides each value)."""
     out = []
     for p in params:
         value = bound.get(p.name)
-        types = _annotation_types(p.annotation)
-        if str in types:
-            continue
         element = _list_element_annotation(p.annotation)
         if isinstance(value, list) and element is not None:
-            if (_is_numeric_annotation(element)
-                    and any(_unholdable_token(v) for v in value)):
+            types = _annotation_types(element)
+            if not all(_number_for(v, types)[0] for v in value):
                 out.append(p.name)
             continue
-        if not _is_numeric_annotation(p.annotation) or not _unholdable_token(value):
-            continue
-        if int in types and _exact_int_token(value) is not None:
-            continue
-        out.append(p.name)
+        if not _number_for(value, _annotation_types(p.annotation))[0]:
+            out.append(p.name)
     return out
 
 
 def _exact_int_arguments(func, arguments):
-    """``arguments`` with each int-typed parameter's whole-number token (one
-    a double could not hold) turned into the exact int.  Anything else, and
+    """``arguments`` with each value _number_for turns into an exact int --
+    a whole number a double could not hold, for an int parameter or an
+    element of a List[int] -- replaced by that int.  Anything else, and
     arguments that are not a dict, as they are."""
     import inspect
     if not isinstance(arguments, dict):
@@ -4329,13 +4351,17 @@ def _exact_int_arguments(func, arguments):
     out = dict(arguments)
     for name, value in arguments.items():
         p = params.get(name)
-        if p is None or not _unholdable_token(value):
+        if p is None:
             continue
-        types = _annotation_types(p.annotation)
-        if int in types and str not in types:
-            exact = _exact_int_token(value)
-            if exact is not None:
-                out[name] = exact
+        element = _list_element_annotation(p.annotation)
+        if isinstance(value, list) and element is not None:
+            types = _annotation_types(element)
+            out[name] = [_number_for(v, types)[1] if _number_for(v, types)[0]
+                         else v for v in value]
+        else:
+            ok, got = _number_for(value, _annotation_types(p.annotation))
+            if ok:
+                out[name] = got
     return out
 
 
@@ -4375,9 +4401,8 @@ def tool_argument_error(func, func_name, arguments, repaired):
         # (coordinator's default, review of dbfef4360).  Measured before:
         # all 854 tool calls models made in llm_outbound.jsonl + .old carry
         # an object.
-        return (f"Error: {func_name} was not run: its arguments were not one "
-                f"JSON object of named values. Call {func_name} again with "
-                f"one JSON object using its parameter names.")
+        return (f"Error: {func_name} was not run: "
+                + refusal_sentence(NOT_AN_OBJECT_REASON))
     args, kwargs = tool_call_shape(arguments)
     if REFUSED_ARGUMENTS_KEY in kwargs:
         # A refused call's stand-in (refused_arguments_json) is never run,
