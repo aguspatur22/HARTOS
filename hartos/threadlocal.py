@@ -128,6 +128,30 @@ class ThreadLocalData:
         _carried.snapshot = snap
         return _carried
 
+    def turn_of(self, prompt_id):
+        """Context manager: run a block as agent ``prompt_id``'s turn, then
+        give the thread back its own agent.
+
+        For a request /chat hands to ANOTHER agent (autonomous routing to an
+        existing agent that matches, hart_intelligence_entry): the thread
+        still carried the request's own prompt_id, so a tool acting for "the
+        calling agent" (cast_experiment_vote) acted as the wrong one.  Only
+        prompt_id is swapped and restored (via adopt()): whatever the turn
+        sets for the handler to read afterwards (ui_actions, creation flags)
+        is kept, and user_id is the same person either way.
+        """
+        import contextlib
+
+        @contextlib.contextmanager
+        def _cm():
+            saved = {'prompt_id': self.get_prompt_id()}
+            self.set_prompt_id(prompt_id)
+            try:
+                yield
+            finally:
+                self.adopt(saved)
+        return _cm()
+
     def detached(self):
         """Context manager: run a block with NO request state on this thread,
         then put this thread's state back exactly as it was.

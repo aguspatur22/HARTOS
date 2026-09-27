@@ -330,3 +330,92 @@ def test_source_guard_create_and_reuse_turns_both_attach_per_turn():
                  if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
         assert 'attach_for_turn' in calls, f'{rel}:{turn_fn}'
         assert '_hart_unlocked_tags = set(goal_tags)' in src, rel
+
+
+# ── A turn /chat hands to a matched agent is that agent's turn ────────
+# Autonomous /chat routes a request to an existing agent that matches it
+# (hart_intelligence_entry: find_matching_agent -> chat_agent(..., _mid)).
+# The thread-local prompt_id still held the ORIGINAL prompt, so a vote cast
+# in that turn was recorded as the wrong agent.  The routed turn now runs
+# inside thread_local_data.turn_of(_mid).
+
+def test_a_vote_in_a_routed_turn_is_the_matched_agents(db):
+    from integrations.agent_engine.thought_experiment_tools import (
+        cast_experiment_vote)
+
+    e = _experiment(db)
+    requester = _user(db, 'agent', owner_id=_user(db).id, agent_id='66601')
+    matched = _user(db, 'agent', owner_id=_user(db).id, agent_id='66602')
+    saved = thread_local_data.snapshot()
+    try:
+        thread_local_data.set_prompt_id('66601')      # what /chat stamped
+        thread_local_data.set_user_id('owner-x')
+        with thread_local_data.turn_of('66602'):      # the routed turn
+            out = json.loads(cast_experiment_vote(e.id, '', vote_value=2))
+            thread_local_data.set_ui_actions([{'route': '/x'}])
+        assert out['success'] is True, out
+        # Back to the request's own agent; what the turn set for the
+        # handler (its ui_actions) is kept; the user is untouched.
+        assert thread_local_data.get_prompt_id() == '66601'
+        assert thread_local_data.get_user_id() == 'owner-x'
+        assert thread_local_data.get_ui_actions() == [{'route': '/x'}]
+    finally:
+        for key in list(vars(thread_local_data._local)):
+            delattr(thread_local_data._local, key)
+        thread_local_data.adopt(saved)
+    db.expire_all()
+    voters = [v.voter_id for v in
+              db.query(ExperimentVote).filter_by(experiment_id=e.id)]
+    assert voters == [matched.id], (voters, requester.id)
+
+
+def test_turn_of_restores_even_when_the_turn_raises():
+    saved = thread_local_data.snapshot()
+    try:
+        thread_local_data.set_prompt_id('71')
+        with pytest.raises(RuntimeError):
+            with thread_local_data.turn_of('72'):
+                assert thread_local_data.get_prompt_id() == '72'
+                raise RuntimeError('turn failed')
+        assert thread_local_data.get_prompt_id() == '71'
+    finally:
+        for key in list(vars(thread_local_data._local)):
+            delattr(thread_local_data._local, key)
+        thread_local_data.adopt(saved)
+
+
+def test_source_guard_the_matched_agent_route_runs_as_that_agent():
+    """hart_intelligence_entry cannot be imported in a unit test (the reason
+    test_capability_consent_canonical reads it by AST).  Every
+    chat_agent(...) call whose agent argument is not the request's own
+    prompt_id must sit inside `with thread_local_data.turn_of(<that id>)`."""
+    import ast
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+    src = open(os.path.join(root, 'hart_intelligence_entry.py'),
+               encoding='utf-8').read()
+    tree = ast.parse(src)
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    routed = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == 'chat_agent' and len(node.args) >= 3
+                and not (isinstance(node.args[2], ast.Name)
+                         and node.args[2].id == 'prompt_id')):
+            routed.append(node)
+    assert routed, 'the matched-agent route (chat_agent(..., _mid, ...)) moved'
+    for call in routed:
+        agent_arg = ast.unparse(call.args[2])
+        p, inside = parents.get(call), False
+        while p is not None:
+            if isinstance(p, ast.With) and any(
+                    'turn_of' in ast.unparse(item.context_expr)
+                    and agent_arg in ast.unparse(item.context_expr)
+                    for item in p.items):
+                inside = True
+                break
+            p = parents.get(p)
+        assert inside, (f'line {call.lineno}: chat_agent for {agent_arg} '
+                        f'runs without turn_of({agent_arg})')

@@ -4276,7 +4276,14 @@ def _exact_int_token(value):
     """The exact int for a whole-number token a double cannot hold (Python
     ints are exact), else None."""
     if isinstance(value, str) and re.fullmatch(r'-?\d+', value.strip()):
-        return int(value.strip())
+        try:
+            return int(value.strip())
+        except ValueError as e:
+            # Past Python's int-from-text digit limit (4300): not a value the
+            # tool can be given, so it is refused like any unholdable number
+            # (review of 1bf298f5b: uncaught, the turn died).
+            _fallback_logger.debug(f"whole number too long to read: {e}")
+            return None
     return None
 
 

@@ -522,3 +522,19 @@ def test_distributed_progress_of_an_api_submitted_goal_is_its_submitters(
     assert mine.status_code == 200 and SECRET in mine.get_data(as_text=True)
     assert theirs.status_code == 403
     assert SECRET not in theirs.get_data(as_text=True)
+
+
+def test_a_distributed_goal_records_who_submitted_it(client, sf):
+    """The submitter is the token's user, never a user_id the body names:
+    /goals/<id>/progress judges the goal by it."""
+    from integrations.distributed_agent import api as dist_api
+    coord = dist_api._get_coordinator()
+    me = _user(sf)
+    with _as(me):
+        r = client.post('/api/distributed/goals', json={
+            'objective': 'o', 'tasks': [{'task_id': 't1', 'description': 'd'}],
+            'context': {'user_id': 'someone-else'}},
+            headers=TOKEN, environ_base=REMOTE)
+    assert r.status_code == 200, r.get_json()
+    context = coord.submit_goal.call_args.args[2]
+    assert context['user_id'] == me

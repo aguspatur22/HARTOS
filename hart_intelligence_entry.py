@@ -10246,7 +10246,11 @@ def chat():
                             app.logger.info(
                                 f'Matched existing agent {_match["name"]} ({_mid}) '
                                 f'— routing to REUSE instead of CREATE')
-                            return chat_agent(user_id, prompt, _mid, file_id, request_id)
+                            # The matched agent's turn: a tool acting for
+                            # "the calling agent" (its own vote) must see
+                            # _mid, not this request's prompt_id.
+                            with thread_local_data.turn_of(_mid):
+                                return chat_agent(user_id, prompt, _mid, file_id, request_id)
                 except Exception as _me:
                     app.logger.debug(f'Agent matching skipped: {_me}')
 

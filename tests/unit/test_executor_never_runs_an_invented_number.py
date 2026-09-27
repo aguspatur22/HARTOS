@@ -304,3 +304,83 @@ class ReviewOfDbfef4360(ExecutorReadsWhatTheModelWrote):
         self.calls.clear()
         content = self.run_tool('opt', '{"x": 1e999}')
         self.assertEqual(self.calls, [], content)
+
+
+class ReviewOf1bf298f5b(ReviewOfDbfef4360):
+    """Review of 1bf298f5b (rv3a7/cases4.py, cases5.py)."""
+
+    def setUp(self):
+        super().setUp()
+        from typing import List
+
+        @log_tool_execution
+        def many_ints(xs: List[int]) -> str:
+            self.calls.append((xs,))
+            return 'ints'
+
+        @log_tool_execution
+        def ping() -> str:
+            self.calls.append(('ping',))
+            return 'pong'
+
+        self.tools.update({'many_ints': many_ints, 'ping': ping})
+
+    def test_a_whole_number_past_the_int_digit_limit_is_refused(self):
+        # int() refuses more than 4300 digits (ValueError); uncaught, the
+        # turn died.  Refused instead.
+        self.calls.clear()
+        content = self.run_tool('bigint', '{"n": %s}' % ('9' * 5000))
+        self.assertEqual(self.calls, [], content)
+        self.assertTrue(tool_reply_failed(content), content)
+
+    def test_an_unquoted_phrase_ending_in_infinity_is_not_written(self):
+        self.calls.clear()
+        content = self.run_tool('search', '{"q": to Infinity, "id": 1e999e}')
+        self.assertEqual(self.calls, [], content)
+
+    def test_exact_big_ints_in_a_list_of_ints_arrive_as_ints(self):
+        big = '9' * 400
+        self.calls.clear()
+        content = self.run_tool('many_ints', '{"xs": [1, %s]}' % big)
+        self.assertEqual(self.calls, [([1, int(big)],)], content)
+
+    def test_empty_arguments_run_a_zero_parameter_tool_and_the_history_agrees(self):
+        from flask import Flask
+        self.calls.clear()
+        a = ConversableAgent('a', llm_config=False, human_input_mode='NEVER')
+        ex = ConversableAgent('ex', llm_config=False, human_input_mode='NEVER')
+        ex.register_function({'ping': ex._wrap_function(self.tools['ping'])})
+        a.send({'role': 'assistant', 'content': None,
+                'tool_calls': [{'id': 'c1', 'type': 'function',
+                                'function': {'name': 'ping', 'arguments': ''}}]},
+               ex, request_reply=False, silent=True)
+        _, reply = ex.generate_tool_calls_reply(sender=a)
+        self.assertEqual(self.calls, [('ping',)], reply)
+        with Flask(__name__).app_context():
+            out = ToolMessageHandler().validate_messages(
+                copy.deepcopy(a._oai_messages[ex]))
+        sent = [tc['function']['arguments'] for m in out
+                for tc in (m.get('tool_calls') or [])][0]
+        self.assertEqual(sent, '{}')
+
+    def test_the_non_object_refusal_reads_the_same_in_reply_and_history(self):
+        from flask import Flask
+        from hartos.helper import REFUSED_BECAUSE_KEY
+        import json as _json
+        a = ConversableAgent('a', llm_config=False, human_input_mode='NEVER')
+        ex = ConversableAgent('ex', llm_config=False, human_input_mode='NEVER')
+        ex.register_function({'ping': ex._wrap_function(self.tools['ping'])})
+        a.send({'role': 'assistant', 'content': None,
+                'tool_calls': [{'id': 'c1', 'type': 'function',
+                                'function': {'name': 'ping', 'arguments': '[1, 2]'}}]},
+               ex, request_reply=False, silent=True)
+        _, reply = ex.generate_tool_calls_reply(sender=a)
+        content = reply['tool_responses'][0]['content']
+        with Flask(__name__).app_context():
+            out = ToolMessageHandler().validate_messages(
+                copy.deepcopy(a._oai_messages[ex]))
+        sent = [tc['function']['arguments'] for m in out
+                for tc in (m.get('tool_calls') or [])][0]
+        because = _json.loads(sent)[REFUSED_BECAUSE_KEY]
+        tail = because.split('not run: ', 1)[1]
+        self.assertIn(tail, content)
