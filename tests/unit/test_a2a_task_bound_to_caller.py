@@ -190,6 +190,9 @@ def test_an_unverified_key_header_is_not_an_identity(node, monkeypatch):
     tid = _start(node, remote, {'X-API-Key': 'the-real-key'})
     assert not _hidden(_read(node, tid, remote, {'X-API-Key': 'the-real-key'}))
     assert _hidden(_read(node, tid, local, {'X-API-Key': 'bogus'}))
+    # The verified key IS the identity: its holder reads from another address.
+    assert not _hidden(_read(node, tid, {'REMOTE_ADDR': '198.51.100.24'},
+                             {'X-API-Key': 'the-real-key'}))
 
 
 def test_two_lan_addresses_are_two_callers(node, monkeypatch):

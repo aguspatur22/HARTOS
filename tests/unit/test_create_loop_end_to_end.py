@@ -535,14 +535,21 @@ def test_a_stuck_action_is_handed_on_not_completed(create_env, monkeypatch):
     assert not done, f'action 2 was recorded as done: {done}'
 
 
-def test_notes_to_self_complete_nothing(create_env):
+def test_notes_to_self_complete_nothing(create_env, caplog):
     """Live 2026-09-27, CREATE daemon_255bd83f: the only tool traffic was
     save_data_in_memory, the verifier cited it, and both actions went
     COMPLETED and were banked.  Here every step runs only that note-taking
-    tool: no action may complete, and none may be banked."""
+    tool: no action may complete, and none may be banked.
+
+    Nor may the refused action stall the loop: it is re-posted (bounded) and
+    then given up or handed to a person, never left for the stall guard to
+    break after 120 silent laps (measured while writing this fix)."""
     env = create_env
     env.script.tool = 'save_data_in_memory'
-    _run(env, turns=1)
+    with caplog.at_level('INFO'):
+        _run(env, turns=1)
+    log = ' | '.join(r.getMessage() for r in caplog.records)
+    assert '[STALL-GUARD]' not in log, 'a refused action spun to the stall guard'
     completed = [(aid, s) for aid, s, _ in env.events if s == 'completed']
     assert not completed, f'an action completed on a note to self: {completed}'
     banked = [n for n in (1, 2, 3) if _action_file(env, n) is not None]

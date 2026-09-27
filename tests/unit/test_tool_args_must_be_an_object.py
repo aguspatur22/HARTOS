@@ -200,10 +200,52 @@ class RefusedStandInNeverRuns(_Executor):
 
     def test_a_stand_in_repeated_as_a_call_is_refused_by_name(self):
         # If a model copies the stand-in into a new call, the tool is not run
-        # with it: the stand-in's keys are names no tool takes.
+        # with it, and the reply says why.
         stand_in = _guarded('[1,2]')
         ok, reply = self.run_sync('send_message_to_user', stand_in)
-        self.assert_refused_by_name(ok, reply, 'refused_arguments')
+        self.assertFalse(ok)
+        self.assertEqual(self.calls, [])
+        self.assertTrue(reply['content'].startswith('Error:'), reply['content'])
+        self.assertIn('refused earlier', reply['content'])
+
+
+class RefusedStandInAndKwargsTools(_Executor):
+    """Review of cd8d9154d, M3: a tool taking **kwargs (clawhub_adapter,
+    MCP tool_executor(**kwargs)) binds any names, so the stand-in's keys were
+    no protection: it ran with refused_arguments / refused_because."""
+
+    def test_a_kwargs_tool_does_not_run_a_stand_in(self):
+        seen = []
+
+        def lenient(**kwargs) -> str:
+            seen.append(kwargs)
+            return 'ok'
+
+        self.agent.register_function(
+            {'lenient': self.agent._wrap_function(lenient)})
+        ok, reply = self.run_sync('lenient', _guarded('[1,2]'))
+        self.assertFalse(ok)
+        self.assertEqual(seen, [])
+        self.assertIn('refused', reply['content'])
+        self.assertTrue(reply['content'].startswith('Error:'), reply['content'])
+
+
+class StandInBuiltOnlyWhenNeeded(unittest.TestCase):
+
+    def test_a_repaired_call_never_builds_a_stand_in(self):
+        from unittest import mock
+        import hartos.helper as h
+        with mock.patch.object(h, 'refused_arguments_json',
+                               side_effect=AssertionError('built')) as built:
+            out = _guarded("{'text': 'a cat'}")  # repaired, not refused
+        self.assertEqual(json.loads(out), {'text': 'a cat'})
+        built.assert_not_called()
+
+    def test_a_key_collision_is_its_own_error_type(self):
+        from hartos.helper import WireKeyCollision, load_wire_json
+        with self.assertRaises(WireKeyCollision):
+            load_wire_json('{"\\ud800": 1, "\\udc00": 2}')
+        self.assertTrue(issubclass(WireKeyCollision, ValueError))
 
 
 class SafeFunctionCallUsesTheSameShape(unittest.TestCase):

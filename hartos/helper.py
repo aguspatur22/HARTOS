@@ -1004,6 +1004,11 @@ _LONE_SURROGATE = re.compile(
     r'[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]')
 
 
+class WireKeyCollision(ValueError):
+    """Two keys of one object would become the same key once each lone
+    surrogate is replaced by U+FFFD (see _wire_json_loads)."""
+
+
 def _wire_json_loads(text, on_refused):
     """json.loads where every token a strict parser refuses goes to on_refused:
     a non-finite number or NaN/Infinity constant as its text, a lone
@@ -1026,8 +1031,8 @@ def _wire_json_loads(text, on_refused):
                 # only one of the two arguments.  Review of b0fa4989e, probed:
                 # {"\ud800":1,"\udc00":2} came back as one key, U+FFFD,
                 # holding 2.
-                raise ValueError("keys collide once lone surrogates are "
-                                 "replaced: " + repr(list(value)))
+                raise WireKeyCollision("keys collide once lone surrogates "
+                                       "are replaced: " + repr(list(value)))
             return out
         return value
 
@@ -1111,26 +1116,29 @@ def _quote_overflowing_numbers(text):
 
 
 # The two keys of a refused call's stand-in arguments (see
-# refused_arguments_json).  Names no tool takes, so a stand-in that is ever
-# executed is refused by the signature check as unknown arguments.
+# refused_arguments_json).  A stand-in is never run: tool_argument_error
+# refuses any arguments carrying REFUSED_ARGUMENTS_KEY, including for a tool
+# that takes **kwargs and would otherwise bind any names (review of
+# cd8d9154d, M3: clawhub_adapter, MCP tool_executor).
 REFUSED_ARGUMENTS_KEY = 'refused_arguments'
 REFUSED_BECAUSE_KEY = 'refused_because'
 
 
 def refused_arguments_reason(text):
-    """Why ``text`` cannot be sent as a call's arguments, in one sentence."""
+    """Why ``text`` cannot be sent as a call's arguments, in one sentence.
+
+    For text the guard could not turn into an object: it is invalid JSON,
+    two of its keys collide, or it parses to something that is not an
+    object (an object would have been kept, so that is the only other
+    case)."""
     try:
-        value = load_wire_json(text)
-    except ValueError as e:
-        if 'keys collide' in str(e):
-            return ('two of its keys differ only in an invalid character and '
-                    'would become one key')
-        return 'it is not valid JSON'
+        load_wire_json(text)
+    except WireKeyCollision:
+        return ('two of its keys differ only in an invalid character and '
+                'would become one key')
     except Exception:
         return 'it is not valid JSON'
-    if not isinstance(value, dict):
-        return 'it is not one JSON object of named values'
-    return 'it holds a value a strict JSON parser refuses'
+    return 'it is not one JSON object of named values'
 
 
 def refused_arguments_json(text):
@@ -1227,7 +1235,7 @@ def ensure_tool_call_arguments_json(messages):
                 # so a prior call with '[{"url": ...}]' rendered with no
                 # parameters at all (measured on :8080, review of b0fa4989e).
                 continue
-            fixed = refused_arguments_json(args)
+            fixed = None
             # The original text first; before repair, each overflowing
             # number is quoted, since repair_json itself would turn it into
             # Infinity and lose the token.
@@ -1240,6 +1248,8 @@ def ensure_tool_call_arguments_json(messages):
                 if isinstance(obj, dict):
                     fixed = json.dumps(obj)
                     break
+            if fixed is None:
+                fixed = refused_arguments_json(args)
             fn['arguments'] = fixed
             coerced += 1
     if coerced:
@@ -4072,11 +4082,19 @@ def tool_argument_error(func, func_name, arguments, repaired):
     could be read shown as what was received, not as names to fix.
     """
     import inspect
+    args, kwargs = tool_call_shape(arguments)
+    if REFUSED_ARGUMENTS_KEY in kwargs:
+        # A refused call's stand-in (refused_arguments_json) is never run,
+        # whatever the tool accepts: a **kwargs tool binds any names, so the
+        # signature check alone let it through (review of cd8d9154d, M3).
+        return (f"Error: {func_name} was not run: these are the stand-in for "
+                f"arguments that were refused earlier "
+                f"({kwargs.get(REFUSED_BECAUSE_KEY, 'refused')}). Call "
+                f"{func_name} again with one JSON object of named values.")
     try:
         sig = inspect.signature(func)
     except (TypeError, ValueError):
         return None
-    args, kwargs = tool_call_shape(arguments)
     try:
         sig.bind(*args, **kwargs)
         return None

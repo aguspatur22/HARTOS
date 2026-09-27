@@ -515,3 +515,14 @@ def test_a_trusted_loopback_proxy_that_sends_no_header_fails_closed(
     resp = app.test_client().post('/test/local-only',
                                   environ_base={'REMOTE_ADDR': '127.0.0.1'})
     assert resp.status_code == 401
+
+
+def test_an_ipv4_mapped_socket_peer_matches_its_trusted_proxy(app, monkeypatch):
+    """F4: a dual-stack server reports the proxy as ::ffff:10.0.0.1; it is
+    still the TRUSTED_PROXY 10.0.0.1."""
+    from core.auth_local import client_address
+    monkeypatch.setenv('TRUSTED_PROXY', PROXY_IP)
+    with app.test_request_context(
+            environ_base={'REMOTE_ADDR': '::ffff:' + PROXY_IP},
+            headers={'X-Forwarded-For': '198.51.100.7'}):
+        assert client_address() == '198.51.100.7'
