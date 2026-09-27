@@ -855,8 +855,8 @@ def verify_pledge(escrow_id):
 
 
 def _agent_for_post(post_id, verb):
-    """``(goal, None)`` when the caller may act on this experiment's agent,
-    else ``(None, refusal response)``.
+    """``(goal, None, caller)`` when the caller may act on this experiment's
+    agent, else ``(None, refusal response, caller)``.
 
     The agent is found by post, then judged by dashboard_service.may_steer
     through goal_to_steer, the gate every goal route uses.  Review of
@@ -866,12 +866,13 @@ def _agent_for_post(post_id, verb):
     by A (/dual-context).  No agent and not-yours get the same 403.
     """
     from .dashboard_service import goal_to_steer, steering_caller
+    caller = steering_caller()
     goal = _get_goal_for_post(g.db, post_id)
     goal, refused = goal_to_steer(g.db, f'post:{post_id}', verb,
-                                  steering_caller(), g.user_id, goal=goal)
+                                  caller, g.user_id, goal=goal)
     if refused:
-        return None, (jsonify({'success': False, 'data': refused}), 403)
-    return goal, None
+        return None, (jsonify({'success': False, 'data': refused}), 403), caller
+    return goal, None, caller
 
 
 
@@ -886,7 +887,7 @@ def inject_variable(post_id):
     if not variable:
         return _err('variable is required', 400)
 
-    goal, refused = _agent_for_post(post_id, 'tracker_inject')
+    goal, refused, _caller = _agent_for_post(post_id, 'tracker_inject')
     if refused:
         return refused
 
@@ -934,7 +935,7 @@ def interview_agent(post_id):
     if not question:
         return _err('question is required', 400)
 
-    goal, refused = _agent_for_post(post_id, 'interview')
+    goal, refused, caller = _agent_for_post(post_id, 'interview')
     if refused:
         return refused
     # Whose turn this is: the goal's owner; for a goal no person owns (the
@@ -942,8 +943,7 @@ def interview_agent(post_id):
     # asked.  Never None (review of dc32b1146: an ownerless goal posted
     # /chat with user_id=None).
     from core.event_attribution import goal_owner_user_id
-    from .dashboard_service import steering_caller
-    run_as = goal_owner_user_id(goal) or steering_caller().user_id
+    run_as = goal_owner_user_id(goal) or caller.user_id
     if not run_as:
         return _err('No user to run this interview as', 409)
 
@@ -1000,7 +1000,7 @@ def launch_dual_context():
     if not source_post_id or not contexts or len(contexts) < 2:
         return _err('post_id and at least 2 contexts required', 400)
 
-    source_goal, refused = _agent_for_post(source_post_id, 'dual_context')
+    source_goal, refused, _caller = _agent_for_post(source_post_id, 'dual_context')
     if refused:
         return refused
 

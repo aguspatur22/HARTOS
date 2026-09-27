@@ -394,3 +394,48 @@ def test_an_engine_installed_into_python_embed_still_heals_the_user_site(
 
     assert captured['args'][captured['args'].index('--target') + 1] == user_site
     offer.assert_not_called()
+
+
+def test_an_offer_that_cannot_be_made_raises_the_missing_package_goal(
+        monkeypatch, he_mock, caplog):
+    """Review of 7810b4352: the once-flag is set before the offer runs, so an
+    offer that raises (capability_setup not importable, a consent-layer bug)
+    was only a WARNING and the worker never offered again: no card, no goal,
+    and the engine silently fell back forever.  Now the owner is told through
+    the missing-package goal the old path raised, at ERROR, still once.  The
+    goal carries no 'backend', so it cannot route to repair_backend_venv and
+    install the engine without the owner's yes."""
+    monkeypatch.setattr('core.venv_paths.venv_python_if_exists',
+                        lambda backend: None)
+    run_mock = MagicMock(side_effect=_fake_run(0))
+    monkeypatch.setattr(gpu_worker.subprocess, 'run', run_mock)
+    offer = MagicMock(side_effect=ImportError("no capability_setup here"))
+    monkeypatch.setattr(
+        'integrations.agent_engine.capability_setup.request_capability_setup',
+        offer)
+    w = gpu_worker.GPUWorker(name='f5_tts',
+                             module='integrations.service_tools.gpu_worker')
+    monkeypatch.setattr(w, 'stop', MagicMock())
+
+    with caplog.at_level(logging.ERROR, logger=gpu_worker.logger.name):
+        w._maybe_self_heal_from_line(
+            "ModuleNotFoundError: No module named 'vocos'")
+        w._maybe_self_heal_from_line(
+            "ModuleNotFoundError: No module named 'torch'")
+
+    offer.assert_called_once()            # the once-flag still holds
+    run_mock.assert_not_called()          # and still no pip into the site
+    he_mock.assert_called_once()
+    (exc,), kwargs = he_mock.call_args
+    assert isinstance(exc, ModuleNotFoundError)
+    assert exc.name == 'vocos'
+    assert kwargs['category'] == 'subprocess.tool_load'
+    assert kwargs['agent_remediation'] is True
+    ctx = kwargs['context']
+    assert ctx['missing_package'] == 'vocos'
+    assert ctx['worker_name'] == 'f5_tts'
+    assert 'backend' not in ctx
+    assert 'no capability_setup here' in ctx['remediation_hint']
+    said = [r.getMessage() for r in caplog.records
+            if r.levelno == logging.ERROR and 'could not be offered' in r.getMessage()]
+    assert said and 'no capability_setup here' in said[0], said

@@ -929,11 +929,39 @@ def steer_transition(verb: str, prev_status: Optional[str]):
     """
     target = STEER_TARGET[verb]
     allowed = STEER_FROM.get(verb)
-    if allowed is not None and prev_status not in allowed:
-        return None, f'{verb} requires {"/".join(sorted(allowed))}, got {prev_status}'
     if verb == 'cancel' and prev_status == 'archived':
-        return None, 'already archived'
+        return None, 'This run was already cancelled.'
+    if allowed is not None and prev_status not in allowed:
+        # Worded as the outcome for the person who asked, not the rule.
+        if prev_status == target:
+            return None, {'paused': 'This run is already paused.',
+                          'active': 'This run is already running.'}[target]
+        return None, (f'This run has {"been cancelled" if prev_status == "archived" else "finished"}'
+                      f', so it cannot be {"paused" if verb == "pause" else "resumed"}.')
     return target, None
+
+
+def steer_response(db, goal_id: str, *, verb: Optional[str] = None,
+                   status: Optional[str] = None, caller: 'SteeringCaller',
+                   actor_id: str, reason: str):
+    """``(body, http_status)`` for a route that steers one goal, by ``verb``
+    or by the ``status`` a verb reaches (STATUS_VERB).  THE route helper, so
+    PATCH /api/goals/<id>/status, PATCH /api/coding/goals/<id> and DELETE
+    /api/goals/<id> write a status only through steer_agent and its one
+    writer, _write_goal_status (review of 275e8e361: the coding PATCH wrote
+    any status, default 'active', and revived completed goals).
+    """
+    if verb is None:
+        if not status:
+            return {'success': False, 'error': 'status is required'}, 400
+        verb = STATUS_VERB.get(status)
+        if verb is None:
+            return {'success': False, 'error': (
+                f'status must be one of {sorted(STATUS_VERB)}')}, 400
+    result = steer_agent(db, goal_id, verb, actor_id=actor_id, reason=reason,
+                         caller=caller)
+    code = 200 if result.get('ok') else 403 if result.get('forbidden') else 400
+    return {'success': bool(result.get('ok')), 'data': result}, code
 
 
 def _write_goal_status(db, goal, status: str) -> None:

@@ -482,3 +482,130 @@ class ProductionTransformsKeepTheMark(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ArgumentsThatAreNotText(_Chat):
+    """Review of the defect-14 fix: arguments handed as a dict or None (not
+    text) reached the executor's parser as they were: _format_json_str
+    raised on them and the fallback read them as ``str(...)``, so a dict
+    call and a None call to a zero-parameter tool were refused and marked
+    with the Python repr, while the history guard (wire_tool_arguments)
+    sent the dict serialized and None as {}.  Both now read them by the
+    guard's own rule, so executor and history agree."""
+
+    def setUp(self):
+        super().setUp()
+        self.pinged = []
+
+        @log_tool_execution
+        def ping() -> str:
+            self.pinged.append(1)
+            return 'pong'
+        self.executor.register_function({
+            'ping': self.executor._wrap_function(ping)})
+
+    def test_a_dict_runs_and_the_history_shows_it_serialized(self):
+        reply = self.call('send_message_to_user', {'text': 'hi'})
+        self.assertEqual(self.calls, ['hi'])
+        self.assertIn('sent', reply['content'])
+        self.assertEqual(json.loads(self.next_request_arguments()),
+                         {'text': 'hi'})
+
+    def test_none_runs_a_zero_parameter_tool_and_the_history_agrees(self):
+        reply = self.call('ping', None)
+        self.assertEqual(self.pinged, [1])
+        self.assertIn('pong', reply['content'])
+        self.assertEqual(self.next_request_arguments(), '{}')
+
+    def test_none_for_a_tool_with_a_required_value_names_it_unmarked(self):
+        reply = self.call('send_message_to_user', None)
+        self.assertEqual(self.calls, [])
+        self.assertIn('Missing required argument(s): text', reply['content'])
+        self.assertEqual(self.next_request_arguments(), '{}')
+
+
+class FallbackThatFailsIsMarked(_Chat):
+
+    def test_a_python_string_literal_is_refused_and_marked(self):
+        # "'abc'": the reader refuses it, retrieve_json reads it as the
+        # Python string 'abc', and the reader refuses that too -- the
+        # fallback fails with no mock.  The call is marked like any other
+        # refused broken JSON.
+        reply = self.call('send_message_to_user', "'abc'")
+        self.assertEqual(self.calls, [])
+        self.assertIn('must be in JSON format', reply['content'])
+        # The conversation's own record is marked, not only the guard's
+        # view of it: every seat reads that record (speaker selection reads
+        # groupchat.messages with no guard).
+        stored = self.assistant._oai_messages[self.executor][-1][
+            'tool_calls'][0]['function']['arguments']
+        for text in (stored, self.next_request_arguments()):
+            parsed = json.loads(text)
+            self.assertEqual(parsed[REFUSED_ARGUMENTS_KEY], "'abc'")
+            self.assertIn('not valid JSON', parsed[REFUSED_BECAUSE_KEY])
+
+
+class KwargsToolsGetNoInventedKeys(_Chat):
+    """Review of the defect-14 fix: a tool that takes **kwargs binds any
+    name, so json_repair's split of an unquoted value (a bare
+    ``status: ok`` read as a key) reached it with the value cut short.  The
+    MCP tool_executor and service_tools endpoint_executor keep a **kwargs
+    signature when a tool has no schema.  After a repair, a key the model
+    did not write in quotes and the tool does not declare is refused, as it
+    is for a fixed signature."""
+
+    def setUp(self):
+        super().setUp()
+        self.ran = []
+
+        @log_tool_execution
+        def run_command(command: str = '', **kwargs) -> str:
+            self.ran.append(dict(command=command, **kwargs))
+            return 'done'
+        self.executor.register_function({
+            'run_command': self.executor._wrap_function(run_command)})
+
+    def _assert_refused_and_marked(self, text):
+        reply = self.call('run_command', text)
+        self.assertEqual(self.ran, [])
+        self.assertIn('not valid JSON', reply['content'])
+        parsed = json.loads(self.next_request_arguments())
+        self.assertEqual(parsed[REFUSED_ARGUMENTS_KEY], text)
+
+    def test_an_unquoted_value_split_into_a_key_is_refused(self):
+        self._assert_refused_and_marked(
+            '{"command": deploy the app, then report status: ok}')
+
+    def test_the_financial_dashboard_split_is_refused(self):
+        self._assert_refused_and_marked(
+            UNQUOTED.replace('"text"', '"command"'))
+
+    def test_a_quoted_extra_key_still_runs_after_a_benign_repair(self):
+        self.call('run_command', '{"command": "deploy", "status": "ok",}')
+        self.assertEqual(self.ran, [{'command': 'deploy', 'status': 'ok'}])
+
+    def test_an_unquoted_declared_key_still_runs(self):
+        self.call('run_command', '{command: "deploy"}')
+        self.assertEqual(self.ran, [{'command': 'deploy'}])
+
+    def test_strict_json_extra_keys_run_as_written(self):
+        self.call('run_command', '{"command": "deploy", "status": "ok"}')
+        self.assertEqual(self.ran, [{'command': 'deploy', 'status': 'ok'}])
+
+
+class QuotedTopLevelKeys(unittest.TestCase):
+    """The keys the rule above credits: quoted, in the outermost object,
+    followed by ':' -- never a nested key, a quoted value, or a bare word."""
+
+    def test_only_quoted_outermost_keys(self):
+        from hartos.helper import _quoted_top_level_keys
+        text = ('{"a": "z", d: "x", "b": {"c": 2}, "e" : "f", '
+                "'g': [\"h\"], \"i\\u006a\": 0}")
+        self.assertEqual(_quoted_top_level_keys(text),
+                         {'a', 'b', 'e', 'g', 'ij'})
+
+    def test_a_split_word_is_not_a_quoted_key(self):
+        from hartos.helper import _quoted_top_level_keys
+        self.assertEqual(_quoted_top_level_keys(
+            '{"command": deploy the app, then report status: ok}'),
+            {'command'})

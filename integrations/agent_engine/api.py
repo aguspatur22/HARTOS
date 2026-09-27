@@ -147,13 +147,13 @@ def list_goals():
 # refused when created_by was a label, and 404 vs 403 told which ids exist.
 
 def _steer_goal(goal_id, verb):
-    """Run ``verb`` through dashboard_service.steer_agent; the route's answer."""
-    from integrations.social.dashboard_service import steer_agent, steering_caller
-    result = steer_agent(g.db, goal_id, verb, actor_id=str(g.user.id),
-                         reason=f'/api/goals {verb}', caller=steering_caller())
-    status = (200 if result.get('ok')
-              else 403 if result.get('forbidden') else 400)
-    return jsonify({'success': bool(result.get('ok')), 'data': result}), status
+    """Run ``verb`` through dashboard_service.steer_response; the answer."""
+    from integrations.social.dashboard_service import steer_response, steering_caller
+    body, code = steer_response(g.db, goal_id, verb=verb,
+                                caller=steering_caller(),
+                                actor_id=str(g.user.id),
+                                reason=f'/api/goals {verb}')
+    return jsonify(body), code
 
 
 @agent_engine_bp.route('/api/goals/<goal_id>', methods=['GET'])
@@ -174,17 +174,14 @@ def update_goal_status(goal_id):
     """Set a goal's status by the steering verb that reaches it: 'paused'
     (pause), 'active' (resume, only from paused), 'archived' (cancel).  Any
     other status is not settable from outside (400)."""
-    from integrations.social.dashboard_service import STATUS_VERB
+    from integrations.social.dashboard_service import steer_response, steering_caller
 
     data = request.get_json() or {}
-    status = data.get('status')
-    if not status:
-        return jsonify({'success': False, 'error': 'status is required'}), 400
-    verb = STATUS_VERB.get(status)
-    if verb is None:
-        return jsonify({'success': False, 'error': (
-            f'status must be one of {sorted(STATUS_VERB)}')}), 400
-    return _steer_goal(goal_id, verb)
+    body, code = steer_response(g.db, goal_id, status=data.get('status'),
+                                caller=steering_caller(),
+                                actor_id=str(g.user.id),
+                                reason='/api/goals status')
+    return jsonify(body), code
 
 
 @agent_engine_bp.route('/api/goals/<goal_id>', methods=['DELETE'])

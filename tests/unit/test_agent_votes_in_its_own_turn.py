@@ -64,6 +64,8 @@ def registry(monkeypatch):
     from integrations.service_tools import registry as reg_mod
     fresh = reg_mod.ServiceToolRegistry(config_file='__none__.json')
     monkeypatch.setattr(reg_mod, 'service_tool_registry', fresh)
+    import integrations.service_tools as st_pkg
+    monkeypatch.setattr(st_pkg, 'service_tool_registry', fresh)
     import integrations.agent_engine.thought_experiment_tools as tet
     monkeypatch.setattr(tet, 'service_tool_registry', fresh, raising=False)
     return fresh
@@ -182,7 +184,14 @@ def test_in_a_turn_the_model_cannot_name_someone_else(db, registry, turn):
         'arguments': json.dumps({'experiment_id': e.id, 'vote_value': 2,
                                  'voter_id': person.id}),
     })
-    assert json.loads(result['content'])['success'] is False
+    content = str(result.get('content') or '')
+    try:
+        refused = json.loads(content)['success'] is False
+    except ValueError:
+        # The tool-argument guard refused the call before it ran
+        # (voter_id is not in the schema): refused all the same.
+        refused = 'not run' in content
+    assert refused, content
     db.expire_all()
     assert db.query(ExperimentVote).filter_by(experiment_id=e.id).count() == 0
 
@@ -190,9 +199,11 @@ def test_in_a_turn_the_model_cannot_name_someone_else(db, registry, turn):
 # ── Review of d99b1aa88: reach the tool from how people ask ───────────
 # It was attached only for the literal phrase "thought experiment", and in
 # CREATE only at agent build time.  Now a turn that pairs a vote word
-# (vote / voting / ballot) with an experiment word (experiment / proposal)
-# or an experiment id unlocks it, in the per-turn attach both CREATE and
-# REUSE run (core.agent_tool_menu.attach_for_turn).
+# (vote / voting / ballot) with the word "experiment", or with the id of an
+# experiment that exists, unlocks it, in the per-turn attach both CREATE and
+# REUSE run (core.agent_tool_menu.attach_for_turn).  Review of a4dc8cf3b
+# (F5): "proposal" tripped political and business chat, and any UUID after
+# a vote word unlocked it; both are gone.
 
 _EXP_ID = '3f2a9c1e-7b4d-4e2a-9c1e-7b4d4e2a9c1e'
 
@@ -200,9 +211,8 @@ _EXP_ID = '3f2a9c1e-7b4d-4e2a-9c1e-7b4d4e2a9c1e'
 @pytest.mark.parametrize('turn_text', [
     'cast your vote on experiment abc',
     'please vote on the experiment about latency',
-    'Voting on proposal 12 closes tonight, add yours',
     'ballot for the thought experiment',
-    f'vote 2 on {_EXP_ID}',
+    'Voting on the experiment closes tonight, add yours',
     'Vote on the thought experiment about cache warmup',
 ])
 def test_a_vote_on_an_experiment_unlocks_the_tool(turn_text):
@@ -216,10 +226,22 @@ def test_a_vote_on_an_experiment_unlocks_the_tool(turn_text):
     f'what is the status of {_EXP_ID}?',
     'What is the weather in Chennai today?',
     'the devotee was experimenting',   # no word starts with vote
+    'Voting on proposal 12 closes tonight, add yours',
+    'vote on the budget proposal in parliament',
+    f'vote 2 on {_EXP_ID}',            # a UUID that is no experiment
 ])
-def test_other_turns_do_not(turn_text):
+def test_other_turns_do_not(turn_text, db):
     from integrations.agent_engine.marketing_tools import detect_goal_tags
     assert 'thought_experiment' not in detect_goal_tags(turn_text)
+
+
+def test_a_vote_naming_a_known_experiment_id_unlocks_the_tool(db):
+    """The id of an experiment that exists counts as the experiment word."""
+    from integrations.agent_engine.marketing_tools import detect_goal_tags
+    e = _experiment(db)
+    assert 'thought_experiment' in detect_goal_tags(f'vote 2 on {e.id}')
+    assert 'thought_experiment' in detect_goal_tags(f'Ballot: {e.id.upper()} +2')
+    assert 'thought_experiment' not in detect_goal_tags(f'what is {e.id}?')
 
 
 def _agents_built_for(registry, goal_text):
@@ -234,8 +256,8 @@ def _agents_built_for(registry, goal_text):
     tools = _gated_tools(registry, goal_text)
     for name, fn in tools.items():
         register_dual(helper, executor, fn, name, fn.__doc__ or name)
-    executor._hart_attached_tools = set(tools)
-    executor._hart_unlocked_tags = set(resolve_goal_tags(None, goal_text))
+    from core.agent_tool_menu import arm_turn_attach
+    arm_turn_attach(executor, set(tools), resolve_goal_tags(None, goal_text))
     return helper, executor
 
 
@@ -314,22 +336,98 @@ def test_a_real_autogen_tool_call_runs_on_the_turns_thread(db, registry):
             db.query(ExperimentVote).filter_by(experiment_id=e.id)] == [agent.id]
 
 
-def test_source_guard_create_and_reuse_turns_both_attach_per_turn():
-    """Wiring guard (the behaviour is pinned above on the shared helper):
-    CREATE's turn (get_response_group) and REUSE's (get_agent_response)
-    both call attach_for_turn, and both builders set the ledger it reads.
-    create/reuse cannot be imported in a bare pytest env."""
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+
+
+def _lift(rel, name, **inject):
+    """One top-level function out of a module a bare pytest env cannot
+    import (create_recipe waits on live services), exec'd with its
+    collaborators injected -- the way test_is_autonomous_is_one_rule lifts
+    create's should_continue_autonomously."""
     import ast
-    root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-    for rel, turn_fn in (('hartos/create_recipe.py', 'get_response_group'),
-                         ('hartos/reuse_recipe.py', 'get_agent_response')):
-        src = open(os.path.join(root, rel), encoding='utf-8').read()
-        fn = next(n for n in ast.walk(ast.parse(src))
-                  if isinstance(n, ast.FunctionDef) and n.name == turn_fn)
-        calls = {c.func.id for c in ast.walk(fn)
-                 if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
-        assert 'attach_for_turn' in calls, f'{rel}:{turn_fn}'
-        assert '_hart_unlocked_tags = set(goal_tags)' in src, rel
+    src = open(os.path.join(_ROOT, rel), encoding='utf-8').read()
+    fn = next(n for n in ast.parse(src).body
+              if isinstance(n, ast.FunctionDef) and n.name == name)
+    ns = dict(inject)
+    exec(ast.get_source_segment(src, fn), ns)
+    return ns[name]
+
+
+def _offered(agent):
+    """The tool names an agent's LLM schema offers."""
+    cfg = agent.llm_config if isinstance(agent.llm_config, dict) else {}
+    return {(t.get('function') or {}).get('name')
+            for t in cfg.get('tools', [])}
+
+
+def test_create_turn_attaches_the_vote_tool_to_creates_helper_pair(
+        db, registry, turn):
+    """CREATE, behaviourally (review of a4dc8cf3b, F2): agents shaped the
+    way create_agents builds them (service tools register_dual'ed on
+    helper/assistant, the ledger armed on the assistant), then CREATE's own
+    per-turn attach, lifted from create_recipe.py, on a vote turn.  The
+    Helper is offered the tool, the Assistant executes it, no other agent
+    gets it, and the vote is the calling agent's."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from integrations.agent_engine.thought_experiment_tools import (
+        ExperimentVoteTool)
+
+    ExperimentVoteTool.register()
+    helper, assistant = _agents_built_for(registry, 'plan my week')
+    other = pytest.importorskip('autogen').ConversableAgent(
+        'author', llm_config=False)
+    agents_object = {'helper': helper, 'assistant': assistant,
+                     'author': other, 'user': other}
+    attach = _lift('hartos/create_recipe.py', '_attach_for_create_turn',
+                   current_app=SimpleNamespace(logger=MagicMock()))
+    assert 'cast_experiment_vote' not in _offered(helper)
+
+    attach(agents_object, 'please vote on the experiment about latency',
+           'u_1')
+    assert 'cast_experiment_vote' in _offered(helper)
+    assert 'cast_experiment_vote' in assistant._function_map
+    assert 'cast_experiment_vote' not in getattr(other, '_function_map', {})
+
+    e = _experiment(db)
+    agent = _user(db, 'agent', owner_id=_user(db).id, agent_id='55505')
+    turn.set_prompt_id('55505')
+    reply = _tool_reply(assistant, helper, e.id)
+    assert json.loads(reply['tool_responses'][0]['content'])['success'] is True
+    db.expire_all()
+    assert [v.voter_id for v in
+            db.query(ExperimentVote).filter_by(experiment_id=e.id)] == [agent.id]
+
+
+def test_source_guard_create_and_reuse_turns_both_attach_per_turn():
+    """Wiring guard (the behaviour is pinned above: the shared helper, and
+    CREATE's own lifted turn attach): CREATE's turn (get_response_group ->
+    _attach_for_create_turn) and REUSE's (get_agent_response) reach
+    attach_for_turn, and both builders arm the ledger it reads, once, on the
+    agent they execute service tools on."""
+    import ast
+
+    def _calls(fn):
+        return {c.func.id if isinstance(c.func, ast.Name) else c.func.attr
+                for c in ast.walk(fn) if isinstance(c, ast.Call)
+                and isinstance(c.func, (ast.Name, ast.Attribute))}
+
+    for rel, turn_fns in (
+            ('hartos/create_recipe.py',
+             ('get_response_group', '_attach_for_create_turn')),
+            ('hartos/reuse_recipe.py', ('get_agent_response',))):
+        tree = ast.parse(open(os.path.join(_ROOT, rel), encoding='utf-8').read())
+        fns = {n.name: n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef)}
+        reached = set().union(*(_calls(fns[f]) for f in turn_fns))
+        assert 'attach_for_turn' in reached, rel
+        if len(turn_fns) > 1:
+            assert turn_fns[1] in _calls(fns[turn_fns[0]]), rel
+        arms = [c for c in ast.walk(tree)
+                if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                and c.func.id == 'arm_turn_attach']
+        assert len(arms) == 1, rel
+        assert ast.unparse(arms[0].args[0]) == 'assistant', rel
 
 
 # ── A turn /chat hands to a matched agent is that agent's turn ────────

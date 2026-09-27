@@ -1139,6 +1139,33 @@ def _written_value_counts(original):
     return counts
 
 
+def _quoted_top_level_keys(original):
+    """The keys the model wrote IN QUOTES in the outermost object of
+    ``original``: a quoted string at depth one followed by ``:``.  Read
+    with the one scanner (_scan_segments).  json_repair also reads a bare
+    ``word:`` inside an unquoted value as a key (``{"command": deploy, then
+    report status: ok}`` -> ``status``); such a key is never in this set."""
+    keys, depth, pending = set(), 0, None
+    for kind, piece in _scan_segments(str(original)):
+        if kind == "char" and piece.isspace() or kind == "comment":
+            continue
+        if pending is not None and kind == "char" and piece == ":":
+            keys.add(pending)
+        pending = None
+        if kind == "string" and depth == 1:
+            try:
+                key = json.loads(piece) if piece[0] == '"' else piece[1:-1]
+            except ValueError:
+                key = piece[1:-1]
+            pending = _LONE_SURROGATE.sub(chr(0xFFFD), key) if isinstance(
+                key, str) else None
+        elif kind == "char" and piece in "{[":
+            depth += 1
+        elif kind == "char" and piece in "}]":
+            depth -= 1
+    return keys
+
+
 def _invents_a_constant(value, original):
     """True when ``value`` carries Infinity / NaN the model never wrote as a
     value: a float inf/nan (json.loads of an overflowing number -- the model
@@ -4365,7 +4392,7 @@ def _exact_int_arguments(func, arguments):
     return out
 
 
-def tool_argument_error(func, func_name, arguments, repaired):
+def tool_argument_error(func, func_name, arguments, repaired, as_written=None):
     """Why ``func`` cannot be called with ``arguments``, or None.
 
     Binds the call the arguments actually become (:func:`tool_call_shape`,
@@ -4390,6 +4417,15 @@ def tool_argument_error(func, func_name, arguments, repaired):
     could be read shown as what was received, not as names to fix.  A
     repaired call that binds but leaves a required value empty (None, or a
     blank string json_repair filled in) is refused the same way.
+
+    ``as_written`` is the text the model wrote.  A call carrying a key that
+    the tool does not declare and the model did not write in quotes (only a
+    repair can make one) is refused the same way, whatever the signature: a
+    tool that takes **kwargs binds any name, so json_repair's split of an
+    unquoted value (``{"command": deploy the app, then report status: ok}`` ->
+    ``status``) used to run it with the value cut short (review of the
+    defect-14 fix; MCP tool_executor and service_tools endpoint_executor
+    keep a **kwargs signature when a tool has no schema).
     """
     import inspect
     if not isinstance(arguments, dict):
@@ -4444,7 +4480,10 @@ def tool_argument_error(func, func_name, arguments, repaired):
                 f"{', '.join(unholdable)} must be a finite number, and the "
                 f"value given cannot be held as one. Call {func_name} again "
                 f"with a number in range.")
-    if bound is not None and not emptied:
+    invented = ([k for k in kwargs if k not in {p.name for p in params}
+                 and k not in _quoted_top_level_keys(as_written)]
+                if as_written is not None and bound is not None else [])
+    if bound is not None and not emptied and not invented:
         return None
     takes_any = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
     names = {p.name for p in params}
@@ -4562,6 +4601,13 @@ def bind_tool_call_arguments(func, func_name, input_string, format_json_str,
     # last resort for shapes the reader cannot repair (an "@user" prefix,
     # Python-literal syntax), and what it returns is refused if it carries
     # Infinity / NaN the model never wrote.
+    if not isinstance(input_string, str):
+        # Arguments handed as an object or None, not text: read by the
+        # history guard's own rule (wire_tool_arguments: a dict serialized,
+        # None as {}), so the executor runs what the history shows.  Before,
+        # _format_json_str raised on them and the call was refused and
+        # marked with the Python repr (review of the defect-14 fix).
+        input_string, _ = wire_tool_arguments(input_string)
     try:
         # A strict read of autogen's formatted text first; on failure the
         # reader repairs the RAW text, the text the history guard reads.
@@ -4597,7 +4643,8 @@ def bind_tool_call_arguments(func, func_name, input_string, format_json_str,
                       f"not be read without turning a number into Infinity. "
                       f"Write a long number or id as a string in double "
                       f"quotes.")
-    error = tool_argument_error(func, func_name, arguments, repaired)
+    error = tool_argument_error(func, func_name, arguments, repaired,
+                                as_written=input_string)
     if error is not None:
         print(f" ARGUMENTS REFUSED{where}: {func_name} not run: {error}")
         if repaired:

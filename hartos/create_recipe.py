@@ -1802,10 +1802,11 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         # or newly-needed tools mid-conversation (owner req 2026-08-31).
         _attached_names = set(svc_tools)
         # The ledger the per-turn attach reads (core.agent_tool_menu.
-        # attach_for_turn, called from get_response_group), as REUSE keeps
-        # it: CREATE used to attach only at build time, from the task.
-        assistant._hart_attached_tools = _attached_names
-        assistant._hart_unlocked_tags = set(goal_tags)
+        # attach_for_turn, from _attach_for_create_turn), on the agent the
+        # register_dual above executes service tools on, as REUSE does.
+        # CREATE used to attach only at build time, from the task.
+        from core.agent_tool_menu import arm_turn_attach
+        arm_turn_attach(assistant, _attached_names, goal_tags)
         from core.agent_tools import register_request_tools
         register_request_tools(helper, assistant, service_tool_registry,
                                _attached_names)
@@ -4329,6 +4330,29 @@ def _resume_prior_user_input_block(user_prompt, text, failure=False):
     return True
 
 
+def _attach_for_create_turn(agents_object, text, user_prompt):
+    """CREATE's Tier-1 per-turn attach, the one REUSE's turn uses
+    (core.agent_tool_menu.attach_for_turn, which also fits the grown schema
+    to the live n_ctx): a turn that drifts into a capability the build-time
+    task never named (an agent asked to vote on an experiment) gets it
+    before the model sees the turn.  On the pair create_agents registered
+    service tools on: the Helper proposes, the Assistant executes.  Never
+    raises; a failure is logged and the turn runs with the tools it has."""
+    try:
+        from core.agent_tool_menu import attach_for_turn
+        from integrations.service_tools import service_tool_registry
+        _new, _n = attach_for_turn(text, agents_object['helper'],
+                                   agents_object['assistant'],
+                                   service_tool_registry)
+        if _new:
+            current_app.logger.info(
+                f"Tier-1 turn attach: +{_new} -> {_n} tools")
+    except Exception as _e:
+        current_app.logger.warning(
+            f"turn attach skipped: {_e} for session: {user_prompt}",
+            exc_info=True)
+
+
 def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
     """
     Handles the response generation process for an agent group.
@@ -4387,22 +4411,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             except Exception:
                 message = ""
                 text = f'Properly Execute Action {user_tasks[user_prompt].current_action}: {message} '
-    # Tier-1 per-turn attach, the one REUSE's turn uses: a turn that drifts
-    # into a capability the build-time task never named (an agent asked to
-    # vote on an experiment) gets it before the model sees the turn.
-    try:
-        from core.agent_tool_menu import attach_for_turn
-        from integrations.service_tools import service_tool_registry
-        _new, _n = attach_for_turn(text, agents_object['helper'],
-                                   agents_object['assistant'],
-                                   service_tool_registry)
-        if _new:
-            current_app.logger.info(
-                f"Tier-1 turn attach: +{_new} -> {_n} tools")
-    except Exception as _e:
-        current_app.logger.warning(
-            f"turn attach skipped: {_e} for session: {user_prompt}",
-            exc_info=True)
+    _attach_for_create_turn(agents_object, text, user_prompt)
 
     # Initiate or resume chat
     try:

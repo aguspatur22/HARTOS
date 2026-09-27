@@ -43,6 +43,7 @@ from hartos.lifecycle_hooks import register_groupchat_for_session  # noqa: E402
 from integrations.agent_engine.api import agent_engine_bp  # noqa: E402
 from integrations.coding_agent.api import coding_agent_bp  # noqa: E402
 from integrations.distributed_agent.api import distributed_agent_bp  # noqa: E402
+from integrations.social.api_audit import audit_bp  # noqa: E402
 from integrations.social.api_dashboard import dashboard_bp  # noqa: E402
 from integrations.social.api_tracker import tracker_bp  # noqa: E402
 from integrations.social.models import AgentGoal, Base, User  # noqa: E402
@@ -80,6 +81,12 @@ ROUTES = {
         lambda gid, pid: ('get', f'/api/coding/goals/{gid}', None),
     ('GET', '/api/distributed/goals/<goal_id>/progress'):
         lambda gid, pid: ('get', f'/api/distributed/goals/{gid}/progress', None),
+    ('GET', '/api/social/audit/agents/<agent_id>/timeline'):
+        lambda gid, pid: ('get', f'/api/social/audit/agents/{gid}/timeline', None),
+    ('GET', '/api/social/audit/agents/<agent_id>/conversations'):
+        lambda gid, pid: ('get', f'/api/social/audit/agents/{gid}/conversations', None),
+    ('GET', '/api/social/audit/agents/<agent_id>/thinking'):
+        lambda gid, pid: ('get', f'/api/social/audit/agents/{gid}/thinking', None),
     ('POST', '/api/social/tracker/dual-context'):
         lambda gid, pid: ('post', '/api/social/tracker/dual-context',
                           {'post_id': pid, 'contexts': [{'label': 'a'}, {'label': 'b'}]}),
@@ -133,7 +140,7 @@ NOT_GOAL = {
 }
 
 BLUEPRINTS = (dashboard_bp, agent_engine_bp, tracker_bp, coding_agent_bp,
-              distributed_agent_bp)
+              distributed_agent_bp, audit_bp)
 
 # What a goal's content reader returns in this suite.  A stranger's answer
 # from ANY route must never carry it.
@@ -170,7 +177,9 @@ def app(sf, monkeypatch, tmp_path):
     writes = []
 
     def _recorded_write(db, goal_id, status):
-        writes.append((goal_id, status))
+        import inspect
+        callers = [f.function for f in inspect.stack()[1:6]]
+        writes.append((goal_id, status, callers))
         return real_status_write(db, goal_id, status)
 
     coordinator = MagicMock()
@@ -195,13 +204,25 @@ def app(sf, monkeypatch, tmp_path):
                side_effect=lambda gid, **kw: {'nodes': [SECRET]}), \
          patch('integrations.distributed_agent.api._get_coordinator',
                return_value=coordinator), \
+         patch('integrations.distributed_agent.coordinator_backends.GossipTaskBridge') as gossip, \
+         patch('integrations.distributed_agent.api._submitters_path',
+               return_value=str(tmp_path / 'distributed_submitters.json')), \
+         patch('integrations.coding_agent.api._IS_CENTRAL', True), \
          patch('security.immutable_audit_log.get_audit_log'), \
          patch('core.http_pool.pooled_post', return_value=chat) as posted, \
          patch('integrations.channels.memory.memory_graph.MemoryGraph') as graph, \
          patch('core.platform_paths.get_memory_graph_dir', return_value=str(tmp_path)), \
          patch('integrations.social.realtime.publish_event'):
         graph.return_value.register.return_value = 'm1'
+        # The audit routes read a goal's memories: they answer SECRET too.
+        graph.return_value.get_session_memories.return_value = [
+            SimpleNamespace(to_dict=lambda: {'content': SECRET,
+                                             'memory_type': 'conversation'}),
+            SimpleNamespace(to_dict=lambda: {'content': SECRET,
+                                             'memory_type': 'thinking'}),
+        ]
         a.chat_post, a.memory_graph, a.writes = posted, graph, writes
+        a.gossip = gossip
         yield a
 
 
@@ -441,7 +462,11 @@ def test_no_route_gives_a_stranger_a_goals_content(app, client, sf):
         for method, rule in sorted(_goal_scoped_rules(app)):
             r = getattr(client, method.lower())(
                 _fill(rule, gid), json={}, headers=TOKEN, environ_base=REMOTE)
-            if SECRET in r.get_data(as_text=True):
+            body = r.get_data(as_text=True)
+            # Both what the mocked readers return AND the row itself: a route
+            # that reads the AgentGoal directly (and was filed as NOT_GOAL)
+            # would carry its title (review of 275e8e361).
+            if SECRET in body or 'secret title' in body:
                 leaked.append((method, rule, r.status_code))
     assert not leaked, f'goal content reached a stranger: {leaked}'
     assert app.writes == []
@@ -477,7 +502,7 @@ def test_a_finished_goal_cannot_be_paused_and_resumed_back_to_life(client, sf, t
     assert _status(sf, gid) == terminal
 
 
-def test_a_stalled_goal_is_not_paused_by_accident_of_its_label(client, sf):
+def test_a_paused_goal_is_not_paused_again(client, sf):
     """Only an active goal may be paused: the rule names the one status it
     leaves, rather than the ones it may not."""
     owner = _user(sf)
@@ -506,13 +531,18 @@ def test_interviewing_a_machine_goal_runs_it_as_the_caller(app, client, sf):
 
 def test_distributed_progress_of_an_api_submitted_goal_is_its_submitters(
         app, client, sf):
-    """A goal submitted to /api/distributed/goals has no AgentGoal row; the
-    coordinator's parent context names who submitted it."""
+    """A goal submitted to /api/distributed/goals has no AgentGoal row.  Who
+    submitted it is kept on THIS node (_record_submitter), never in the
+    coordinator's shared context or the gossip announce."""
     submitter = _user(sf)
     from integrations.distributed_agent import api as dist_api
     coord = dist_api._get_coordinator()
-    coord.get_goal_progress.side_effect = lambda gid: {
-        'goal_id': gid, 'context': {'user_id': submitter}, 'tasks': [SECRET]}
+    coord.submit_goal.return_value = 'dist-1'
+    with _as(submitter):
+        made = client.post('/api/distributed/goals', json={
+            'objective': 'o', 'tasks': [{'task_id': 't1', 'description': 'd'}]},
+            headers=TOKEN, environ_base=REMOTE)
+    assert made.status_code == 200, made.get_json()
     with _as(submitter):
         mine = client.get('/api/distributed/goals/dist-1/progress',
                           headers=TOKEN, environ_base=REMOTE)
@@ -524,17 +554,83 @@ def test_distributed_progress_of_an_api_submitted_goal_is_its_submitters(
     assert SECRET not in theirs.get_data(as_text=True)
 
 
-def test_a_distributed_goal_records_who_submitted_it(client, sf):
-    """The submitter is the token's user, never a user_id the body names:
-    /goals/<id>/progress judges the goal by it."""
+def test_the_submitter_never_leaves_this_node(app, client, sf):
+    """Review of 275e8e361: the submitter's id was stamped into the context
+    that goes to the shared coordinator and to every peer (announce_goal,
+    plaintext to a peer without X25519) -- egress under the 09-26 ruling."""
     from integrations.distributed_agent import api as dist_api
     coord = dist_api._get_coordinator()
     me = _user(sf)
     with _as(me):
         r = client.post('/api/distributed/goals', json={
             'objective': 'o', 'tasks': [{'task_id': 't1', 'description': 'd'}],
-            'context': {'user_id': 'someone-else'}},
+            'context': {'repo_url': 'a/b'}},
             headers=TOKEN, environ_base=REMOTE)
     assert r.status_code == 200, r.get_json()
-    context = coord.submit_goal.call_args.args[2]
-    assert context['user_id'] == me
+    shared = coord.submit_goal.call_args.args[2]
+    announced = app.gossip.return_value.announce_goal.call_args.args[3]
+    for ctx in (shared, announced):
+        assert me not in repr(ctx)
+        assert 'user_id' not in ctx
+        assert ctx.get('repo_url') == 'a/b'
+
+
+def test_a_peers_goal_is_this_machines_to_read(client, sf):
+    """A goal a peer gossiped here names ITS user in the context; that id is
+    not an owner on this node.  The goal is the machine's: this machine's
+    own callers read its progress (review of 275e8e361: they got 403), a
+    remote stranger does not."""
+    from integrations.distributed_agent import api as dist_api
+    coord = dist_api._get_coordinator()
+    coord.get_goal_progress.side_effect = lambda gid: {
+        'goal_id': gid, 'context': {'user_id': 'a-user-on-another-node'},
+        'tasks': [SECRET]}
+    with _as(_user(sf)):
+        local = client.get('/api/distributed/goals/peer-goal/progress',
+                           headers=TOKEN)
+        remote = client.get('/api/distributed/goals/peer-goal/progress',
+                            headers=TOKEN, environ_base=REMOTE)
+    assert local.status_code == 200, local.get_json()
+    assert remote.status_code == 403
+
+
+# ── ONE status writer (review of 275e8e361) ─────────────────────────────
+
+def test_no_route_revives_a_finished_goal_even_for_an_admin(app, client, sf):
+    """Every parameterised rule, driven as a central admin with a body that
+    asks for 'active' (and with none): a completed goal never becomes active
+    or paused, and every status write goes through the one writer,
+    dashboard_service._write_goal_status.  PATCH /api/coding/goals/<id>
+    wrote any status (default 'active') and revived completed goals."""
+    revived, stray = [], []
+    with _as(_user(sf), is_admin=True, role='central'):
+        for method, rule in sorted(_goal_scoped_rules(app)):
+            for body in ({'status': 'active'}, {}):
+                gid, pid, _ = _goal(sf, owner_id=_user(sf), status='completed')
+                db = sf()
+                row = db.query(AgentGoal).filter(AgentGoal.id == gid).first()
+                row.config_json = {'post_id': gid}
+                db.commit()
+                db.close()
+                getattr(client, method.lower())(
+                    _fill(rule, gid), json=body, headers=TOKEN,
+                    environ_base=REMOTE)
+                if _status(sf, gid) in ('active', 'paused'):
+                    revived.append((method, rule, body))
+    for goal_id, status, callers in app.writes:
+        if '_write_goal_status' not in callers:
+            stray.append((goal_id, status, callers))
+    assert not revived, f'finished goals revived: {revived}'
+    assert not stray, f'status written outside _write_goal_status: {stray}'
+
+
+def test_patch_coding_goal_status_goes_through_the_steering_rule(client, sf):
+    gid, pid, _ = _goal(sf, owner_id=_user(sf), status='active')
+    with _as(_user(sf), is_admin=True, role='central'):
+        paused = client.patch(f'/api/coding/goals/{gid}', json={'status': 'paused'},
+                              headers=TOKEN, environ_base=REMOTE)
+        empty = client.patch(f'/api/coding/goals/{gid}', json={},
+                             headers=TOKEN, environ_base=REMOTE)
+    assert paused.status_code == 200, paused.get_json()
+    assert empty.status_code == 400
+    assert _status(sf, gid) == 'paused'

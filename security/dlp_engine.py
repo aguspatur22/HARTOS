@@ -26,8 +26,25 @@ PII_PATTERNS = {
     'email': re.compile(
         r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
     ),
+    # An email written so '@' is not literal: URL-encoded (%40) or spelled
+    # out ((at) / [at]) -- the same address, the same person.
+    'email_obfuscated': re.compile(
+        r'(?<![A-Za-z0-9._%+-])[A-Za-z0-9._+-]+(?:%40|\s*[\(\[]\s*at\s*[\)\]]\s*)'
+        r'[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b',
+        re.IGNORECASE,
+    ),
+    # IPv6: a compressed form with '::' and at least three groups, or the
+    # full eight groups -- not a clock time (12:30:45) or 'std::vector'.
+    'ipv6_address': re.compile(
+        r'(?<![\w:])(?:(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}'
+        r'(?::[0-9A-Fa-f]{1,4}){1,5}|(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4})'
+        r'(?![\w:])'
+    ),
+    # Bounded by letters/digits, not \b: an underscore is a word character,
+    # so \b let 'phone_4155550199' through whole.
     'phone': re.compile(
-        r'\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b'
+        r'(?<![A-Za-z0-9])(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}'
+        r'(?![A-Za-z0-9])'
     ),
     'ssn': re.compile(
         r'\b\d{3}-\d{2}-\d{4}\b'
@@ -43,6 +60,8 @@ PII_PATTERNS = {
 # Redaction replacements
 _REDACT_MAP = {
     'email': '[EMAIL_REDACTED]',
+    'email_obfuscated': '[EMAIL_REDACTED]',
+    'ipv6_address': '[IP_REDACTED]',
     'phone': '[PHONE_REDACTED]',
     'ssn': '[SSN_REDACTED]',
     'credit_card': '[CC_REDACTED]',

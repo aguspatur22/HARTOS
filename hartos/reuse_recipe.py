@@ -2715,8 +2715,8 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         # Shared per-conversation state for the per-turn attach hook in
         # get_agent_response — same set object request_tools mutates, so
         # both layers see one attach ledger.
-        assistant._hart_attached_tools = _attached_names
-        assistant._hart_unlocked_tags = set(goal_tags)
+        from core.agent_tool_menu import arm_turn_attach
+        arm_turn_attach(assistant, _attached_names, goal_tags)
         # The FULL core closure list, for the per-turn named attach in
         # get_agent_response — that runs in a different function, so the list
         # built at L2141 is out of scope there and has to ride the agent like

@@ -115,11 +115,18 @@ def get_goal(goal_id):
 @require_admin
 @_require_central
 def update_goal(goal_id):
-    from .goal_manager import CodingGoalManager
+    """Set a coding goal's status the way every goal's status is set: by the
+    steering verb that reaches it (dashboard_service.steer_response), so a
+    finished goal is never revived.  It wrote any status, 'active' when the
+    body named none (review of 275e8e361); an empty body is now a 400."""
+    from integrations.social.dashboard_service import steer_response, steering_caller
 
     data = request.get_json() or {}
-    result = CodingGoalManager.update_goal_status(g.db, goal_id, data.get('status', 'active'))
-    return jsonify(result)
+    body, code = steer_response(g.db, goal_id, status=data.get('status'),
+                                caller=steering_caller(),
+                                actor_id=str(g.user.id),
+                                reason='/api/coding/goals status')
+    return jsonify(body), code
 
 
 # ─── Opt-In / Opt-Out (self-service) ───

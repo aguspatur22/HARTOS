@@ -613,36 +613,18 @@ class GPUWorker:
                 f"{self.name}: deterministic install of '{pkg}' failed "
                 f"(rc={rc}); dispatching agentic self-heal fallback."
             )
-            try:
-                from core.error_advice import handle_exception
-                synthetic = ModuleNotFoundError(f"No module named '{pkg}'")
-                synthetic.name = pkg  # type: ignore[attr-defined]
-                handle_exception(
-                    synthetic,
-                    category='subprocess.tool_load',
-                    severity='high',
-                    agent_remediation=True,
-                    context={
-                        'worker_name': self.name,
-                        'worker_module': self.module,
-                        'missing_package': pkg,
-                        'remediation_hint': (
-                            f"Deterministic `pip install {pkg}` FAILED. "
-                            f"Do NOT edit source to fix a missing package. "
-                            f"Diagnose the pip failure (network / build "
-                            f"deps / wrong index), then add '{pkg}' to the "
-                            f"freeze pip plan (Nunba "
-                            f"scripts/setup_freeze_nunba.py _tts_deps or "
-                            f"the appropriate _<X>_deps tuple) AND to "
-                            f"tts/package_installer.py legacy fallback "
-                            f"plan so the next build bundles it."
-                        ),
-                    },
-                )
-            except Exception as e:
-                logger.debug(
-                    f"{self.name}: error_advice dispatch skipped: {e}"
-                )
+            self._raise_missing_package_goal(
+                pkg,
+                f"Deterministic `pip install {pkg}` FAILED. "
+                f"Do NOT edit source to fix a missing package. "
+                f"Diagnose the pip failure (network / build "
+                f"deps / wrong index), then add '{pkg}' to the "
+                f"freeze pip plan (Nunba "
+                f"scripts/setup_freeze_nunba.py _tts_deps or "
+                f"the appropriate _<X>_deps tuple) AND to "
+                f"tts/package_installer.py legacy fallback "
+                f"plan so the next build bundles it.",
+            )
 
         threading.Thread(
             target=_install_async, daemon=True,
@@ -730,11 +712,55 @@ class GPUWorker:
                 )
                 logger.info(f"{self.name}: setup offer: {outcome}")
             except Exception as e:
-                logger.warning(f"{self.name}: setup could not be offered: {e}")
+                # The once-flag is already set, so this worker never offers
+                # again: tell the owner through the goal instead of falling
+                # back to another voice in silence.  No 'backend' in its
+                # context: that would route to repair_backend_venv and
+                # install the engine without the owner's yes.
+                logger.error(
+                    f"{self.name}: setup could not be offered: "
+                    f"{type(e).__name__}: {e}; raising the missing-package "
+                    f"goal instead")
+                self._raise_missing_package_goal(
+                    pkg,
+                    f"The {self.name} engine is not installed (its worker ran "
+                    f"on {self.python_exe}, not its own venv, and cannot "
+                    f"import '{pkg}'), and offering its setup to the owner "
+                    f"failed: {type(e).__name__}: {e}. Do NOT pip '{pkg}' "
+                    f"into the shared site. Diagnose why "
+                    f"capability_setup.request_capability_setup failed so "
+                    f"the owner can be asked to set up tts:{self.name}.",
+                )
 
         threading.Thread(
             target=_offer, daemon=True, name=f"setup-offer-{self.name}",
         ).start()
+
+    def _raise_missing_package_goal(self, pkg: str, hint: str) -> None:
+        """Raise the agentic self-heal goal for a package this worker could
+        not import (``core.error_advice``, throttled per failure shape).
+        The context names no ``backend``, so the goal's prompt takes the
+        missing-dependency route, never ``repair_backend_venv``."""
+        try:
+            from core.error_advice import handle_exception
+            synthetic = ModuleNotFoundError(f"No module named '{pkg}'")
+            synthetic.name = pkg  # type: ignore[attr-defined]
+            handle_exception(
+                synthetic,
+                category='subprocess.tool_load',
+                severity='high',
+                agent_remediation=True,
+                context={
+                    'worker_name': self.name,
+                    'worker_module': self.module,
+                    'missing_package': pkg,
+                    'remediation_hint': hint,
+                },
+            )
+        except Exception as e:
+            logger.error(
+                f"{self.name}: the '{pkg}' self-heal goal could not be "
+                f"raised: {type(e).__name__}: {e}")
 
     def _user_site_packages_dir(self) -> Optional[str]:
         """Return the user-writable site-packages dir for runtime

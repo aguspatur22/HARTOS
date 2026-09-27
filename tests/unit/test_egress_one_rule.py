@@ -804,3 +804,43 @@ def test_publish_async_scrubs_an_undeclared_catch_all_uri(legs):
         _publish_async(client)('com.hertzai.hevolve.somethingnew',
                                {'text': f'mail {EMAIL}'})
     assert json.loads(client.published[0][1])['text'] == 'mail [EMAIL_REDACTED]'
+
+
+# ── the remaining raw leaks, closed in the ONE pattern home ───────────────
+# (dlp_engine.PII_PATTERNS / secret_redactor._SECRET_PATTERNS; scrub_text
+# only calls them)
+
+@pytest.mark.parametrize('text, raw', [
+    ('my box is at 2001:db8::8a2e:370:7334 today', '2001:db8::8a2e:370:7334'),
+    ('fe80::1ff:fe23:4567:890a', 'fe80::1ff:fe23:4567:890a'),
+    ('full 2001:0db8:85a3:0000:0000:8a2e:0370:7334 here',
+     '2001:0db8:85a3:0000:0000:8a2e:0370:7334'),
+    ('write john.doe%40example.com', 'john.doe%40example.com'),
+    ('https://x.io/u?email=john.doe%40example.com', 'john.doe%40example.com'),
+    ('reach john.doe(at)example.com', 'john.doe(at)example.com'),
+    ('reach john.doe [at] example.com', 'example.com'),
+    ('password=hunter2', 'hunter2'),
+    ('pwd=abc', '=abc'),
+    ('pass:xyz9', 'xyz9'),
+    ('my password: hunter2 ok', 'hunter2'),
+    ('DB_PASSWORD=s3cr3t', 's3cr3t'),
+    ('https://api.example.com/v1/data?key=AIzaSyShort123', 'AIzaSyShort123'),
+    ('https://api.example.com/v1/data?x=1&api_key=abc123', 'abc123'),
+    ('phone_4155550199', '4155550199'),
+])
+def test_the_one_scrub_closes_the_remaining_raw_leaks(text, raw):
+    from security.edge_privacy import scrub_for_egress, scrub_text
+    assert raw not in scrub_text(text), text
+    assert raw not in json.dumps(scrub_for_egress({'reply': text})), text
+
+
+def test_the_new_patterns_keep_protocol_and_plain_text():
+    from security.edge_privacy import scrub_for_egress, scrub_text
+    kept = {'version': '1.4.0.12', 'build': '2026.9.27.1',
+            'hart_version': '3.5.4.1', 'peer_ip': 'fe80::1ff:fe23:4567:890a',
+            'request_id': 'task_1234567890'}
+    assert scrub_for_egress(kept) == kept
+    for plain in ('meet at 12:30:45 today', 'std::vector<int> works',
+                  'the pass rate was high', 'password=none',
+                  'you pass: nothing', 'hash deadbeefcafe'):
+        assert scrub_text(plain) == plain, plain

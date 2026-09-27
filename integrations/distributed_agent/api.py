@@ -26,6 +26,45 @@ logger = logging.getLogger(__name__)
 
 distributed_agent_bp = Blueprint('distributed_agent', __name__)
 
+
+# ─── Who submitted a goal: kept on THIS node ───
+# /goals/<id>/progress judges an API-submitted goal (it has no AgentGoal
+# row) by who submitted it.  That id must not ride in the goal's context:
+# the context goes to the shared coordinator ledger and, through
+# announce_goal, to every peer (review of 275e8e361: egress under the 09-26
+# ruling).  So it lives in a node-local file, goal id -> user id, bounded.
+_SUBMITTERS_MAX = 10000
+_submitters_lock = threading.Lock()
+
+
+def _submitters_path() -> str:
+    from core.platform_paths import get_agent_data_dir
+    return os.path.join(get_agent_data_dir(), 'distributed_submitters.json')
+
+
+def _record_submitter(goal_id: str, user_id: str) -> None:
+    from core.file_cache import atomic_json_write, cached_json_load
+    path = _submitters_path()
+    with _submitters_lock:
+        try:
+            table = dict(cached_json_load(path) or {})
+        except Exception:
+            table = {}
+        table[str(goal_id)] = str(user_id)
+        while len(table) > _SUBMITTERS_MAX:
+            table.pop(next(iter(table)))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        atomic_json_write(path, table)
+
+
+def _submitter_of(goal_id: str):
+    from core.file_cache import cached_json_load
+    try:
+        return (cached_json_load(_submitters_path()) or {}).get(str(goal_id))
+    except Exception:
+        logger.debug('submitter table unreadable', exc_info=True)
+        return None
+
 # Track which backend is active
 _coordinator_backend_type = None
 
@@ -435,11 +474,9 @@ def submit_goal():
         return jsonify({'success': False, 'error': 'objective is required'}), 400
     if not tasks:
         return jsonify({'success': False, 'error': 'tasks list is required'}), 400
-    # Who submitted it: the goal's owner for /goals/<id>/progress (there is
-    # no AgentGoal row for an API-submitted goal).  The token's user, never
-    # a value the body chose.
-    context = dict(context or {})
-    context['user_id'] = str(g.user.id)
+    # A user id in the context would go to the shared ledger and to every
+    # peer; the submitter is kept on this node instead (_record_submitter).
+    context = {k: v for k, v in (context or {}).items() if k != 'user_id'}
 
     # submit_goal refuses with an exception instead of answering with a goal
     # that is missing children: HiveDepthExceeded for a hop past the
@@ -458,6 +495,11 @@ def submit_goal():
     except RuntimeError as e:
         status = 503 if 'persist' in str(e) else 409
         return jsonify({'success': False, 'error': str(e)}), status
+    try:
+        _record_submitter(goal_id, str(g.user.id))
+    except Exception:
+        logger.warning('could not record who submitted goal %s', goal_id,
+                       exc_info=True)
 
     # Announce to peers via gossip if we have peers
     try:
@@ -477,8 +519,9 @@ def goal_progress(goal_id):
 
     The goal is the AgentGoal / CodingGoal with this id when there is one
     (dispatch submits under the goal's own id), else the coordinator's goal,
-    owned by the ``user_id`` its context names (the submitter, stamped by
-    POST /goals; a peer's gossiped goal names none, so it is this machine's).
+    owned by whoever submitted it HERE (_submitter_of, node-local).  A goal
+    a peer gossiped names nobody on this node -- any user id in its context
+    is the peer's -- so it is this machine's: local callers read it.
     Judged by dashboard_service.may_steer; an unknown id and someone else's
     goal answer the same 403.  Review of dc32b1146: any signed-in user read
     any goal's tasks.
@@ -493,8 +536,8 @@ def goal_progress(goal_id):
     progress = coordinator.get_goal_progress(goal_id)
     goal = find_goal(g.db, goal_id)
     if goal is None and 'error' not in progress:
-        goal = SimpleNamespace(
-            owner_id=(progress.get('context') or {}).get('user_id'))
+        goal = SimpleNamespace(owner_id=_submitter_of(goal_id),
+                               created_by=None, user_id=None)
     _, refused = goal_to_steer(g.db, goal_id, 'read', steering_caller(),
                                str(g.user.id), goal=goal, audit=False)
     if refused:
