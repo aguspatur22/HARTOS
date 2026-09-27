@@ -189,3 +189,88 @@ def test_torch_probe_false_when_child_finds_torch_but_cannot_read_it(
     text = caplog.text
     assert str(init) in text or repr(str(init))[1:-1] in text
     assert 'errno 13' in text.lower()
+
+
+# ── an EMPTY leftover torch/ directory (review of 865130b86) ──────────
+# A torch/ dir with no __init__.py is a namespace package: find_spec
+# returns a spec with origin None, so the open() check was skipped and the
+# gate passed, yet ``import torch`` gives an empty module and the brain's
+# first ``torch.<attr>`` dies -- the same crash loop.  Real child, real
+# probe; the exit code it returns is the named one.
+
+def _spy_run_bounded(monkeypatch, flags=()):
+    """Run the REAL run_bounded, recording each result; ``flags`` are
+    interpreter options put before the probe's own ``-c`` (e.g. -S: no
+    site-packages, so no installed torch can answer instead of the fake)."""
+    from core import subprocess_safe
+    seen = []
+    real = subprocess_safe.run_bounded
+
+    def spy(argv, *a, **kw):
+        res = real([argv[0], *flags, *argv[1:]], *a, **kw)
+        seen.append(res)
+        return res
+    monkeypatch.setattr(subprocess_safe, 'run_bounded', spy)
+    return seen
+
+
+def test_torch_probe_false_for_an_empty_torch_dir(tmp_path, monkeypatch,
+                                                   caplog):
+    (tmp_path / 'torch').mkdir()
+    monkeypatch.setenv('PYTHONPATH', str(tmp_path))
+    monkeypatch.setattr(sup, '_resolve_repo_root', lambda: None)
+    monkeypatch.setattr(sup, '_resolve_python_exe', lambda: sys.executable)
+    # -S: a child with no site-packages, so no installed torch can stand in
+    # for the empty dir -- the shape of the live box, where the leftover was
+    # all there was.
+    seen = _spy_run_bounded(monkeypatch, ['-S'])
+    _reset_cache()
+    with caplog.at_level(logging.INFO, logger='hevolve_agent_engine'):
+        verdict = sup._child_can_import_torch()
+    assert verdict is False
+    assert [r.returncode for r in seen] == [sup.TORCH_PROBE_EXIT_NOT_A_PACKAGE]
+    assert str(tmp_path / 'torch') in caplog.text
+    assert 'not a package' in caplog.text
+
+
+def test_torch_probe_readable_torch_exits_ok(tmp_path, monkeypatch):
+    _fake_torch(tmp_path, monkeypatch)
+    seen = _spy_run_bounded(monkeypatch, ['-S'])
+    assert sup._child_can_import_torch() is True
+    assert [r.returncode for r in seen] == [0]
+
+
+def test_torch_probe_unreadable_exit_code_is_the_named_one(
+        tmp_path, monkeypatch):
+    init = _fake_torch(tmp_path, monkeypatch)
+    seen = _spy_run_bounded(monkeypatch)
+    with _unreadable(init):
+        assert sup._child_can_import_torch() is False
+    assert [r.returncode for r in seen] == [sup.TORCH_PROBE_EXIT_UNREADABLE]
+
+
+def test_torch_probe_not_found_exit_code_is_the_named_one(monkeypatch):
+    # -S -I: no site-packages, no PYTHONPATH -> no torch anywhere.
+    monkeypatch.setattr(sup, '_resolve_repo_root', lambda: None)
+    monkeypatch.setattr(sup, '_resolve_python_exe', lambda: sys.executable)
+    seen = _spy_run_bounded(monkeypatch, ['-S', '-I'])
+    _reset_cache()
+    assert sup._child_can_import_torch() is False
+    assert [r.returncode for r in seen] == [sup.TORCH_PROBE_EXIT_NOT_FOUND]
+
+
+@pytest.mark.parametrize('code,words', [
+    (3, 'not found'), (4, 'not readable'), (5, 'not a package')])
+def test_log_names_the_exit_code(code, words, caplog):
+    assert sup.TORCH_PROBE_EXIT_REASONS[code] == words
+    with _patch_probe(returncode=code), \
+            caplog.at_level(logging.INFO, logger='hevolve_agent_engine'):
+        assert sup._child_can_import_torch() is False
+    assert f'exit {code}: {words}' in caplog.text
+
+
+def test_exit_codes_are_distinct_and_nonzero():
+    codes = [sup.TORCH_PROBE_EXIT_NOT_FOUND, sup.TORCH_PROBE_EXIT_UNREADABLE,
+             sup.TORCH_PROBE_EXIT_NOT_A_PACKAGE]
+    assert len(set(codes)) == 3 and 0 not in codes and 1 not in codes
+    assert set(sup.TORCH_PROBE_EXIT_REASONS) == set(codes)

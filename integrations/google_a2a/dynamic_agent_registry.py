@@ -68,6 +68,14 @@ class TrainedAgent:
     flow_name: str = ""
     sub_goal: str = ""
 
+    @property
+    def is_autonomous(self) -> bool:
+        """The recipe's can_perform_without_user_input, read by the ONE
+        rule (hartos.lifecycle_hooks.action_is_autonomous).  Imported here,
+        not at module top: lifecycle_hooks pulls hartos.helper."""
+        from hartos.lifecycle_hooks import action_is_autonomous
+        return action_is_autonomous(self.can_perform_without_user_input)
+
 
 class DynamicAgentDiscovery:
     """Discovers trained agents from prompts directory"""
@@ -280,7 +288,7 @@ class DynamicAgentDiscovery:
                 "flow_id": agent.flow_id,
                 "flow_name": agent.flow_name,
                 "persona": agent.persona,
-                "autonomous": agent.can_perform_without_user_input == "yes",
+                "autonomous": agent.is_autonomous,
                 "has_fallback": bool(agent.fallback_action),
                 "recipe_steps": len(agent.recipe)
             }
@@ -321,7 +329,7 @@ class DynamicAgentDiscovery:
         description += f"Specialized in: {agent.action}. "
         description += f"Recipe contains {len(agent.recipe)} steps. "
 
-        if agent.can_perform_without_user_input == "yes":
+        if agent.is_autonomous:
             description += "Can operate autonomously. "
 
         if agent.fallback_action:

@@ -569,6 +569,22 @@ def autonomy_needs_user(value):
     return str(value or '').strip().lower().startswith('no')
 
 
+def action_is_autonomous(value):
+    """True when a ``can_perform_without_user_input`` value lets the action
+    run without the user: an explicit 'yes', ignoring case and surrounding
+    space.  Missing, None, 'no' and 'no - <reason>' are all False, so an
+    action the recipe does not clearly mark is never auto-driven.  Not the
+    negation of autonomy_needs_user: a missing value is neither.
+
+    One rule for every reader (REUSE's session reader and both of its
+    state_transitions, CREATE's timer paths, the A2A agent card).  Those were
+    five-plus private ``== 'yes'`` compares, raw or strip().lower(); every
+    value in the banked recipes (census 2026-09-26: 'yes', 'no', missing,
+    None, 'no - ...') gets the same answer from each.  Guarded by
+    tests/unit/test_is_autonomous_is_one_rule.py."""
+    return str(value or '').strip().lower() == 'yes'
+
+
 # ── No-progress stall guard for the CREATE loop ───────────────────────────
 # create_recipe.get_response_group's main loop can spin to its 300-iteration
 # cap (~25 min of wasted compute, observed live) when an action sits in a

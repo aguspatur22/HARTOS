@@ -246,7 +246,7 @@ from hartos.lifecycle_hooks import (
     debug_lifecycle_status,
     ActionState,
     get_action_state, safe_set_state, force_state_through_valid_path, is_terminal_state,
-    autonomy_needs_user,
+    autonomy_needs_user, action_is_autonomous,
     lifecycle_hook_track_status_verification_request,
     lifecycle_hook_track_fallback_request,
     lifecycle_hook_track_recipe_request,
@@ -632,7 +632,7 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
             break
         _check_action = time_actions[user_prompt].get_action_byaction_id(action_entry_point)
         current_app.logger.info(f'checking can_perform_without_user_input from {_check_action} ')
-        if _check_action and _check_action.get('can_perform_without_user_input') == 'yes':
+        if _check_action and action_is_autonomous(_check_action.get('can_perform_without_user_input')):
             restart = True
             text = 'You can assume things on your own to complete this task'
             result = chat_instructor.initiate_chat(time_manager, message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
@@ -3547,7 +3547,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
                     return chat_instructor1
 
                 currentaction_id = last_json['action_id']
-                if final_recipe[prompt_id]['actions'][currentaction_id-1]['can_perform_without_user_input'] == 'yes':
+                if action_is_autonomous(final_recipe[prompt_id]['actions'][currentaction_id-1]['can_perform_without_user_input']):
                     return time_agent
         except Exception as e:
             current_app.logger.error(f'Got Error while getting json for current actionid: {e}')

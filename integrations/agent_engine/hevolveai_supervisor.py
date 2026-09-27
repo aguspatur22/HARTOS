@@ -322,21 +322,43 @@ _CHILD_TORCH_OK: Optional[bool] = None
 # find_spec passed and the child then died reading torch/__init__.py with
 # PermissionError, 5x per breaker window.  Opening the resolved origin is
 # the read the child's import does first; it proves that without paying
-# for a full torch import.  Exit 3 = not found, 4 = found but unreadable
-# (origin + errno printed for the supervisor's log).
+# for a full torch import.
+#
+# A torch/ directory with no __init__.py (an empty leftover of an
+# uninstall) is a namespace package: find_spec returns it with origin None,
+# so there is no file to open, and ``import torch`` yields an empty module
+# the brain's first ``torch.<attr>`` dies on -- the same crash loop
+# (review of 865130b86).  A real torch is a regular package, so a spec
+# without an origin fails the gate.
+#
+# The probe's exit codes, named; each failing one prints its detail
+# (path, errno) for the supervisor's log.
+TORCH_PROBE_EXIT_NOT_FOUND = 3       # find_spec('torch') is None
+TORCH_PROBE_EXIT_UNREADABLE = 4      # found, torch/__init__.py cannot be read
+TORCH_PROBE_EXIT_NOT_A_PACKAGE = 5   # found only as a namespace dir
+TORCH_PROBE_EXIT_REASONS = {
+    TORCH_PROBE_EXIT_NOT_FOUND: 'not found',
+    TORCH_PROBE_EXIT_UNREADABLE: 'not readable',
+    TORCH_PROBE_EXIT_NOT_A_PACKAGE: 'not a package',
+}
 _TORCH_PROBE_SNIPPET = (
     "import importlib.util as u, sys\n"
     "s = u.find_spec('torch')\n"
     "if s is None:\n"
-    "    print('torch not found'); sys.exit(3)\n"
-    "if s.origin and s.has_location:\n"
-    "    try:\n"
-    "        open(s.origin, 'rb').close()\n"
-    "    except OSError as e:\n"
-    "        print('torch at %s is not readable: errno %s %s'"
-    " % (s.origin, e.errno, e.strerror)); sys.exit(4)\n"
-    "print('torch at %s' % s.origin)\n"
-)
+    "    print('torch not found'); sys.exit(%(not_found)d)\n"
+    "if not (s.origin and s.has_location):\n"
+    "    print('torch at %%s is not a package (no __init__.py)'"
+    " %% ', '.join(s.submodule_search_locations or []));"
+    " sys.exit(%(not_a_package)d)\n"
+    "try:\n"
+    "    open(s.origin, 'rb').close()\n"
+    "except OSError as e:\n"
+    "    print('torch at %%s is not readable: errno %%s %%s'"
+    " %% (s.origin, e.errno, e.strerror)); sys.exit(%(unreadable)d)\n"
+    "print('torch at %%s' %% s.origin)\n"
+) % {'not_found': TORCH_PROBE_EXIT_NOT_FOUND,
+     'unreadable': TORCH_PROBE_EXIT_UNREADABLE,
+     'not_a_package': TORCH_PROBE_EXIT_NOT_A_PACKAGE}
 
 
 def _child_can_import_torch() -> bool:
@@ -362,8 +384,9 @@ def _child_can_import_torch() -> bool:
 
     One short, cached subprocess per process (``_TORCH_PROBE_SNIPPET``:
     find_spec, then open the resolved ``torch/__init__.py`` -- does not
-    load torch).  A torch the child finds but cannot read fails the gate
-    and the log names the file and errno.  Conservative: any probe failure / timeout ->
+    load torch).  A torch the child finds but cannot read, or finds only
+    as an empty namespace dir, fails the gate, and the log names the
+    exit code's reason (``TORCH_PROBE_EXIT_REASONS``), the file and errno.  Conservative: any probe failure / timeout ->
     unavailable, so a flaky probe never starts a crash-looping child.
     macOS incident 2026-06-16: the post-build ``Nunba --validate`` smoke
     test spawned this brain, which crash-looped on ``import torch`` (torch
@@ -390,6 +413,10 @@ def _child_can_import_torch() -> bool:
         )
         verdict = (res.returncode == 0 and not res.timed_out)
         _detail = (res.stdout or res.stderr or '').strip()[-500:]
+        _reason = TORCH_PROBE_EXIT_REASONS.get(res.returncode)
+        if not verdict and _reason:
+            _detail = f'exit {res.returncode}: {_reason}' + (
+                f'; {_detail}' if _detail else '')
     except Exception as e:  # FileNotFoundError / OSError / anything
         logger.warning(
             "hevolveai_supervisor: torch probe failed (%s); treating torch "

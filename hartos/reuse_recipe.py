@@ -351,6 +351,7 @@ from hartos.lifecycle_hooks import (
     ActionState, safe_set_state, force_state_through_valid_path, get_action_state,
     clear_action_states, settled_action_id, commit_verified_action_completion,
     dispatch_action_id, ACTION_STATES_AWAITING_USER, autonomy_needs_user,
+    action_is_autonomous,
 )
 from hartos.cultural_wisdom import get_cultural_prompt
 
@@ -3061,7 +3062,8 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                     _known_aid = user_tasks[user_prompt].current_action
                     _cp_yes = False
                     try:
-                        _cp_yes = individual_recipe[_known_aid - 1]['can_perform_without_user_input'] == 'yes'
+                        _cp_yes = action_is_autonomous(
+                            individual_recipe[_known_aid - 1]['can_perform_without_user_input'])
                     except (IndexError, KeyError):
                         pass
 
@@ -3220,7 +3222,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                 # Use known pipeline state, not LLM's claimed action_id
                 _timer_aid = time_actions[user_prompt].current_action
                 try:
-                    if final_recipe[prompt_id]['actions'][_timer_aid - 1]['can_perform_without_user_input'] == 'yes':
+                    if action_is_autonomous(final_recipe[prompt_id]['actions'][_timer_aid - 1]['can_perform_without_user_input']):
                         return time_agent
                 except (IndexError, KeyError):
                     pass
@@ -4140,9 +4142,10 @@ def _reuse_action_is_autonomous(user_prompt, action_id):
 
     Reads the same ``can_perform_without_user_input`` field the recipe author
     writes and the prompt at L1296 instructs the model to honour.  Absent or
-    unparseable -> False, so an unknown action is never auto-advanced.
+    unparseable -> False, so an unknown action is never auto-advanced.  The
+    rule is lifecycle_hooks.action_is_autonomous, shared with every reader.
     """
-    return _reuse_action_autonomy(user_prompt, action_id) == 'yes'
+    return action_is_autonomous(_reuse_action_autonomy(user_prompt, action_id))
 
 
 def _reuse_action_autonomy(user_prompt, action_id):
