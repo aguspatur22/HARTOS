@@ -1,4 +1,7 @@
-"""A test run never reads or writes the owner's real node identity.
+"""A test run never reads or writes the owner's real data root.
+
+The identity (node_id.json, keys) was the first casualty; the coding
+benchmark DB was the second (see the bottom of this file).
 
 On 2026-09-23 an uncommitted identity change ran under test and replaced the
 owner's desktop node_id.json (46329c87, the id central had verified) with a
@@ -33,7 +36,7 @@ def decoy_home(tmp_path, monkeypatch):
     for var in _OVERRIDES:
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(pp, '_cached_data_dir', None)
-    monkeypatch.setattr(pp, '_pytest_identity_dir', None)
+    monkeypatch.setattr(pp, '_pytest_data_dir', None)
     real_root = pp._platform_default_data_dir()
     assert real_root.startswith(str(home)), real_root
     return real_root
@@ -107,6 +110,56 @@ def test_outside_pytest_the_real_root_is_used(decoy_home):
     code = ('import sys, core.platform_paths as pp; '
             'assert "pytest" not in sys.modules; '
             'print(pp.get_identity_data_dir() == pp._platform_default_data_dir())')
+    env = {k: v for k, v in os.environ.items() if k not in _OVERRIDES}
+    out = subprocess.run([sys.executable, '-c', code], cwd=_REPO, env=env,
+                         capture_output=True, text=True, timeout=60)
+
+    assert out.stdout.strip() == 'True', out.stderr
+
+
+# ── The whole data root, not only the identity ──────────────────────────────
+# a4ea04651 moved coding_benchmarks.db to get_agent_data_dir(). The identity
+# guard covered get_identity_data_dir only, so test_autoresearch's
+# test_record_benchmark_no_crash_on_failure wrote
+# ('autoresearch', 'aider_native_backend', 'score', ..., 0.0, 0) into the
+# owner's live DB on 2026-09-27 (three rows by 18:09). get_best_tool learns a
+# 0% success rate from five of those, and export_learning_delta ships them to
+# hive peers.
+
+def test_a_default_benchmark_tracker_never_writes_under_the_real_root(decoy_home):
+    from integrations.coding_agent.benchmark_tracker import BenchmarkTracker
+
+    tracker = BenchmarkTracker()
+    tracker.record('autoresearch', 'aider_native_backend', 0.0, False,
+                   model_name='score', user_id='hermetic_probe')
+
+    real = os.path.normcase(os.path.abspath(decoy_home))
+    assert not os.path.normcase(os.path.abspath(tracker._db_path)).startswith(real)
+    assert os.path.isfile(tracker._db_path)
+    written = [os.path.join(d, f) for d, _, fs in os.walk(decoy_home) for f in fs]
+    assert written == []
+    assert tracker.get_summary()['total_benchmarks'] == 1
+
+
+def test_every_data_root_resolver_is_off_the_real_root(decoy_home):
+    real = os.path.normcase(os.path.abspath(decoy_home))
+    for resolve in (pp.get_data_dir, pp.get_db_dir, pp.get_agent_data_dir,
+                    pp.get_db_path, pp.get_prompts_dir, pp.get_uploads_dir,
+                    pp.get_memory_graph_dir, pp.get_simplemem_dir,
+                    pp.get_identity_data_dir):
+        got = os.path.normcase(os.path.abspath(resolve()))
+        assert not got.startswith(real), (resolve.__name__, got)
+
+
+def test_identity_and_data_share_one_root(decoy_home):
+    # One guard: the identity root IS the data root, swapped or not.
+    assert pp.get_identity_data_dir() == pp.get_data_dir()
+
+
+def test_outside_pytest_the_data_root_is_the_real_one(decoy_home):
+    code = ('import sys, core.platform_paths as pp; '
+            'assert "pytest" not in sys.modules; '
+            'print(pp.get_data_dir() == pp._platform_default_data_dir())')
     env = {k: v for k, v in os.environ.items() if k not in _OVERRIDES}
     out = subprocess.run([sys.executable, '-c', code], cwd=_REPO, env=env,
                          capture_output=True, text=True, timeout=60)

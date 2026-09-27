@@ -424,25 +424,37 @@ class TestCreditServedCompute:
 class TestSpendSparkIsAtomic:
 
     def test_a_stale_balance_cannot_spend_twice(self, db_factory):
-        """Session A loads the wallet (10 Spark).  Session B spends the 10 and
-        commits.  A's spend must see the database, not its stale copy: the
-        read-then-write version let both succeed from one balance."""
+        """This session read the wallet at 10 Spark; another writer then
+        spent it (a raw UPDATE, which leaves this session's copy at 10, as a
+        concurrent MySQL transaction would).  The spend must check the
+        database, not the stale copy: read-then-write debited 10 again from a
+        balance of 0 and reported success."""
+        from sqlalchemy import text
         from integrations.social.resonance_engine import ResonanceService
         _seed(db_factory, requester_spark=10)
-        a = db_factory()
+        db = db_factory()
         try:
-            ResonanceService.get_or_create_wallet(a, REQUESTER)
-            b = db_factory()
-            ok_b, _ = ResonanceService.spend_spark(b, REQUESTER, 10, 't')
-            b.commit()
-            b.close()
-            ok_a, left = ResonanceService.spend_spark(a, REQUESTER, 10, 't')
-            a.commit()
+            wallet = ResonanceService.get_or_create_wallet(db, REQUESTER)
+            assert wallet.spark == 10
+            db.execute(text("UPDATE resonance_wallets SET spark = 0 "
+                            "WHERE user_id = :u"), {'u': REQUESTER})
+            ok, left = ResonanceService.spend_spark(db, REQUESTER, 10, 't')
+            db.commit()
         finally:
-            a.close()
-        assert ok_b is True
-        assert ok_a is False and left == 0
+            db.close()
+        assert ok is False and left == 0
         assert _spark(db_factory, REQUESTER) == 0
+
+    def test_a_funded_spend_still_debits_and_logs(self, db_factory):
+        from integrations.social.resonance_engine import ResonanceService
+        _seed(db_factory, requester_spark=10)
+        with _session(db_factory) as db:
+            assert ResonanceService.spend_spark(db, REQUESTER, 4, 't') == (True, 6)
+        with _session(db_factory) as db:
+            txns = db.query(ResonanceTransaction).filter_by(
+                user_id=REQUESTER, source_type='t').all()
+        assert [(t.amount, t.balance_after) for t in txns] == [(-4, 6)]
+        assert _spark(db_factory, REQUESTER) == 6
 
 
 # ─── the exits and the two halves agree ───

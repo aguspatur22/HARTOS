@@ -1115,7 +1115,8 @@ class ResourceGovernor:
                 from core.foreground import session_marker_dir
                 marker_dir = session_marker_dir()
             except Exception:
-                pass
+                logger.debug('session marker dir unresolved; using the '
+                             'default input-alive path', exc_info=True)
             # The literal, not a join: on a Windows dev box os.path.join would
             # put a backslash into a Linux path the tests pin verbatim.
             marker = (os.path.join(marker_dir, 'input-alive') if marker_dir
@@ -1438,8 +1439,8 @@ class ResourceGovernor:
                         return fh.read().strip() == '1'
                 except OSError:
                     continue
-        except OSError:
-            pass
+        except OSError as e:
+            logger.debug('power_supply sysfs unreadable: %s', e)
         return None
 
     def _get_battery_status(self) -> tuple:

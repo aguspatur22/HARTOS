@@ -34,25 +34,20 @@ def get_data_dir() -> str:
         1. NUNBA_DATA_DIR env var (explicit override)
         2. HARTOS_DATA_DIR env var (embedded OS / custom deployment)
         3. Platform default
+
+    Under pytest a result that is the owner's real data root is swapped for
+    a per-process temp dir; see _off_the_real_root_under_test.
     """
     global _cached_data_dir
     if _cached_data_dir is not None:
         return _cached_data_dir
 
-    # 1. Explicit override
-    override = os.environ.get('NUNBA_DATA_DIR', '').strip()
-    if override:
-        _cached_data_dir = override
-        return _cached_data_dir
-
-    # 2. HARTOS OS deployment override
-    hartos_dir = os.environ.get('HARTOS_DATA_DIR', '').strip()
-    if hartos_dir:
-        _cached_data_dir = hartos_dir
-        return _cached_data_dir
-
-    # 3 + 4. Embedded HARTOS OS, else the platform default
-    _cached_data_dir = _platform_default_data_dir()
+    # 1. Explicit override, 2. HARTOS OS deployment override,
+    # 3 + 4. embedded HARTOS OS, else the platform default.
+    resolved = (os.environ.get('NUNBA_DATA_DIR', '').strip()
+                or os.environ.get('HARTOS_DATA_DIR', '').strip()
+                or _platform_default_data_dir())
+    _cached_data_dir = _off_the_real_root_under_test(resolved)
     return _cached_data_dir
 
 
@@ -73,41 +68,61 @@ def _platform_default_data_dir() -> str:
     return os.path.join(home, '.config', 'nunba')
 
 
-_pytest_identity_dir = None
+_pytest_data_dir = None
 
 
-def get_identity_data_dir() -> str:
-    """Data root for this node's identity: node_id and key material.
+def _off_the_real_root_under_test(data_dir: str) -> str:
+    """`data_dir`, or a per-process temp dir when a test would use the owner's
+    real data root.
 
-    Same as get_data_dir(), except under pytest when that resolves to the
-    owner's real data root. A test run then gets a per-process temp dir.
+    The ONE test guard for everything under the data root: identity, keys,
+    databases, recipes, logs. Every resolver in this module goes through
+    get_data_dir, so each writer that asks this module for a path is covered,
+    including ones added later.
 
     Importing integrations.social.peer_discovery builds a GossipProtocol at
     module level, which reads and can write node_id.json. On 2026-09-23 an
     uncommitted identity change ran that code under test and replaced the
     owner's desktop id (46329c87, the one central had verified) with a fresh
-    one. A test that points the data dir somewhere of its own (monkeypatch,
+    one. On 2026-09-27 a test wrote fake autoresearch rows into the owner's
+    agent_data/coding_benchmarks.db, which get_best_tool learns from and
+    export_learning_delta sends to hive peers; the guard then covered the
+    identity alone.
+
+    A test that points the data dir somewhere of its own (monkeypatch,
     NUNBA_DATA_DIR to a tmp path) is left alone; only the real root is
     swapped out. Same shape as models.py's DB_PATH guard (828562872).
 
     Residual: the test is "pytest is imported", so a production process that
-    imported pytest would run on a temp identity. No shipped module does;
-    tests/unit/test_identity_is_hermetic.py fails if one starts to.
+    imported pytest would run on a temp data root, removed at exit. No shipped
+    HARTOS module imports it (tests/unit/test_identity_is_hermetic.py fails if
+    one starts to), but the frozen Nunba bundle does ship pytest in lib/.
+    A writer that builds ~/Documents/Nunba itself instead of asking this
+    module is not covered.
     """
-    global _pytest_identity_dir
-    data_dir = get_data_dir()
+    global _pytest_data_dir
     if 'pytest' not in sys.modules:
         return data_dir
     real = os.path.normcase(os.path.abspath(_platform_default_data_dir()))
     if os.path.normcase(os.path.abspath(data_dir)) != real:
         return data_dir
-    if _pytest_identity_dir is None:
+    if _pytest_data_dir is None:
         import atexit
         import shutil
         import tempfile
-        _pytest_identity_dir = tempfile.mkdtemp(prefix='hartos_test_identity_')
-        atexit.register(shutil.rmtree, _pytest_identity_dir, ignore_errors=True)
-    return _pytest_identity_dir
+        _pytest_data_dir = tempfile.mkdtemp(prefix='hartos_test_data_')
+        atexit.register(shutil.rmtree, _pytest_data_dir, ignore_errors=True)
+    return _pytest_data_dir
+
+
+def get_identity_data_dir() -> str:
+    """Data root for this node's identity: node_id and key material.
+
+    The data root itself. The name stays because the identity callers
+    (peer_discovery, node_integrity) and their tests use it; the test guard
+    lives in get_data_dir, once.
+    """
+    return get_data_dir()
 
 
 def get_db_dir() -> str:
@@ -386,30 +401,4 @@ def cleanup_old_logs(max_age_days: int = 7, max_total_mb: int = 50):
             total_bytes -= sz
             deleted += 1
         except OSError:
-            pass
-
-    if deleted:
-        import logging
-        logging.getLogger('hevolve.platform').info(
-            f"Log cleanup: deleted {deleted} old log files from {log_dir}")
-
-
-def ensure_data_dirs():
-    """Create all standard data directories if they don't exist.
-
-    Also runs log cleanup on startup to prevent unbounded log accumulation.
-    """
-    for d in [get_db_dir(), get_agent_data_dir(), get_prompts_dir(),
-              get_log_dir(), get_memory_graph_dir(), get_simplemem_dir()]:
-        os.makedirs(d, exist_ok=True)
-    # Clean old logs on every startup (safe — worst case is a no-op)
-    try:
-        cleanup_old_logs(max_age_days=7, max_total_mb=50)
-    except Exception:
-        pass
-
-
-def reset_cache():
-    """Reset the cached data dir (useful for testing)."""
-    global _cached_data_dir
-    _cached_data_dir = None
+    

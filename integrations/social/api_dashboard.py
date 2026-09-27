@@ -15,6 +15,8 @@ import time
 
 from flask import Blueprint, jsonify, request, make_response
 
+from .auth import require_local_or_auth
+
 logger = logging.getLogger('hevolve_social')
 
 dashboard_bp = Blueprint('social_dashboard', __name__)
@@ -552,15 +554,41 @@ def steer_cancel(agent_id):
 
 # ─── Agent Ops Console (Phase D: operator inject) ────────────────────────
 
+def _steering_caller():
+    """Who is calling, for dashboard_service.may_steer.
+
+    Runs under require_local_or_auth: a remote caller is the user its token
+    names (g.user); a loopback caller is this desktop's owner,
+    HEVOLVE_OWNER_USER_ID -- the identity the camera, screen, computer-use
+    and credential asks all go to.  Nothing a request body says is identity.
+    """
+    from flask import g
+    from .dashboard_service import SteeringCaller
+    user = getattr(g, 'user', None)
+    if user is not None:
+        from .auth import holds_central_role
+        return SteeringCaller(user_id=str(user.id),
+                              is_admin=holds_central_role(user),
+                              is_local=False)
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    return SteeringCaller(user_id=owner or None, is_admin=False, is_local=True)
+
+
 @dashboard_bp.route(
     '/api/social/dashboard/agents/<agent_id>/inject',
     methods=['POST'],
 )
+@require_local_or_auth
 def inject_into_groupchat(agent_id):
     """Inject an operator instruction into the agent's live GroupChat.
 
     Body: ``{"instruction": <str>, "actor_id": <str>?}``.  Returns
     ``{ok: bool, message_index: int|null, error: str|null}``.
+
+    Only a caller dashboard_service.may_steer admits (the goal's owner, an
+    admin, or this machine for a goal no human owns): 401 for a remote
+    caller without a token, 403 for anyone else.  ``actor_id`` is a label
+    for the audit line and the GroupChat message name, never identity.
 
     Returns 400 when the GroupChat is not registered (process restart,
     8h TTL eviction, or /chat never ran for this agent in this process).
@@ -577,8 +605,10 @@ def inject_into_groupchat(agent_id):
     db = get_db()
     try:
         result = inject_instruction(db, agent_id, instruction,
-                                    actor_id=actor_id)
-        status = 200 if result.get('ok') else 400
+                                    actor_id=actor_id,
+                                    caller=_steering_caller())
+        status = (200 if result.get('ok')
+                  else 403 if result.get('forbidden') else 400)
         return jsonify({'success': result.get('ok'),
                         'data': result}), status
     except Exception as e:

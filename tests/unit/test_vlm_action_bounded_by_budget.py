@@ -131,6 +131,24 @@ class TestTheBudgetBoundsTheActionInFlight:
                  if r.name == 'hevolve.vlm.local_loop']
         assert any('open_file_gui' in m and 'budget' in m for m in lines), lines
 
+    def test_a_timeout_after_two_failures_is_still_called_a_timeout(self, stuck_tool):
+        """The third failure in a row would otherwise trip the
+        3-consecutive-errors exit and report 'action_error', hiding that the
+        run was cut off by its budget."""
+        calls = []
+
+        def _execute(action, tier, **kw):
+            calls.append(1)
+            if len(calls) < 3:
+                return {'output': '', 'error': 'window not found'}
+            return stuck_tool(action, tier, **kw)
+
+        with patch('integrations.vlm.local_loop.time.sleep'):
+            result, elapsed, _ = _run_loop(_execute)
+        assert len(calls) == 3
+        assert result['exit_reason'] == 'timeout'
+        assert elapsed < BUDGET_S + MARGIN_S
+
     def test_no_budget_left_means_the_action_never_starts(self):
         """The VLM call itself can spend the rest of the budget; the action
         must then not fire on the owner's machine after the deadline."""

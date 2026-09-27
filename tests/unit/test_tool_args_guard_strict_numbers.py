@@ -148,12 +148,26 @@ class StrictNumbers(unittest.TestCase):
         self.assertIs(type(parsed['n']), int)
 
     def test_repair_quotes_only_whole_overflowing_tokens(self):
-        # Unquoted keys and words: a number that is part of a word stays in
-        # the word, and one in a list is quoted like one in an object.
+        # Unquoted words: a number that is part of a word stays in the word,
+        # and one in a list is quoted like one in an object.  One call per
+        # case: json_repair reads an unquoted value up to the next colon, so
+        # several unquoted words in one object blur into each other.
+        for text, expected in (
+                ('{v: 1e999}', {'v': '1e999'}),
+                ('{k: a1e999}', {'k': 'a1e999'}),
+                ('{k: x.1e999}', {'k': 'x.1e999'}),
+                ('{w: 1e999abc}', {'w': '1e999abc'}),
+                ("{'a': [1e999, 2], 'b': 1.5}", {'a': ['1e999', 2], 'b': 1.5})):
+            with self.subTest(text=text):
+                out = _out_args(ensure_tool_call_arguments_json(_call(text)))
+                self.assertEqual(_strict_loads(out), expected)
+
+    def test_repair_skips_an_escaped_quote_inside_a_string(self):
+        # The escaped quote does not end the string, so the overflow-looking
+        # text after it stays text.
         out = _out_args(ensure_tool_call_arguments_json(
-            _call('{v: 1e999, k: a1e999, w: 1e999abc, a: [1e999, 2]}')))
-        self.assertEqual(_strict_loads(out), {'v': '1e999', 'k': 'a1e999',
-                                              'w': '1e999abc', 'a': ['1e999', 2]})
+            _call("{'note': 'it\\'s 1e999', 'v': 1e999}")))
+        self.assertEqual(_strict_loads(out), {'note': "it's 1e999", 'v': '1e999'})
 
     def test_repair_leaves_an_overflow_inside_curly_quotes_alone(self):
         out = _out_args(ensure_tool_call_arguments_json(

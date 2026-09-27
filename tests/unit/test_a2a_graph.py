@@ -265,11 +265,17 @@ def test_steer_missing_agent_returns_error(monkeypatch):
 
 # ─── inject_instruction ───────────────────────────────────────────────
 
+def _OWNER(ds):
+    """The goal's owner (_make_goal's owner_id): who may steer it.
+    Who may NOT is tests/unit/test_inject_requires_goal_owner.py."""
+    return ds.SteeringCaller(user_id='user-42')
+
+
 def test_inject_rejects_empty_instruction(monkeypatch):
     ds = pytest.importorskip('integrations.social.dashboard_service')
     fake_db = _install_fake_models(monkeypatch, goal=_make_goal())
 
-    out = ds.inject_instruction(fake_db, 'agent-1', '   ')
+    out = ds.inject_instruction(fake_db, 'agent-1', '   ', caller=_OWNER(ds))
     assert out['ok'] is False
     assert 'empty' in out['error']
 
@@ -280,7 +286,8 @@ def test_inject_no_groupchat_registered(monkeypatch):
     monkeypatch.setitem(sys.modules, 'hartos.lifecycle_hooks',
                         SimpleNamespace(get_registered_groupchat=lambda key: None))
 
-    out = ds.inject_instruction(fake_db, 'agent-1', 'retry now')
+    out = ds.inject_instruction(fake_db, 'agent-1', 'retry now',
+                                caller=_OWNER(ds))
     assert out['ok'] is False
     assert 'no live GroupChat' in out['error']
 
@@ -298,7 +305,7 @@ def test_inject_appends_to_groupchat_and_audits(monkeypatch):
     captured = _install_fake_audit(monkeypatch)
 
     out = ds.inject_instruction(fake_db, 'agent-1', 'switch to cloud',
-                                actor_id='alice')
+                                actor_id='alice', caller=_OWNER(ds))
 
     assert out['ok'] is True
     assert out['message_index'] == 1
@@ -314,7 +321,7 @@ def test_inject_missing_agent_returns_error(monkeypatch):
     ds = pytest.importorskip('integrations.social.dashboard_service')
     fake_db = _install_fake_models(monkeypatch, goal=None)
 
-    out = ds.inject_instruction(fake_db, 'nope', 'hi')
+    out = ds.inject_instruction(fake_db, 'nope', 'hi', caller=_OWNER(ds))
     assert out['ok'] is False
     assert 'not found' in out['error']
 

@@ -25,6 +25,16 @@ logger = logging.getLogger(__name__)
 # A2A Protocol Version
 A2A_PROTOCOL_VERSION = "0.2.6"
 
+import os as _os
+
+# The task table is bounded (review finding M5: it grew by one entry per
+# message/send and was never pruned).  A FINISHED task is kept this long
+# after its last update so its caller can read the verdict, and past
+# _TASK_MAX entries the oldest finished tasks go first.  A task still
+# running is never evicted: its caller may be polling it.
+_TASK_TTL_S = float(_os.environ.get('HEVOLVE_A2A_TASK_TTL_S', '600'))
+_TASK_MAX = int(_os.environ.get('HEVOLVE_A2A_TASK_MAX', '1024'))
+
 
 class TaskState(str, Enum):
     """A2A Task lifecycle states"""
@@ -88,6 +98,11 @@ class A2ATask:
         self.updated_at = datetime.now()
         self.result = None
         self.error = None
+        # The identity admitted for its message/send ('peer:<node_id>',
+        # 'user:<id>', 'api_key', 'addr:<ip>'); message/get and task/cancel
+        # answer only that caller.  None: no identity was given (a direct,
+        # in-process caller), and then any caller is answered, as before.
+        self.owner = None
         # Set by task/cancel.  The executor reads it (when it takes a
         # cancel_event) to give the LLM permit back before its turn starts.
         self.cancel_event = threading.Event()
@@ -139,8 +154,39 @@ class A2AMessageHandler:
         """
         self.agent_executor = agent_executor_func
         self.tasks: Dict[str, A2ATask] = {}
+        self._tasks_lock = threading.Lock()
 
-    async def handle_message_send(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    def _prune(self) -> None:
+        """Evict finished tasks past _TASK_TTL_S, then the oldest finished
+        ones while the table is over _TASK_MAX.  Running tasks stay."""
+        open_states = (TaskState.SUBMITTED, TaskState.WORKING)
+        now = datetime.now()
+        with self._tasks_lock:
+            done = [(t.updated_at, tid) for tid, t in self.tasks.items()
+                    if t.state not in open_states]
+            for updated, tid in done:
+                if (now - updated).total_seconds() > _TASK_TTL_S:
+                    self.tasks.pop(tid, None)
+            if len(self.tasks) > _TASK_MAX:
+                for updated, tid in sorted(done):
+                    if len(self.tasks) <= _TASK_MAX:
+                        break
+                    self.tasks.pop(tid, None)
+
+    def _task_for(self, task_id, caller):
+        """The task, when ``caller`` may see it; else None.  A task bound to
+        another caller reads as absent: its existence is not disclosed."""
+        task = self.tasks.get(task_id)
+        if task is None:
+            return None
+        if task.owner is not None and task.owner != caller:
+            logger.info(f"A2A task {str(task_id)[:12]}: refused to "
+                        f"{caller!r} (bound to another caller)")
+            return None
+        return task
+
+    async def handle_message_send(self, params: Dict[str, Any],
+                                  caller: Optional[str] = None) -> Dict[str, Any]:
         """
         Handle message/send JSON-RPC method
 
@@ -164,9 +210,17 @@ class A2AMessageHandler:
             if part.get("kind", part.get("type")) == "text":
                 message_text += part.get("text", "")
 
-        # Create task
+        # Create task, bound to the caller that was admitted for it.
         task = A2ATask(task_id=message_id, message=message, context_id=context_id)
-        self.tasks[message_id] = task
+        task.owner = caller
+        with self._tasks_lock:
+            existing = self.tasks.get(message_id)
+            if existing is not None and existing.owner != caller:
+                # Another caller's messageId: never overwrite its task.
+                message_id = str(uuid.uuid4())
+                task.task_id = message_id
+            self.tasks[message_id] = task
+        self._prune()
 
         # configuration.blocking (A2A MessageSendParams): false returns the
         # task now and runs it on a thread of its own; the caller polls
@@ -218,7 +272,8 @@ class A2AMessageHandler:
             logger.error(f"A2A task {message_id} failed: {e}")
             task.update_state(TaskState.FAILED, error=str(e))
 
-    async def handle_message_get(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def handle_message_get(self, params: Dict[str, Any],
+                                 caller: Optional[str] = None) -> Dict[str, Any]:
         """
         Handle message/get JSON-RPC method
 
@@ -229,19 +284,18 @@ class A2AMessageHandler:
             Task status
         """
         task_id = params.get("taskId")
-
-        if task_id not in self.tasks:
+        task = self._task_for(task_id, caller)
+        if task is None:
             return {
                 "error": {
                     "code": -32602,
                     "message": f"Task {task_id} not found"
                 }
             }
-
-        task = self.tasks[task_id]
         return task.to_dict()
 
-    async def handle_task_cancel(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def handle_task_cancel(self, params: Dict[str, Any],
+                                 caller: Optional[str] = None) -> Dict[str, Any]:
         """
         Handle task/cancel JSON-RPC method
 
@@ -252,16 +306,14 @@ class A2AMessageHandler:
             Cancellation confirmation
         """
         task_id = params.get("taskId")
-
-        if task_id not in self.tasks:
+        task = self._task_for(task_id, caller)
+        if task is None:
             return {
                 "error": {
                     "code": -32602,
                     "message": f"Task {task_id} not found"
                 }
             }
-
-        task = self.tasks[task_id]
 
         # Only cancel if not already completed/failed
         if task.state in [TaskState.SUBMITTED, TaskState.WORKING]:
@@ -279,6 +331,28 @@ class A2AMessageHandler:
                     "message": f"Cannot cancel task in state {task.state}"
                 }
             }
+
+
+def _gate_caller() -> str:
+    """Who the /chat gate admitted for THIS request, as a task owner: the
+    signed-in user (a JWT or an owner-allowed device token), the API-key
+    holder, else the client address (core.auth_local.client_address; a
+    desktop's own callers and LAN-trusted tiers carry no other identity)."""
+    try:
+        from flask import g
+        payload = getattr(g, 'jwt_payload', None) or {}
+        uid = payload.get('user_id') or payload.get('sub')
+        if uid:
+            return f'user:{uid}'
+    except Exception:
+        pass
+    if request.headers.get('X-API-Key'):
+        return 'api_key'
+    try:
+        from core.auth_local import client_address
+        return f'addr:{client_address() or request.remote_addr or ""}'
+    except Exception:
+        return f'addr:{request.remote_addr or ""}'
 
 
 class A2AProtocolServer:
@@ -335,6 +409,18 @@ class A2AProtocolServer:
         logger.info(f"Registered A2A agent: {agent_id} ({name})")
 
     def _jsonrpc_refusal(self, agent_id, rpc_request):
+        """(http_code, message) when refused, else None; see _admit."""
+        refused, _who = self._admit(agent_id, rpc_request)
+        return refused
+
+    def _admit(self, agent_id, rpc_request):
+        """(refusal, caller): refusal is (http_code, message) or None, and
+        caller the identity admitted (the task owner, M5): 'peer:<node_id>'
+        for a signed peer, else the /chat gate's (_gate_caller)."""
+        refused, who = self._admit_checks(agent_id, rpc_request)
+        return refused, (None if refused else who)
+
+    def _admit_checks(self, agent_id, rpc_request):
         """(http_code, message) when this request may not run the agent, read
         its tasks or cancel them, else None.  Called inside the jsonrpc view's
         request for message/send, message/get and task/cancel.
@@ -358,13 +444,16 @@ class A2AProtocolServer:
         so they take the same admission.  And, like the recipe pull, only an
         agent this node would export is served (peer_reuse.export_allowed).
         Fail closed on any error."""
+        who = None
         try:
             from security.middleware import _apply_api_auth
             refused = _apply_api_auth(self.app, register=False)(as_path='/chat')
         except Exception as e:
             logger.warning(f'A2A jsonrpc auth check failed: {e}')
-            return 503, 'authorization unavailable'
-        if refused is not None:
+            return (503, 'authorization unavailable'), None
+        if refused is None:
+            who = _gate_caller()
+        else:
             body = rpc_request if isinstance(rpc_request, dict) else {}
             if 'signature' in body or 'sender' in body:
                 try:
@@ -376,15 +465,16 @@ class A2AProtocolServer:
                             db, body, audience=SyncEngine.canonical_node_id())
                 except Exception as e:
                     logger.warning(f'A2A peer admission check failed: {e}')
-                    return 503, 'authorization unavailable'
+                    return (503, 'authorization unavailable'), None
                 if peer is None:
                     logger.info(f'A2A {agent_id}: signed request refused ({why})')
-                    return 401, f'peer not admitted: {why}'
+                    return (401, f'peer not admitted: {why}'), None
                 if body.get('agent_id') != agent_id:
                     logger.info(f'A2A {agent_id}: peer {peer[:8]} signed for '
                                 f'{body.get("agent_id")!r}; refused')
-                    return 401, 'peer not admitted: signed for another agent'
+                    return (401, 'peer not admitted: signed for another agent'), None
                 logger.info(f'A2A {agent_id}: admitted peer {peer[:8]}')
+                who = f'peer:{peer}'
             else:
                 resp, status = refused if isinstance(refused, tuple) else (
                     refused, getattr(refused, 'status_code', 401))
@@ -392,16 +482,16 @@ class A2AProtocolServer:
                     error = (resp.get_json(silent=True) or {}).get('error')
                 except Exception:
                     error = None
-                return status, error or 'authentication required to run an agent'
+                return (status, error or 'authentication required to run an agent'), None
         try:
             from .peer_reuse import export_allowed
             prompt_id = agent_id.rsplit('_', 1)[0] if '_' in agent_id else agent_id
             if not export_allowed(prompt_id):
-                return 403, 'agent not shared with peers'
+                return (403, 'agent not shared with peers'), None
         except Exception as e:
             logger.warning(f'A2A jsonrpc export gate failed: {e}')
-            return 503, 'authorization unavailable'
-        return None
+            return (503, 'authorization unavailable'), None
+        return None, who
 
     def setup_routes(self):
         """Setup Flask routes for A2A protocol"""
@@ -520,19 +610,23 @@ class A2AProtocolServer:
                 handler = self.message_handlers[agent_id]
 
                 # Route to appropriate handler
+                caller = None
                 if method in ("message/send", "message/get", "task/cancel"):
-                    refused = self._jsonrpc_refusal(agent_id, rpc_request)
+                    refused, caller = self._admit(agent_id, rpc_request)
                     if refused is not None:
                         code, message = refused
                         return jsonify({"jsonrpc": "2.0", "error": {
                             "code": -32001, "message": message},
                             "id": rpc_id}), code
                 if method == "message/send":
-                    result = run_async(handler.handle_message_send(params))
+                    result = run_async(handler.handle_message_send(
+                        params, caller=caller))
                 elif method == "message/get":
-                    result = run_async(handler.handle_message_get(params))
+                    result = run_async(handler.handle_message_get(
+                        params, caller=caller))
                 elif method == "task/cancel":
-                    result = run_async(handler.handle_task_cancel(params))
+                    result = run_async(handler.handle_task_cancel(
+                        params, caller=caller))
                 else:
                     return jsonify({
                         "jsonrpc": "2.0",

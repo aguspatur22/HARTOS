@@ -606,7 +606,10 @@ def test_task_reads_and_cancels_need_the_same_admission(node, method):
     assert 'result' not in resp
 
 
-def test_an_admitted_peer_reads_a_task(node, invoker):
+def test_an_admitted_peer_cannot_read_the_local_callers_task(node, invoker):
+    """Admission lets a peer ask; the task still answers only the caller
+    that started it (review finding M5: any admitted caller could read or
+    cancel any task by id)."""
     task_id = _run_one_locally(node)
     _admit(invoker.node_id, invoker.public_key)
     body = discovery.signed_peer_request({
@@ -614,7 +617,7 @@ def test_an_admitted_peer_reads_a_task(node, invoker):
         'params': {'taskId': task_id}, 'agent_id': AGENT}, audience=SERVER_ID)
     status, resp = _post(node, body)
     assert status == 200, resp
-    assert resp['result']['state'] == 'completed'
+    assert 'not found' in resp['result']['error']['message'], resp
 
 
 def test_the_local_caller_reads_a_task(node):

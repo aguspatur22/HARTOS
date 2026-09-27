@@ -227,12 +227,14 @@ def _in_process_chat(native_fallback=True, model_config=None):
         from routes.hartos_backend_adapter import chat
         return chat
     except ImportError:
-        pass
+        logger.debug('routes.hartos_backend_adapter not importable; trying '
+                     'the flat adapter module')
     try:
         from hartos_backend_adapter import chat
         return chat
     except ImportError:
-        pass
+        logger.debug('No Nunba backend adapter importable; native /chat '
+                     'fallback=%s', native_fallback)
     return _native_chat if native_fallback else None
 
 
@@ -374,7 +376,7 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
         try:
             _notify_watchdog_llm_end()
         except Exception:
-            pass
+            logger.debug('watchdog LLM-end notify failed', exc_info=True)
 
     result = result or {}
     # The Nunba adapter explicitly stamps an agent-addressed request made
@@ -440,7 +442,7 @@ def mark_user_chat_activity():
         from core.foreground import touch_marker, USER_CHAT_MARKER
         touch_marker(USER_CHAT_MARKER)
     except Exception:
-        pass
+        logger.debug('user-chat marker touch failed', exc_info=True)
 
 
 def _user_chat_marker_recent() -> bool:
@@ -591,7 +593,8 @@ def is_transient_deferral() -> bool:
             if _h and llm_provider_breaker.state(_h) == CircuitState.OPEN:
                 return True
         except Exception:
-            pass
+            logger.debug('provider-breaker check failed in '
+                         'is_transient_deferral', exc_info=True)
         # A goal whose in-flight LLM call was just PREEMPTED for a live user turn
         # (foreground abort / llama_scheduler eviction) is a transient defer too —
         # re-queue it next tick, never count it toward auto-pause.  The user may
@@ -726,7 +729,8 @@ def local_dispatch_provider_breaker_open(model_config=None) -> str:
         if host and llm_provider_breaker.state(host) == CircuitState.OPEN:
             return host
     except Exception:
-        pass
+        logger.debug('provider-breaker check failed; not blocking the '
+                     'dispatch', exc_info=True)
     return ''
 
 
@@ -826,7 +830,7 @@ def should_yield_to_user() -> bool:
         if foreground_active():
             reason = 'foreground_request'
     except Exception:
-        pass
+        logger.debug('yield gate: foreground check failed', exc_info=True)
     # Reason #1 — user recently active (is_user_recently_active stays the
     # single source; we only LABEL which sub-condition fired).
     if reason is None:
@@ -835,7 +839,8 @@ def should_yield_to_user() -> bool:
                 reason = ('create_in_flight' if _active_create_sessions > 0
                           else 'user_active')
         except Exception:
-            pass
+            logger.debug('yield gate: user-activity check failed',
+                         exc_info=True)
     # Reason #2 — LLM throttle collapsed under VRAM/CPU pressure.
     if reason is None:
         try:
@@ -846,7 +851,8 @@ def should_yield_to_user() -> bool:
             if callable(_present) and _present() is True:
                 reason = 'user_present'
         except Exception:
-            pass
+            logger.debug('yield gate: user-presence check failed',
+                         exc_info=True)
     if reason is None:
         try:
             from integrations.service_tools.model_lifecycle import (
@@ -855,7 +861,8 @@ def should_yield_to_user() -> bool:
             if _pressure.get('throttle_factor', 1.0) < 0.1:
                 reason = 'model_pressure'
         except Exception:
-            pass
+            logger.debug('yield gate: model-pressure check failed',
+                         exc_info=True)
     # Reason #3 — generic resource-governor throttle (now driven by
     # EXTERNAL cpu, so our OWN idle-compute work no longer trips this).
     if reason is None:
@@ -865,7 +872,8 @@ def should_yield_to_user() -> bool:
             if _gov is not None and _gov.get_throttle() < _GATE_THROTTLE_FLOOR:
                 reason = 'governor_throttle'
         except Exception:
-            pass
+            logger.debug('yield gate: governor throttle check failed',
+                         exc_info=True)
     _note_yield_reason(reason)
     return reason is not None
 
@@ -880,7 +888,8 @@ try:
     from core.foreground import set_yield_gate as _set_yield_gate
     _set_yield_gate(should_yield_to_user)
 except Exception:
-    pass
+    logger.debug('core.foreground yield-gate registration failed; the core '
+                 'accessor fails open', exc_info=True)
 
 
 def _notify_watchdog_llm_start():
@@ -929,7 +938,7 @@ def _notify_watchdog_llm_end():
                 wd.clear_llm_call(name)
                 wd.heartbeat(name)
     except Exception:
-        pass
+        logger.debug('watchdog LLM-end marker clear failed', exc_info=True)
 
 
 def _get_distributed_coordinator():
@@ -983,7 +992,8 @@ def _decompose_goal(prompt: str, goal_id: str, goal_type: str,
             prompt, goal_id, goal_type, user_id, subtask_defs)
         return tasks
     except Exception:
-        pass
+        logger.debug('ledger decomposition unavailable for goal %s; using a '
+                     'single task', goal_id, exc_info=True)
 
     # capabilities are NOT goal types.  A worker claims a task only when one
     # of the names here is in its own advertised set
@@ -1158,7 +1168,8 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
             logger.warning(f"Dispatch blocked by budget gate for {goal_type} goal {goal_id}: {bg_reason}")
             return None
     except ImportError:
-        pass
+        logger.warning('budget_gate not importable; goal %s dispatched without '
+                       'the budget check', goal_id)
 
     # TOOL ALLOWLIST: resolve model tier and attach to dispatch context.
     # Tier is sent to /chat as body['model_tier']; create_recipe uses it
@@ -1178,7 +1189,9 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
                         logger.info(f"Dispatch model tier: {_dispatch_model_tier.value} "
                                     f"for {goal_type} goal {goal_id}")
         except Exception:
-            pass  # Model registry unavailable — no tier restriction
+            # Model registry unavailable — no tier restriction
+            logger.debug('model registry unavailable for goal %s; no tier '
+                         'restriction', goal_id, exc_info=True)
 
     # GUARDRAIL: full pre-dispatch gate (fail-closed: block if guardrails unavailable)
     # Pass the goal dict + user_id so before_dispatch's goal-specific checks
@@ -1214,7 +1227,9 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
             action=f'dispatch {goal_type} goal {goal_id}',
             target_id=goal_id)
     except Exception:
-        pass  # Audit is best-effort
+        # Audit is best-effort
+        logger.debug('audit log write failed for goal %s', goal_id,
+                     exc_info=True)
 
     # A turn with a model override runs HERE, never on the hive.  The hive
     # task carries no model config (an override's entry can hold a peer's
@@ -1308,7 +1323,8 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
                                f"this tick")
                 return None
         except Exception:
-            pass
+            logger.debug('provider-breaker check failed for goal %s',
+                         goal_id, exc_info=True)
 
     # Tier 1: the canonical in-process /chat call.  The adapter resolution,
     # the user-priority gate and the local-LLM semaphore all live in
@@ -1388,7 +1404,8 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
                     goal_id=goal_id,
                 )
             except Exception:
-                pass
+                logger.debug('world-model record failed for goal %s',
+                             goal_id, exc_info=True)
 
             return response
         else:
@@ -1408,7 +1425,8 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
                         related_goal_id=goal_id,
                     )
                 except Exception:
-                    pass
+                    logger.warning('goal %s not re-queued after HTTP %s',
+                                   goal_id, resp.status_code, exc_info=True)
     except requests.RequestException as e:
         _cb_record_failure()
         logger.warning(f"Goal dispatch failed for {goal_type} goal {goal_id}: {e}")

@@ -4698,6 +4698,28 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
                         _generated_fallback = str(
                             json_obj.get('fallback_action') or '').strip()
+                        _flow_now = get_current_flow(user_prompt)
+                        if (_generated_fallback
+                                and _bank_action_recipe_from_trace(
+                                    user_prompt, prompt_id, _flow_now,
+                                    _verified_action_id, group_chat)):
+                            # The work that ran IS the recipe (#88, #106), as
+                            # in the claim handler below; asking the model to
+                            # describe it is a fallible round-trip.  Close the
+                            # verified action and post nothing: next lap the
+                            # claim handler finds it done with its file on
+                            # disk ([ALREADY DONE] / [LAST-ACTION]) and moves
+                            # on.  This path became live on 2026-09-27: before,
+                            # the TERMINATE after each verdict had already
+                            # closed the action (without a receipt) before
+                            # this hook ran.
+                            user_tasks[user_prompt].fallback = False
+                            user_tasks[user_prompt].recipe = False
+                            force_state_through_valid_path(
+                                user_prompt, _verified_action_id,
+                                ActionState.TERMINATED,
+                                'verified; recipe banked from its trace')
+                            continue
                         if _generated_fallback:
                             # The verifier already supplied the fallback, so
                             # keep the autonomous path and request the recipe
@@ -5281,7 +5303,14 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                 # If the current action hasn't been executed yet, start it
                 _ca_pending = user_tasks[user_prompt].current_action
                 _ca_pending_state = get_action_state(user_prompt, _ca_pending)
-                if _ca_pending_state in (ActionState.ASSIGNED, ActionState.PENDING, ActionState.IN_PROGRESS):
+                # STATUS_VERIFICATION_REQUESTED too: an action whose completion
+                # claim the gate refused sits there with no verdict at the
+                # tail, and nothing else re-posts it.  Before 2026-09-27 the
+                # TERMINATE hook closed such an action (without a receipt);
+                # left open, it spun here silently to the stall guard.  Re-
+                # posting it is bounded by the three attempts below.
+                if _ca_pending_state in (ActionState.ASSIGNED, ActionState.PENDING, ActionState.IN_PROGRESS,
+                                         ActionState.STATUS_VERIFICATION_REQUESTED):
                     # Track retries to detect actions stuck needing user input
                     if not hasattr(user_tasks[user_prompt], '_exec_retries'):
                         user_tasks[user_prompt]._exec_retries = {}

@@ -80,7 +80,8 @@ def test_inject_resolves_flywheel_goal_with_null_prompt_id():
     with patch('hartos.lifecycle_hooks.get_registered_groupchat', side_effect=_resolver), \
          patch('security.immutable_audit_log.get_audit_log'):
         out = ds.inject_instruction(_db_returning(goal), goal_id,
-                                    'Emit the recipe JSON now.', actor_id='claude-copilot')
+                                    'Emit the recipe JSON now.', actor_id='claude-copilot',
+                                    caller=ds.SteeringCaller('owner42'))
 
     assert out['ok'] is True, out
     assert out['message_index'] == 0
@@ -99,7 +100,10 @@ def test_inject_resolves_flywheel_goal_under_system_user():
     with patch('hartos.lifecycle_hooks.get_registered_groupchat',
                side_effect=lambda k: gc if k == key else None), \
          patch('security.immutable_audit_log.get_audit_log'):
-        out = ds.inject_instruction(_db_returning(goal), goal_id, 'steer', actor_id='cp')
+        # A goal no human owns is this machine's: its own (loopback) caller
+        # steers it, as the MCP co-pilot does.
+        out = ds.inject_instruction(_db_returning(goal), goal_id, 'steer', actor_id='cp',
+                                    caller=ds.SteeringCaller(None, is_local=True))
     assert out['ok'] is True, out
 
 
@@ -112,7 +116,8 @@ def test_inject_still_resolves_human_goal_via_row_prompt_id():
     with patch('hartos.lifecycle_hooks.get_registered_groupchat',
                side_effect=lambda k: gc if k == 'u1_12345' else None), \
          patch('security.immutable_audit_log.get_audit_log'):
-        out = ds.inject_instruction(_db_returning(goal), 'agent-x', 'hello', actor_id='admin')
+        out = ds.inject_instruction(_db_returning(goal), 'agent-x', 'hello', actor_id='admin',
+                                    caller=ds.SteeringCaller('u1'))
     assert out['ok'] is True, out
     assert gc.messages[-1]['content'] == 'hello'
 
@@ -123,12 +128,14 @@ def test_inject_no_live_groupchat_returns_clear_error():
     goal = SimpleNamespace(prompt_id=None, owner_id='o', created_by='o', user_id=None)
     with patch('hartos.lifecycle_hooks.get_registered_groupchat', return_value=None), \
          patch('security.immutable_audit_log.get_audit_log'):
-        out = ds.inject_instruction(_db_returning(goal), 'gid', 'x', actor_id='cp')
+        out = ds.inject_instruction(_db_returning(goal), 'gid', 'x', actor_id='cp',
+                                    caller=ds.SteeringCaller('o'))
     assert out['ok'] is False
     assert 'no live GroupChat' in (out['error'] or '')
 
 
 def test_inject_empty_instruction_rejected():
-    out = ds.inject_instruction(MagicMock(), 'gid', '   ', actor_id='cp')
+    out = ds.inject_instruction(MagicMock(), 'gid', '   ', actor_id='cp',
+                                caller=ds.SteeringCaller('o'))
     assert out['ok'] is False
     assert 'empty' in (out['error'] or '').lower()

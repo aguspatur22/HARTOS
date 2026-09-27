@@ -10,7 +10,7 @@ import hashlib
 import logging
 import os
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, NamedTuple, Optional
 
 from sqlalchemy.orm import Session
 
@@ -1065,8 +1065,48 @@ def _parse_iso(value) -> Optional[datetime]:
         return None
 
 
+class SteeringCaller(NamedTuple):
+    """Who is asking to steer a goal, as the route established it.
+
+    ``user_id`` None means a caller on this machine with no owner configured
+    (HEVOLVE_OWNER_USER_ID unset).  ``is_local`` is a loopback caller, which
+    is this desktop's owner; a remote caller is whoever its token names.
+    """
+    user_id: Optional[str]
+    is_admin: bool = False
+    is_local: bool = False
+
+
+def may_steer(goal, caller: SteeringCaller) -> Optional[str]:
+    """Why ``caller`` may NOT write into ``goal``'s GroupChat, or None.
+
+    Review of de3f89364 (2026-09-27, CRITICAL): the inject route checked
+    nothing, and /api/social/ is exempt from the API gate, so the desktop
+    owner's typed chat reached a guest's running agent (and any caller on the
+    network could have).  The rule:
+      * the goal's owner (core.event_attribution.goal_owner_user_id, the one
+        owner precedence) steers it;
+      * an admin (integrations.social.auth.holds_central_role) steers any;
+      * a goal with no human owner -- the flywheel's seeded goals, whose
+        author is a machine -- belongs to the machine, so this machine's own
+        callers steer it (the MCP co-pilot does, steer_goal) and a remote
+        non-admin does not.
+    """
+    if caller.is_admin:
+        return None
+    from core.event_attribution import goal_owner_user_id
+    owner = goal_owner_user_id(goal)
+    if owner is None:
+        return None if caller.is_local else (
+            'only an admin may steer a goal with no owner from another machine')
+    if caller.user_id and str(caller.user_id) == owner:
+        return None
+    return 'this agent belongs to another user'
+
+
 def inject_instruction(db, agent_id: str, instruction: str,
-                       actor_id: str = 'admin-ui') -> Dict:
+                       actor_id: str = 'admin-ui', *,
+                       caller: SteeringCaller) -> Dict:
     """Append an operator instruction to the live GroupChat.
 
     Reuses the existing ``_groupchat_registry`` (populated by
@@ -1081,6 +1121,10 @@ def inject_instruction(db, agent_id: str, instruction: str,
     Returns ``{ok, message_index, error}``.  ``ok=False`` when the
     GroupChat is not registered (process restarted, TTL expired, or
     /chat never ran for this agent in this process).
+
+    ``caller`` is required: a goal is steered only by someone may_steer
+    admits.  A refusal is ``forbidden: True`` (the route answers 403) and is
+    audit-logged as ``inject_refused`` with the caller's identity.
     """
     out = {'ok': False, 'message_index': None, 'error': None}
     if not (instruction or '').strip():
@@ -1113,6 +1157,29 @@ def inject_instruction(db, agent_id: str, instruction: str,
             pass
     if not goal:
         out['error'] = 'agent not found'
+        return out
+
+    refusal = may_steer(goal, caller)
+    if refusal:
+        out['error'] = refusal
+        out['forbidden'] = True
+        logger.warning('inject refused: caller=%s local=%s agent=%s: %s',
+                       caller.user_id, caller.is_local, agent_id, refusal)
+        try:
+            from security.immutable_audit_log import get_audit_log
+            get_audit_log().log_event(
+                event_type='agent_steered',
+                actor_id=str(actor_id or 'admin-ui'),
+                action='inject_refused',
+                detail={'agent_id': str(agent_id),
+                        'caller_user_id': caller.user_id,
+                        'caller_is_local': caller.is_local,
+                        'reason': refusal},
+                target_id=str(agent_id),
+            )
+        except Exception:
+            logger.exception('inject_refused audit-log write failed for %s',
+                             agent_id)
         return out
 
     try:
@@ -1192,6 +1259,8 @@ def inject_instruction(db, agent_id: str, instruction: str,
             action='inject',
             detail={'agent_id': str(agent_id),
                     'message_index': out['message_index'],
+                    'caller_user_id': caller.user_id,
+                    'caller_is_local': caller.is_local,
                     'instruction_preview': instruction[:200]},
             target_id=str(agent_id),
         )

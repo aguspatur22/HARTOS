@@ -173,7 +173,26 @@ def _payload(*, user_id: str, prompt_id: str, run_id: str, task_id: str,
         # True only on the run-level message from finish_run: a client that
         # routes guidance to the run must stop doing so on this message.
         'run_done': run_done,
+        # True on a copy sent to someone who may SEE the run but not steer
+        # it (_disclosure_copy).  The run's own user always gets False.
+        'disclosure_only': False,
     }
+
+
+def _disclosure_copy(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """The message for someone who is told about a run but may not steer it.
+
+    The desktop owner sees every step of a run another user started
+    (_recipients), but the run is that user's: its ``agent_id`` is THEIR
+    goal.  Review of de3f89364 (2026-09-27, CRITICAL): the owner's copy
+    carried that goal id, Nunba's liveRunOf took it for a run the owner could
+    guide, and the owner's typed chat was POSTed to
+    /dashboard/agents/<guest goal>/inject.  So this copy has no goal id and
+    says ``disclosure_only``; the same msg_id keeps a client subscribed as
+    both deduping it.  The inject route refuses a non-owner on its own too
+    (dashboard_service.may_steer); this keeps the client from trying.
+    """
+    return {**payload, 'agent_id': '', 'disclosure_only': True}
 
 
 def _ribbon(show: bool, text: str = None) -> None:
@@ -250,7 +269,8 @@ def _fan_out(user_id: str, payload: Dict[str, Any]) -> None:
     for recipient in _recipients(user_id):
         try:
             from integrations.social.realtime import on_notification
-            on_notification(recipient, payload)
+            on_notification(recipient, payload if recipient == user_id
+                            else _disclosure_copy(payload))
         except Exception:
             # Persistence succeeded; the Task Ledger remains authoritative and
             # a later refresh recovers the state.  Never roll the task back

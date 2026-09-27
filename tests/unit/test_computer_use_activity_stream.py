@@ -141,14 +141,50 @@ def test_the_desktop_owner_sees_a_run_started_by_another_user(
         iteration=1)
     recipients = [c.args[0] for c in wired.call_args_list]
     assert recipients == ['guest', 'owner-1', 'guest', 'owner-1']
-    # The owner gets the same message, so a client subscribed as both
-    # dedupes it by msg_id.
-    assert wired.call_args_list[1].args[1] == started
-    assert wired.call_args_list[3].args[1] == closed
+    # The owner is told the same step under the same msg_id, so a client
+    # subscribed as both dedupes it.
+    for run_leg, owner_leg in ((0, 1), (2, 3)):
+        run_msg = wired.call_args_list[run_leg].args[1]
+        owner_msg = wired.call_args_list[owner_leg].args[1]
+        assert owner_msg['msg_id'] == run_msg['msg_id']
+        assert owner_msg['summary'] == run_msg['summary']
+        assert owner_msg['phase'] == run_msg['phase']
+        assert owner_msg['run_done'] == run_msg['run_done']
+    assert wired.call_args_list[0].args[1] == started
+    assert wired.call_args_list[2].args[1] == closed
+
+
+def test_the_owners_copy_of_another_users_run_cannot_steer_it(
+        ledger, wired, monkeypatch):
+    """Review of de3f89364 (CRITICAL): the owner's copy carried the guest's
+    goal id, Nunba's liveRunOf made it the live run, and the OWNER's typed
+    chat went to /dashboard/agents/<guest goal>/inject.  The owner's copy is
+    disclosure only: no goal id, and it says so."""
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', 'owner-1')
+    started = _step('executing', 1, steering_agent_id='goal-42')
+    activity_stream.finish_run(
+        user_id='guest', prompt_id='42', run_id='run1', exit_reason='done',
+        iteration=1, steering_agent_id='goal-42')
+    by_recipient = {}
+    for c in wired.call_args_list:
+        by_recipient.setdefault(c.args[0], []).append(c.args[1])
+    for msg in by_recipient['owner-1']:
+        assert msg['agent_id'] == ''
+        assert msg['disclosure_only'] is True
+    for msg in by_recipient['guest']:
+        assert msg['agent_id'] == 'goal-42'
+        assert msg['disclosure_only'] is False
+    # What record_activity returns is the run user's own, routable message.
+    assert started['agent_id'] == 'goal-42'
+    assert started['disclosure_only'] is False
 
 
 def test_the_owner_is_not_told_twice_about_their_own_run(
         ledger, wired, monkeypatch):
     monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', 'guest')
-    _step('executing', 1)
+    _step('executing', 1, steering_agent_id='goal-42')
     assert [c.args[0] for c in wired.call_args_list] == ['guest']
+    # Their own run: the one message they get can steer it.
+    msg = wired.call_args_list[0].args[1]
+    assert msg['agent_id'] == 'goal-42'
+    assert msg['disclosure_only'] is False

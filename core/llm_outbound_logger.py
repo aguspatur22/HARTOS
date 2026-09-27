@@ -875,6 +875,41 @@ def _task_turn(messages: list):
                  and m.get('name') == speaker), None)
 
 
+def protected_messages(messages: list) -> list:
+    """The messages no trimming may remove, newest-user first, deduplicated.
+
+    THE one protected set, read by both places that shorten a conversation:
+    the wire trim (``_trim_to_budget``) and the seats' context limiters
+    (``hartos.helper`` history_limiter / token_limiter).  The limiters used
+    to keep only the newest message, and dropped the user's task turn
+    BEFORE the wire saw the body: live 2026-09-27, REUSE probe
+    liveprobe_reuse_1, 99 of 113 ToolMessageHandler inputs held no message
+    from User.  One set means the two can never disagree about what must
+    survive.
+
+      * the newest role='user' message: llama.cpp's Qwen3.5 template raises
+        "No user query found in messages." without one (measured 3x on
+        2026-08-30, source autogen.reuse);
+      * the task turn (:func:`_task_turn`): in an autogen group chat every
+        other agent's message reaches a seat as role='user', so the newest
+        user turn is often the StatusVerifier's verdict and the user's own
+        text is the oldest message (measured 2026-09-25 21:17:36);
+      * the newest role='tool' message: what the current step produced, the
+        thing the Assistant must use and the StatusVerifier must check (owner
+        decision, delegated 2026-09-26).
+    """
+    anchor = next((m for m in reversed(messages)
+                   if isinstance(m, dict) and m.get('role') == 'user'), None)
+    newest_result = next((m for m in reversed(messages)
+                          if isinstance(m, dict) and m.get('role') == 'tool'),
+                         None)
+    out = []
+    for m in (anchor, _task_turn(messages), newest_result):
+        if m is not None and not any(m is o for o in out):
+            out.append(m)
+    return out
+
+
 def _drop_units(messages: list) -> dict:
     """``id(message) -> the messages the drop must remove along with it``.
 
@@ -1042,41 +1077,11 @@ def _trim_to_budget(body: dict) -> tuple:
 
     has_system = bool(messages and isinstance(messages[0], dict)
                       and messages[0].get('role') == 'system')
-    # The newest user message is load-bearing: llama.cpp's Qwen3.5 chat
-    # template raises "No user query found in messages." whenever a
-    # role='tool' message survives with no user message anywhere, and the
-    # server turns that into HTTP 500 (measured 3x on 2026-08-30, source
-    # autogen.reuse — post-trim roles were [system, assistant, assistant,
-    # tool, assistant]).  Left-dropping by position deleted it first,
-    # because the user's task instruction is the OLDEST non-system message.
-    anchor = next((m for m in reversed(messages)
-                   if isinstance(m, dict) and m.get('role') == 'user'), None)
-    # The newest user message is not always the USER's.  In an autogen group
-    # chat every other agent's message reaches a seat as role='user' with its
-    # speaker in `name`, so from the second Assistant call on the newest user
-    # turn is the StatusVerifier's verdict and the user's own text is the
-    # oldest droppable message.  Measured 2026-09-25 21:17:36 (source
-    # autogen.reuse, request livetest_reuse_verify_1790351226, post-trim wire
-    # body): [system, assistant, tool, user/StatusVerifier] -- the user's
-    # "Summarize: ..." dropped, the Assistant asked for the text again, and
-    # the turn ended with no summary.  So also protect the newest turn of the
-    # speaker who OPENED the user side (the initiator whose task it is).
-    # Unnamed bodies (langchain / raw SDK) have no speakers to tell apart and
-    # keep the single newest-user anchor, unchanged.
-    task = _task_turn(messages)
-    # And the newest tool result: it is what the current step produced, the
-    # thing the Assistant must use and the StatusVerifier must check.
-    # Unprotected, the cut pass took it first and floored it at 64 tokens
-    # while the task stayed whole, or the drop removed it outright when a
-    # verdict followed it (review of 9ddc8b92d, probed).  Owner decision,
-    # delegated 2026-09-26 ("use sensible defaults without creating more
-    # friction"): protect it, and let the largest-first pass below share the
-    # cut between it and the task.  Its tool_calls message stays with it
-    # (_drop_units).
-    newest_result = next((m for m in reversed(messages)
-                          if isinstance(m, dict) and m.get('role') == 'tool'),
-                         None)
-    protected = [m for m in (anchor, task, newest_result) if m is not None]
+    # Never dropped: the newest user message, the task turn and the newest
+    # tool result -- protected_messages, the one set the seats' context
+    # limiters keep too.  Each was added after a measured failure; the
+    # reasons live on that function.
+    protected = protected_messages(messages)
     start = 1 if has_system else 0
     n_dropped = 0
     # A tool call and its results leave together or not at all (see

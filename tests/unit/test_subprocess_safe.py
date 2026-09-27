@@ -693,4 +693,9 @@ class TestTheOtherBoundedWaitsDelegate:
     def test_an_enormous_wait_is_clamped_not_an_overflow(self):
         """Windows raises OverflowError past threading.TIMEOUT_MAX; a caller
         passing a huge budget (an env-configured ETA) must still get a value."""
-        assert subprocess_safe.call_bounded(lambda: 'v', 1e12) == (True, 'v', None)
+        # The call must still be running when wait() starts: an Event that is
+        # already set returns before the timeout is ever checked.
+        def _slow():
+            time.sleep(0.3)
+            return 'v'
+        assert subprocess_safe.call_bounded(_slow, 1e12) == (True, 'v', None)

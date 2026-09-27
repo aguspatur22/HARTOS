@@ -350,7 +350,8 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState',
                             'action': 'status_request',
                         })
                     except Exception:
-                        pass
+                        logger.warning('task.sla_breached event for %s not '
+                                       'emitted', task_id, exc_info=True)
 
                 # Release ownership on terminal states.
                 if LedgerTaskStatus.is_terminal_state(ledger_status) and task.is_owned:
@@ -383,7 +384,8 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState',
                 task.__dict__.clear()
                 task.__dict__.update(task_snapshot)
             except Exception:
-                pass
+                logger.warning('in-memory task %s not restored after the '
+                               'failed ledger sync', task_id, exc_info=True)
         logger.error(f"Failed to auto-sync to ledger: {e}", exc_info=True)
         return False
 

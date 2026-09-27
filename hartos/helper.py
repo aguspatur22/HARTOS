@@ -1335,6 +1335,58 @@ def _context_limiter_classes():
                   f"result and would have dropped the newest message "
                   f"(role={newest.get('role')}, name={newest.get('name')}); kept it")
 
+    def same_message(kept_msg, original):
+        # The history limiter keeps the caller's dicts; the token limiter
+        # keeps deep copies whose content it may have cut from the tail
+        # (autogen's cut keeps the head).  So: the same dict, or the same
+        # speaker and call id with the kept content a head of the original.
+        if kept_msg is original:
+            return True
+        if not isinstance(kept_msg, dict) or not isinstance(original, dict):
+            return False
+        if any(kept_msg.get(k) != original.get(k)
+               for k in ('role', 'name', 'tool_call_id')):
+            return False
+        a, b = kept_msg.get('content'), original.get('content')
+        if isinstance(a, str) and isinstance(b, str):
+            return b.startswith(a[:200])
+        return a == b
+
+    def restore_protected(which, messages, kept, bound=None):
+        # Put back every message of the ONE protected set
+        # (core.llm_outbound_logger.protected_messages, which the wire trim
+        # never drops either) that autogen's window left out.  Live
+        # 2026-09-27, REUSE probe liveprobe_reuse_1: 99 of 113
+        # ToolMessageHandler inputs held no message from User -- the token
+        # limiter keeps the newest ~2500 tokens and the task turn is the
+        # oldest message -- so the user's words reached 4 of 77 LLM calls.
+        # Each goes back in its place (before the first kept message that is
+        # newer), cut by ``bound`` like any other message.
+        from core.llm_outbound_logger import protected_messages
+        if kept is messages:
+            return kept
+        missing = [p for p in protected_messages(messages)
+                   if not any(same_message(k, p) for k in kept)]
+        if not missing:
+            return kept
+        kept = list(kept)
+
+        def original_index(k):
+            return next((i for i in range(len(messages) - 1, -1, -1)
+                         if same_message(k, messages[i])), len(messages))
+
+        for p in sorted(missing, key=lambda m: next(
+                i for i, x in enumerate(messages) if x is m)):
+            p_idx = next(i for i, x in enumerate(messages) if x is p)
+            at = next((j for j, k in enumerate(kept)
+                       if original_index(k) > p_idx), len(kept))
+            kept.insert(at, bound(p) if bound else p)
+            _safe_log('info',
+                      f"[PROTECTED-KEPT] autogen {which} dropped a protected "
+                      f"message (role={p.get('role')}, name={p.get('name')}); "
+                      f"put it back at {at}")
+        return kept
+
     class HistoryLimiter(transforms.MessageHistoryLimiter):
         def apply_transform(self, messages):
             kept = super().apply_transform(messages)
@@ -1345,7 +1397,7 @@ def _context_limiter_classes():
                 # in -- so the message it popped is exactly this one.
                 kept.append(newest)
                 note('MessageHistoryLimiter', newest)
-            return kept
+            return restore_protected('MessageHistoryLimiter', messages, kept)
 
     class TokenLimiter(transforms.MessageTokenLimiter):
         def apply_transform(self, messages):
@@ -1354,17 +1406,26 @@ def _context_limiter_classes():
                 # autogen cuts the newest message first, with nothing yet
                 # counted against the budget: to max_tokens_per_message, or to
                 # max_tokens when that is smaller.  Give it the same cut.
-                newest = dict(messages[-1])
-                util = transforms.transforms_util
-                if (util.is_content_right_type(newest.get('content'))
-                        and util.should_transform_message(
-                            newest, self._filter_dict, self._exclude_filter)):
-                    newest['content'] = self._truncate_str_to_tokens(
-                        newest['content'],
-                        min(self._max_tokens, self._max_tokens_per_message))
+                newest = self._bound_message(messages[-1])
                 kept.append(newest)
                 note('MessageTokenLimiter', newest)
+            kept = restore_protected('MessageTokenLimiter', messages, kept,
+                                     bound=self._bound_message)
             return [self._bound_tool_responses(m) for m in kept]
+
+        def _bound_message(self, msg):
+            # The per-message cut autogen gives every message it keeps (head
+            # kept), for a message put back by restore_protected.  A copy:
+            # the original is the group chat's own.
+            msg = dict(msg)
+            util = transforms.transforms_util
+            if (util.is_content_right_type(msg.get('content'))
+                    and util.should_transform_message(
+                        msg, self._filter_dict, self._exclude_filter)):
+                msg['content'] = self._truncate_str_to_tokens(
+                    msg['content'],
+                    min(self._max_tokens, self._max_tokens_per_message))
+            return msg
 
         def _bound_tool_responses(self, msg):
             # autogen cuts a message's 'content' and never reads

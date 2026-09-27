@@ -135,6 +135,18 @@ def test_a_steward_against_blocks(db):
     assert result['success'] is False and goals == 0
 
 
+def test_one_steward_against_is_not_outvoted_by_another_steward_for(db):
+    e = _experiment(db)
+    _people_approve(db, e.id)
+    for _ in range(3):   # 9 FOR / 2 AGAINST overall = 0.82: over 0.8
+        _vote(db, e.id, _user(db).id, 2)
+    _vote(db, e.id, _user(db, role='central', is_admin=True).id, 2)
+    _vote(db, e.id, _user(db, role='central', is_admin=True).id, -1)
+    result, goals = _evaluate(db, e)
+    assert result['success'] is False and goals == 0
+    assert result['verdict']['reason'] == 'steward_required'
+
+
 def test_an_agent_the_steward_owns_is_not_the_steward(db):
     """It counts as its owner for the quorum, never as the steward."""
     e = _experiment(db)

@@ -179,8 +179,9 @@ def venv_site_packages(backend: str) -> str:
             candidate = os.path.join(lib, entry, "site-packages")
             if entry.startswith("python") and os.path.isdir(candidate):
                 return candidate
-    except OSError:
-        pass
+    except OSError as exc:
+        logger.debug("venv %r: %s not listable (%s); naming site-packages "
+                     "after this interpreter", backend, lib, exc)
     return os.path.join(
         lib, f"python{sys.version_info[0]}.{sys.version_info[1]}",
         "site-packages",
@@ -325,8 +326,10 @@ def ensure_parent_packages_visible(backend: Optional[str]) -> Optional[str]:
         with open(pth, "r", encoding=encoding) as fh:
             if fh.read() == content:
                 return pth
-    except (OSError, UnicodeError):
-        pass  # absent, unreadable or stale: rewrite below
+    except (OSError, UnicodeError) as exc:
+        # absent, unreadable or stale: rewrite below
+        logger.debug("venv %r: %s not read (%s); rewriting it", backend,
+                     pth, exc)
 
     tmp = pth + ".tmp"
     try:
@@ -340,8 +343,9 @@ def ensure_parent_packages_visible(backend: Optional[str]) -> Optional[str]:
         )
         try:
             os.remove(tmp)
-        except OSError:
-            pass
+        except OSError as rm_exc:
+            logger.debug("venv %r: temp %s not removed (%s)", backend, tmp,
+                         rm_exc)
         return None
     logger.info("venv %r: %s now lists %s", backend, PARENT_PACKAGES_PTH, roots)
     return pth
