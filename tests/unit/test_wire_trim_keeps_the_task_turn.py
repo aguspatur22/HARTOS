@@ -151,7 +151,7 @@ def test_only_the_larger_protected_message_is_cut_when_that_suffices(
     assert kept_anchor and kept_anchor[0]['content'] == anchor['content'], (
         'the result the verifier must check was cut although cutting only '
         'the larger task turn fits')
-    assert kept_task and kept_task[0]['content'].startswith(WIRE_TRIM_MARKER)
+    assert kept_task and WIRE_TRIM_MARKER in kept_task[0]['content']
     assert est_after <= budget
 
 
@@ -165,7 +165,7 @@ def test_the_mirror_case_keeps_the_smaller_task_whole(monkeypatch):
     kept_task = [m for m in out if m.get('name') == 'User']
     kept_anchor = [m for m in out if m.get('name') == 'Assistant']
     assert kept_task and kept_task[0]['content'] == task['content']
-    assert kept_anchor and kept_anchor[0]['content'].startswith(WIRE_TRIM_MARKER)
+    assert kept_anchor and WIRE_TRIM_MARKER in kept_anchor[0]['content']
     assert est_after <= budget
 
 
@@ -181,7 +181,7 @@ def test_an_oversized_task_turn_is_truncated_not_left_over_budget(monkeypatch):
         [sys_m, _task(), result, verdict], msgs, monkeypatch)
     kept = [m for m in out if m.get('name') == 'User']
     assert len(kept) == 1, 'the task turn must survive, truncated'
-    assert kept[0]['content'].startswith(WIRE_TRIM_MARKER)
+    assert WIRE_TRIM_MARKER in kept[0]['content']
     assert kept[0]['content'].endswith('TAIL 83 cyclists')
     assert _VERDICT in [m.get('content') for m in out]
     assert est_after <= budget
@@ -204,7 +204,7 @@ def test_an_anchor_that_is_the_newest_message_is_kept_whole(monkeypatch):
     kept_task = [m for m in out if m.get('name') == 'User']
     assert kept_anchor and kept_anchor[0]['content'] == anchor['content'], (
         'the newest message was cut although cutting the larger task fits')
-    assert kept_task and kept_task[0]['content'].startswith(WIRE_TRIM_MARKER)
+    assert kept_task and WIRE_TRIM_MARKER in kept_task[0]['content']
     assert est_after <= budget
 
 
@@ -221,6 +221,6 @@ def test_an_unprotected_oversized_newest_message_is_still_truncated(
     out, est_after, budget = _trim_so_that_only(
         [sys_m, {'role': 'user', 'content': 'q'},
          {'role': 'assistant', 'content': 'word ' * 100}], msgs, monkeypatch)
-    assert out[-1]['content'].startswith(WIRE_TRIM_MARKER)
+    assert WIRE_TRIM_MARKER in out[-1]['content']
     assert out[-1]['content'].endswith('TAIL')
     assert est_after <= budget

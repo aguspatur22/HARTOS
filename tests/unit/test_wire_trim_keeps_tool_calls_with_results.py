@@ -82,7 +82,7 @@ def test_the_reviewed_shape_keeps_the_call_its_newest_result_answers(
         % [(m.get('role'), m.get('name')) for m in out])
     assert call in out
     assert out[-1]['role'] == 'tool'
-    assert out[-1]['content'].startswith(WIRE_TRIM_MARKER)
+    assert WIRE_TRIM_MARKER in out[-1]['content']
     assert out[-1]['content'].endswith('PAGETAIL')
     assert est_after <= budget
 

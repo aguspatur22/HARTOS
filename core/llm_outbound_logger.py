@@ -786,7 +786,17 @@ def _compact_tool_schema(body: dict, model=None) -> tuple:
 
 def _truncate_msg_content(msg: dict, target_chars: int, marker: str,
                           content_to_text) -> tuple:
-    """Left-truncate one message's content to ``target_chars``, marker-prefixed.
+    """Cut the MIDDLE of one message's content: keep its head and its tail,
+    ``target_chars`` together, with ``marker`` where the middle was.
+
+    Never the head.  Live 2026-09-27 (installed build, REUSE probe
+    liveprobe_reuse_1): a dispatch turn reads "Perform this action -> Action
+    #1:... <the user's words> follow these steps: [...]", and the head cut
+    this used to make removed the marker and the words and kept the steps
+    (6 of 77 calls); the reply was off-topic.  A tool result's head is where
+    its status and failure text sit, and a system message's head is the
+    persona, so every kind of message keeps both ends.  The head gets the
+    larger half.
 
     Returns ``(new_msg, n_cut_chars)`` — ``(msg, 0)`` when it already fits.
     Multimodal-aware: rebuilds list-shaped content preserving image parts.
@@ -798,7 +808,10 @@ def _truncate_msg_content(msg: dict, target_chars: int, marker: str,
     if len(text) <= target_chars:
         return msg, 0
     new_msg = dict(msg)
-    new_text = marker + text[-target_chars:]
+    tail_chars = max(0, target_chars) // 2
+    head_chars = max(0, target_chars) - tail_chars
+    new_text = (text[:head_chars] + marker
+                + (text[-tail_chars:] if tail_chars else ''))
     if isinstance(new_msg.get('content'), list):
         new_parts = []
         replaced = False
@@ -910,13 +923,14 @@ def _trim_to_budget(body: dict) -> tuple:
          newest role='tool' message.  An assistant message carrying tool_calls drops together with the
          results answering it (:func:`_drop_units`), and is kept with them
          when one of them is never dropped.
-      4. If still over, left-truncate the messages step 3 could not drop,
+      4. If still over, cut the middle of the messages step 3 could not drop,
          one at a time, until the set fits: the most-recent message first
          when nothing protects it, then the protected ones, largest first.
          Each is cut only as far as the others at their current size
          require, never below 64 tokens, and its content is prefixed with
          ``WIRE_TRIM_MARKER`` so the LLM sees the truncation.
-      5. If STILL over, left-truncate the system message the same way.
+      5. If STILL over, cut the middle of the system message the same way.
+      A cut keeps each message's head and tail (_truncate_msg_content).
       A body that is still over after step 5 is sent as is and logged as
       an error.
 
@@ -1127,7 +1141,7 @@ def _trim_to_budget(body: dict) -> tuple:
     # cut anyway, est 569 of budget 740).  Deduplicated by identity: the
     # newest message is often the anchor itself.  Room uses the same
     # chars/token ratio the fallback uses (3.5): conservative with tiktoken,
-    # and cutting from the left means over-cutting only shrinks the payload.
+    # and over-cutting only shrinks the payload.
     #
     # UNPROTECTED BEFORE PROTECTED.  When the newest message is protected by
     # nothing (an assistant reply), it is cut before any protected message,
@@ -1135,7 +1149,7 @@ def _trim_to_budget(body: dict) -> tuple:
     # The newest tool result used to be that unprotected message, and was
     # floored at 64 tokens ahead of a whole task (review of 9ddc8b92d); it is
     # protected now, so a 15k task and a 10.5k result share the cut, the
-    # larger first -- which can cut the task's head, the price of the result
+    # larger first -- which can cut the middle of the task, the price of the result
     # keeping real content (owner decision above).
     candidates = []
     for m in protected + messages[-1:]:
@@ -1169,8 +1183,8 @@ def _trim_to_budget(body: dict) -> tuple:
     # STILL-over failures were this shape (sample: [system 28,154 chars,
     # assistant 247]), each sent doomed and rejected by llama-server.  When
     # the drop and the cut pass have both run and the set is STILL over, the
-    # system message is the only mass left; left-truncating it cuts the
-    # boilerplate head and keeps the actionable recipe tail.  Only reached
+    # system message is the only mass left; cutting its middle keeps the
+    # persona head and the actionable recipe tail.  Only reached
     # when the alternative is a guaranteed reject.
     if (count_tokens_for_messages(messages, model) > budget
             and has_system and len(messages) >= 1):

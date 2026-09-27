@@ -1,22 +1,30 @@
-"""Remote compute is paid for by the requester and earned by the operator.
+"""Remote compute is paid by the requester and earned by the operator.
 
 Owner rulings 2026-09-26:
   (a) the metered boundary is work that goes to "hive nodes ... that's not
       their node", tracked inside HARTOS;
-  (b) "proportinal to compute spent and earned": ONE measured quantity is
-      debited from the requester and credited to the serving operator,
-      spend == earn before the 90/9/1 split;
+  (b) "proportinal to compute spent and earned": ONE measured quantity per
+      exchange is debited from the requester and credited to the serving
+      operator, spend == earn before the 90/9/1 split;
   (c) "for local person'a work zero spark earned": own node, a SAME_USER
       node, or a local model costs 0 and earns 0.
 
-Every test runs the real code against a real SQLite schema: the wallet, the
-MeteredAPIUsage row and the settlement are observed, never a mock's call args
-standing in for a balance.
+Each node records its own half on its own node: the requesting node debits
+its person when the result returns, the serving node credits its operator
+when it serves someone else.  Both measure the exchange with
+budget_gate.exchange_tokens from the same request and response.
+
+Every test runs the real code against a real SQLite schema: the wallet and
+the MeteredAPIUsage rows are observed, never a mock's call args standing in
+for a balance.  The two-node tests run the requester's code against one
+database and the server's against another, the server half driven by the
+very request the requester sent.
 """
+import json
 import os
 import sys
-import uuid
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -35,16 +43,21 @@ from integrations.social.models import (  # noqa: E402
 REQUESTER = 'user-requester'
 OPERATOR = 'user-operator'
 SERVING_NODE = 'node-of-operator'
+REQUESTER_NODE = 'node-of-requester'
+
+
+def _factory():
+    engine = create_engine('sqlite://', connect_args={'check_same_thread': False},
+                           poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine, expire_on_commit=False)
 
 
 @pytest.fixture
 def db_factory(monkeypatch):
-    """A fresh in-memory schema; every get_db() in the code under test and
-    every db the test opens share it."""
-    engine = create_engine('sqlite://', connect_args={'check_same_thread': False},
-                           poolclass=StaticPool)
-    Base.metadata.create_all(engine)
-    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    """The requesting node's database: every get_db() in the code under test
+    and every db the test opens share it."""
+    factory = _factory()
     monkeypatch.setattr(_models, 'get_db', lambda: factory())
     # No PeerLink manager is running in a unit test: no link proves anything
     # unless a test installs one.
@@ -52,9 +65,9 @@ def db_factory(monkeypatch):
     fake_mgr.get_link.return_value = None
     monkeypatch.setattr('core.peer_link.link_manager.get_link_manager',
                         lambda: fake_mgr)
-    monkeypatch.setenv('HEVOLVE_NODE_ID', 'node-of-requester')
+    monkeypatch.setenv('HEVOLVE_NODE_ID', REQUESTER_NODE)
+    monkeypatch.delenv('HEVOLVE_USER_ID', raising=False)
     yield factory
-    engine.dispose()
 
 
 @contextmanager
@@ -68,12 +81,15 @@ def _session(factory):
 
 
 def _seed(factory, requester_spark=1000, operator_id=OPERATOR,
-          node_id=SERVING_NODE):
+          node_id=SERVING_NODE, operator_spark=0):
     with _session(factory) as db:
         for uid in {REQUESTER, OPERATOR, operator_id} - {None}:
             db.add(User(id=uid, username=uid, user_type='human'))
         db.add(ResonanceWallet(user_id=REQUESTER, spark=requester_spark,
                                spark_lifetime=requester_spark))
+        if operator_id and operator_id != REQUESTER:
+            db.add(ResonanceWallet(user_id=operator_id, spark=operator_spark,
+                                   spark_lifetime=operator_spark))
         db.add(PeerNode(node_id=node_id, url='http://peer.example:6777',
                         node_operator_id=operator_id))
 
@@ -102,6 +118,13 @@ def _settle(factory):
     from integrations.agent_engine.revenue_aggregator import settle_metered_api_costs
     with _session(factory) as db:
         return settle_metered_api_costs(db)
+
+
+def _resp(status, body):
+    r = MagicMock()
+    r.status_code = status
+    r.json.return_value = body
+    return r
 
 
 # ─── the rate: an EXISTING compute-to-Spark conversion, not a new number ───
@@ -141,7 +164,53 @@ class TestCanonicalRate:
             round(3.6 * GPU_SECONDS_PER_1K_TOKENS / 3600.0, 4))
 
 
-# ─── charge_remote_compute: the ONE function ───
+# ─── the measure: a peer's report can lower it, never raise it ───
+
+class TestExchangeTokens:
+
+    def test_inflated_prompt_claim_is_capped_at_the_counted_prompt(self):
+        """Reviewer probe 1: prompt_tokens worth 900 Spark for 'q'."""
+        from core.token_utils import count_tokens_for_text
+        from integrations.agent_engine.budget_gate import exchange_tokens
+        tin, tout = exchange_tokens(
+            'q', 'ok', {'prompt_tokens': _tokens_for_spark(900),
+                        'completion_tokens': 0}, 1500)
+        assert tin == count_tokens_for_text('q')
+        assert tout == 0
+
+    def test_completion_claim_is_capped_at_max_tokens(self):
+        from integrations.agent_engine.budget_gate import exchange_tokens
+        assert exchange_tokens('q', 'ok', {'prompt_tokens': 1,
+                                           'completion_tokens': 10 ** 7},
+                               1500)[1] == 1500
+
+    def test_a_lower_honest_claim_is_used(self):
+        from core.token_utils import count_tokens_for_text
+        from integrations.agent_engine.budget_gate import exchange_tokens
+        p = 'hello there ' * 50
+        assert count_tokens_for_text(p) > 7
+        assert exchange_tokens(p, 'r', {'prompt_tokens': 7,
+                                        'completion_tokens': 3}, 1500) == (7, 3)
+
+    def test_counted_when_no_usage(self):
+        from core.token_utils import count_tokens_for_text
+        from integrations.agent_engine.budget_gate import exchange_tokens
+        p, r = 'hello there ' * 50, 'general kenobi ' * 20
+        assert exchange_tokens(p, r, None, None) == (
+            count_tokens_for_text(p), count_tokens_for_text(r))
+        assert exchange_tokens(p, r, None, 5) == (count_tokens_for_text(p), 5)
+
+    def test_completion_exchange_reads_messages_and_first_choice(self):
+        from core.token_utils import count_tokens_for_text
+        from integrations.agent_engine.budget_gate import completion_exchange
+        req = {'messages': [{'role': 'user', 'content': 'why ' * 40}],
+               'max_tokens': 10}
+        resp = {'choices': [{'message': {'content': 'because ' * 30}}]}
+        assert completion_exchange(req, resp) == (
+            count_tokens_for_text('why ' * 40), 10)
+
+
+# ─── the requester's half ───
 
 class TestChargeRemoteCompute:
 
@@ -154,33 +223,52 @@ class TestChargeRemoteCompute:
         assert moved == 3
         assert _spark(db_factory, REQUESTER) == 97
         rows = _rows(db_factory)
-        assert len(rows) == 1
-        req, op, node, rin, rout, spark, status, src = rows[0]
-        assert (req, op, node, rin, rout, spark, status) == (
-            REQUESTER, OPERATOR, SERVING_NODE, tin, tout, 3, 'pending')
-        # The operator has earned nothing yet: the credit is the settlement's.
-        assert _spark(db_factory, OPERATOR) == 0
+        assert rows == [(REQUESTER, OPERATOR, SERVING_NODE, tin, tout, 3,
+                         'debited', 'hive_compute')]
+        with _session(db_factory) as db:
+            spent = db.query(ResonanceTransaction).filter_by(
+                user_id=REQUESTER, source_type='hive_compute_spent').all()
+        assert [t.amount for t in spent] == [-3]
 
-    def test_settlement_credits_operator_the_same_quantity(self, db_factory):
+    def test_the_requester_node_never_credits_the_operator(self, db_factory):
+        """The operator's credit is the serving node's, on its own ledger."""
+        from integrations.agent_engine.budget_gate import charge_remote_compute
+        _seed(db_factory, requester_spark=100)
+        charge_remote_compute(REQUESTER, SERVING_NODE, _tokens_for_spark(4), 0,
+                              source='t')
+        _settle(db_factory)
+        _settle(db_factory)
+        assert _spark(db_factory, OPERATOR) == 0
+        assert _spark(db_factory, REQUESTER) == 96
+
+    def test_an_aged_row_is_never_left_pending_nor_paid(self, db_factory):
+        """Reviewer probe 2: a row older than settlement's 24 h window stayed
+        'pending' with its requester debited.  A ledger row is complete when
+        written; settlement never touches it, at any age."""
         from integrations.agent_engine.budget_gate import charge_remote_compute
         _seed(db_factory, requester_spark=100)
         moved = charge_remote_compute(REQUESTER, SERVING_NODE,
-                                      _tokens_for_spark(4), 0, source='test')
-        result = _settle(db_factory)
-        assert _spark(db_factory, OPERATOR) == moved == 4
-        assert _spark(db_factory, REQUESTER) == 96
-        assert result['settled_count'] == 1
-        assert _rows(db_factory)[0][6] == 'settled'
-        # settling twice pays once
-        _settle(db_factory)
-        assert _spark(db_factory, OPERATOR) == 4
+                                      _tokens_for_spark(5), 0, source='t')
         with _session(db_factory) as db:
-            earned = db.query(ResonanceTransaction).filter_by(
-                user_id=OPERATOR, source_type='hive_compute_earned').all()
-            spent = db.query(ResonanceTransaction).filter_by(
-                user_id=REQUESTER, source_type='hive_compute_spent').all()
-        assert [t.amount for t in earned] == [4]
-        assert [t.amount for t in spent] == [-4]
+            for r in db.query(MeteredAPIUsage).all():
+                r.created_at = datetime.utcnow() - timedelta(hours=25)
+        _settle(db_factory)
+        assert moved == 5
+        assert _spark(db_factory, REQUESTER) == 95
+        assert _spark(db_factory, OPERATOR) == 0
+        assert [r[6] for r in _rows(db_factory)] == ['debited']
+
+    def test_settlement_still_pays_a_metered_api_row(self, db_factory):
+        """Only the compute ledger is excluded: api_cost_recovery rows pay."""
+        from integrations.agent_engine.revenue_aggregator import SPARK_PER_USD
+        _seed(db_factory)
+        with _session(db_factory) as db:
+            db.add(MeteredAPIUsage(node_id=SERVING_NODE, operator_id=OPERATOR,
+                                   model_id='gpt-4o', task_source='hive',
+                                   actual_usd_cost=0.05,
+                                   settlement_status='pending'))
+        _settle(db_factory)
+        assert _spark(db_factory, OPERATOR) == int(0.05 * SPARK_PER_USD)
 
     def test_fractions_carry_until_a_whole_spark_is_owed(self, db_factory):
         from integrations.agent_engine.budget_gate import charge_remote_compute
@@ -189,22 +277,20 @@ class TestChargeRemoteCompute:
         assert charge_remote_compute(REQUESTER, SERVING_NODE, sixty_percent, 0,
                                      source='t') == 0
         assert _spark(db_factory, REQUESTER) == 100
+        assert [r[6] for r in _rows(db_factory)] == ['carried']
         assert charge_remote_compute(REQUESTER, SERVING_NODE, sixty_percent, 0,
                                      source='t') == 1
         assert _spark(db_factory, REQUESTER) == 99
-        _settle(db_factory)
-        assert _spark(db_factory, OPERATOR) == 1
 
-    def test_own_node_costs_and_earns_nothing(self, db_factory):
+    def test_own_node_costs_nothing(self, db_factory):
         from integrations.agent_engine.budget_gate import charge_remote_compute
         _seed(db_factory, requester_spark=100, operator_id=REQUESTER)
         assert charge_remote_compute(REQUESTER, SERVING_NODE,
                                      _tokens_for_spark(5), 0, source='t') == 0
-        _settle(db_factory)
         assert _spark(db_factory, REQUESTER) == 100
         assert _rows(db_factory) == []
 
-    def test_same_user_link_costs_and_earns_nothing(self, db_factory, monkeypatch):
+    def test_same_user_link_costs_nothing(self, db_factory, monkeypatch):
         from core.peer_link.link import PeerLink, TrustLevel
         from integrations.agent_engine.budget_gate import charge_remote_compute
         _seed(db_factory, requester_spark=100)
@@ -216,9 +302,7 @@ class TestChargeRemoteCompute:
                             lambda: mgr)
         assert charge_remote_compute(REQUESTER, SERVING_NODE,
                                      _tokens_for_spark(5), 0, source='t') == 0
-        _settle(db_factory)
         assert _spark(db_factory, REQUESTER) == 100
-        assert _spark(db_factory, OPERATOR) == 0
         assert _rows(db_factory) == []
 
     def test_peer_link_is_not_ownership(self, db_factory, monkeypatch):
@@ -236,7 +320,6 @@ class TestChargeRemoteCompute:
                                      _tokens_for_spark(2), 0, source='t') == 2
 
     def test_unknown_operator_moves_nothing(self, db_factory):
-        """No operator to credit means no charge: spend must equal earn."""
         from integrations.agent_engine.budget_gate import charge_remote_compute
         _seed(db_factory, requester_spark=100)
         assert charge_remote_compute(REQUESTER, 'node-nobody-knows',
@@ -244,20 +327,16 @@ class TestChargeRemoteCompute:
         assert _spark(db_factory, REQUESTER) == 100
         assert _rows(db_factory) == []
 
-    def test_insufficient_spark_refuses_debit_and_credit(self, db_factory):
+    def test_insufficient_spark_runs_the_work_and_records_it_unfunded(self, db_factory):
         """Wallet semantics (ResonanceService.spend_spark): all or nothing.
-        The row stays as 'unfunded' so the operator's served work is visible,
-        and settlement credits nothing for it."""
+        No friction: the work already ran; the row says 'unfunded' and that
+        amount is not billed again."""
         from integrations.agent_engine.budget_gate import charge_remote_compute
         _seed(db_factory, requester_spark=2)
         assert charge_remote_compute(REQUESTER, SERVING_NODE,
                                      _tokens_for_spark(5), 0, source='t') == 0
         assert _spark(db_factory, REQUESTER) == 2
-        rows = _rows(db_factory)
-        assert len(rows) == 1 and rows[0][6] == 'unfunded'
-        _settle(db_factory)
-        assert _spark(db_factory, OPERATOR) == 0
-        # the refused Spark is written off, not re-billed on the next call
+        assert [r[6] for r in _rows(db_factory)] == ['unfunded']
         assert charge_remote_compute(REQUESTER, SERVING_NODE,
                                      _tokens_for_spark(1), 0, source='t') == 1
         assert _spark(db_factory, REQUESTER) == 1
@@ -270,22 +349,103 @@ class TestChargeRemoteCompute:
         assert _rows(db_factory) == []
 
 
-class TestRemoteCallTokens:
+# ─── the serving node's half ───
 
-    def test_usage_block_wins(self):
-        from integrations.agent_engine.budget_gate import remote_call_tokens
-        assert remote_call_tokens('a b c', 'd e', {'prompt_tokens': 11,
-                                                    'completion_tokens': 7}) == (11, 7)
-
-    def test_counted_when_no_usage(self):
-        from core.token_utils import count_tokens_for_text
-        from integrations.agent_engine.budget_gate import remote_call_tokens
-        p, r = 'hello there ' * 50, 'general kenobi ' * 20
-        assert remote_call_tokens(p, r, None) == (
-            count_tokens_for_text(p), count_tokens_for_text(r))
+@pytest.fixture
+def server_db(db_factory, monkeypatch):
+    """The same schema seen as the SERVING node: this node is SERVING_NODE,
+    operated by OPERATOR."""
+    monkeypatch.setenv('HEVOLVE_NODE_ID', SERVING_NODE)
+    _seed(db_factory, requester_spark=0)
+    return db_factory
 
 
-# ─── the exits: hive expert call ───
+class TestCreditServedCompute:
+
+    def test_serving_someone_else_credits_the_operator(self, server_db):
+        from integrations.agent_engine.budget_gate import credit_served_compute
+        moved = credit_served_compute(REQUESTER, REQUESTER_NODE,
+                                      _tokens_for_spark(2), _tokens_for_spark(1),
+                                      source='t')
+        assert moved == 3
+        assert _spark(server_db, OPERATOR) == 3
+        assert _rows(server_db) == [
+            (REQUESTER, OPERATOR, SERVING_NODE, _tokens_for_spark(2),
+             _tokens_for_spark(1), 3, 'credited', 'hive_compute_served')]
+
+    def test_fractions_carry_on_the_server_too(self, server_db):
+        from integrations.agent_engine.budget_gate import credit_served_compute
+        sixty = int(_tokens_for_spark(1) * 0.6)
+        assert credit_served_compute(REQUESTER, REQUESTER_NODE, sixty, 0,
+                                     source='t') == 0
+        assert credit_served_compute(REQUESTER, REQUESTER_NODE, sixty, 0,
+                                     source='t') == 1
+        assert _spark(server_db, OPERATOR) == 1
+
+    def test_serving_its_own_operator_earns_nothing(self, server_db):
+        from integrations.agent_engine.budget_gate import credit_served_compute
+        assert credit_served_compute(OPERATOR, REQUESTER_NODE,
+                                     _tokens_for_spark(5), 0, source='t') == 0
+        assert _spark(server_db, OPERATOR) == 0
+        assert _rows(server_db) == []
+
+    def test_a_same_user_requesting_node_earns_nothing(self, server_db, monkeypatch):
+        from core.peer_link.link import PeerLink, TrustLevel
+        from integrations.agent_engine.budget_gate import credit_served_compute
+        monkeypatch.setenv('HEVOLVE_USER_ID', REQUESTER)
+        link = PeerLink(REQUESTER_NODE, 'r.example:6777', TrustLevel.SAME_USER)
+        mgr = MagicMock()
+        mgr.get_link.side_effect = lambda pid: link if pid == REQUESTER_NODE else None
+        monkeypatch.setattr('core.peer_link.link_manager.get_link_manager',
+                            lambda: mgr)
+        assert credit_served_compute(REQUESTER, REQUESTER_NODE,
+                                     _tokens_for_spark(5), 0, source='t') == 0
+        assert _rows(server_db) == []
+
+    def test_no_requester_or_no_operator_earns_nothing(self, db_factory, monkeypatch):
+        from integrations.agent_engine.budget_gate import credit_served_compute
+        monkeypatch.setenv('HEVOLVE_NODE_ID', 'node-with-no-row')
+        _seed(db_factory)
+        assert credit_served_compute('', REQUESTER_NODE, 10 ** 6, 0, source='t') == 0
+        assert credit_served_compute(REQUESTER, REQUESTER_NODE, 10 ** 6, 0,
+                                     source='t') == 0
+        assert _rows(db_factory) == []
+
+    def test_served_rows_are_never_settled(self, server_db):
+        from integrations.agent_engine.budget_gate import credit_served_compute
+        credit_served_compute(REQUESTER, REQUESTER_NODE, _tokens_for_spark(2), 0,
+                              source='t')
+        _settle(server_db)
+        assert _spark(server_db, OPERATOR) == 2
+
+
+# ─── the wallet debit is one conditional UPDATE ───
+
+class TestSpendSparkIsAtomic:
+
+    def test_a_stale_balance_cannot_spend_twice(self, db_factory):
+        """Session A loads the wallet (10 Spark).  Session B spends the 10 and
+        commits.  A's spend must see the database, not its stale copy: the
+        read-then-write version let both succeed from one balance."""
+        from integrations.social.resonance_engine import ResonanceService
+        _seed(db_factory, requester_spark=10)
+        a = db_factory()
+        try:
+            ResonanceService.get_or_create_wallet(a, REQUESTER)
+            b = db_factory()
+            ok_b, _ = ResonanceService.spend_spark(b, REQUESTER, 10, 't')
+            b.commit()
+            b.close()
+            ok_a, left = ResonanceService.spend_spark(a, REQUESTER, 10, 't')
+            a.commit()
+        finally:
+            a.close()
+        assert ok_b is True
+        assert ok_a is False and left == 0
+        assert _spark(db_factory, REQUESTER) == 0
+
+
+# ─── the exits and the two halves agree ───
 
 def _hive_expert(peer_id=SERVING_NODE, is_local=False):
     from integrations.agent_engine.model_registry import ModelBackend, ModelTier
@@ -304,40 +464,48 @@ def _dispatcher():
     return SpeculativeDispatcher(model_registry=ModelRegistry())
 
 
-def _resp(status, body):
-    r = MagicMock()
-    r.status_code = status
-    r.json.return_value = body
-    return r
+class _TwoNodes:
+    """The requester's database and the server's, and a switch between them:
+    code runs as whichever node the test says it is."""
+
+    def __init__(self, monkeypatch):
+        self.req, self.srv = _factory(), _factory()
+        self._mp = monkeypatch
+        _seed(self.req, requester_spark=1000)
+        _seed(self.srv, requester_spark=0)
+
+    def be(self, node):
+        factory = self.req if node == REQUESTER_NODE else self.srv
+        self._mp.setattr(_models, 'get_db', lambda: factory())
+        self._mp.setenv('HEVOLVE_NODE_ID', node)
 
 
 class TestHiveExpertExit:
 
-    def test_completed_hive_call_charges_real_usage_tokens(self, db_factory):
+    def test_request_names_the_requester(self, db_factory):
         _seed(db_factory, requester_spark=100)
-        tin, tout = _tokens_for_spark(1), _tokens_for_spark(2)
-        body = {'choices': [{'message': {'content': 'the answer'}}],
-                'usage': {'prompt_tokens': tin, 'completion_tokens': tout}}
-        with patch('requests.post', return_value=_resp(200, body)):
-            out = _dispatcher()._dispatch_expert_langchain(
+        body = {'choices': [{'message': {'content': 'ok'}}]}
+        with patch('requests.post', return_value=_resp(200, body)) as post:
+            _dispatcher()._dispatch_expert_langchain(
                 _hive_expert(), 'q', REQUESTER, None, 'general', None)
-        assert out == 'the answer'
-        assert _spark(db_factory, REQUESTER) == 97
-        rows = _rows(db_factory)
-        assert [(r[0], r[1], r[3], r[4]) for r in rows] == [
-            (REQUESTER, OPERATOR, tin, tout)]
+        headers = post.call_args.kwargs['headers']
+        assert headers['X-Hart-Requester-User'] == REQUESTER
+        assert headers['X-Hart-Requester-Node'] == REQUESTER_NODE
 
-    def test_completed_hive_call_without_usage_charges_counted_tokens(self, db_factory):
+    def test_inflated_usage_cannot_drain_the_requester(self, db_factory):
+        """Reviewer probe 1, end to end: 1000 Spark stays 1000."""
         from core.token_utils import count_tokens_for_text
-        _seed(db_factory, requester_spark=100)
-        prompt, answer = 'why ' * 40, 'because ' * 30
-        body = {'choices': [{'message': {'content': answer}}]}
+        _seed(db_factory, requester_spark=1000)
+        body = {'choices': [{'message': {'content': 'ok'}}],
+                'usage': {'prompt_tokens': _tokens_for_spark(900),
+                          'completion_tokens': 0}}
         with patch('requests.post', return_value=_resp(200, body)):
             _dispatcher()._dispatch_expert_langchain(
-                _hive_expert(), prompt, REQUESTER, None, 'general', None)
-        rows = _rows(db_factory)
-        assert [(r[3], r[4]) for r in rows] == [
-            (count_tokens_for_text(prompt), count_tokens_for_text(answer))]
+                _hive_expert(), 'q', REQUESTER, None, 'general', None)
+        _settle(db_factory)
+        assert _spark(db_factory, REQUESTER) == 1000
+        assert [(r[3], r[4]) for r in _rows(db_factory)] == [
+            (count_tokens_for_text('q'), 0)]
 
     @pytest.mark.parametrize('resp', [
         _resp(500, {}),
@@ -366,6 +534,43 @@ class TestHiveExpertExit:
         assert _spark(db_factory, REQUESTER) == 100
         assert _rows(db_factory) == []
 
+    def test_spend_equals_earn_across_two_nodes(self, monkeypatch):
+        """The server half runs INSIDE the requester's HTTP call, on the
+        server's own database, fed the exact request the requester sent and
+        answering with a usage block that overstates the prompt.  After
+        many exchanges the requester's debit equals the operator's credit,
+        and neither node wrote the other's wallet."""
+        from integrations.agent_engine.budget_gate import credit_served_completion
+        nodes = _TwoNodes(monkeypatch)
+        fake_mgr = MagicMock()
+        fake_mgr.get_link.return_value = None
+        monkeypatch.setattr('core.peer_link.link_manager.get_link_manager',
+                            lambda: fake_mgr)
+        answer = 'x ' * 1400
+
+        def _serve(url, headers=None, json=None, timeout=None):
+            reply = {'choices': [{'message': {'content': answer}}],
+                     'usage': {'prompt_tokens': 10 ** 7, 'completion_tokens': 1400}}
+            nodes.be(SERVING_NODE)
+            try:
+                credit_served_completion(headers, json, reply)
+            finally:
+                nodes.be(REQUESTER_NODE)
+            return _resp(200, reply)
+
+        nodes.be(REQUESTER_NODE)
+        prompt = 'word ' * 60000
+        with patch('requests.post', side_effect=_serve):
+            for _ in range(12):
+                _dispatcher()._dispatch_expert_langchain(
+                    _hive_expert(), prompt, REQUESTER, None, 'general', None)
+        spent = 1000 - _spark(nodes.req, REQUESTER)
+        earned = _spark(nodes.srv, OPERATOR)
+        assert spent > 0
+        assert spent == earned
+        assert _spark(nodes.req, OPERATOR) == 0      # no cross-node credit
+        assert [r[3:5] for r in _rows(nodes.req)] == [r[3:5] for r in _rows(nodes.srv)]
+
     def test_discovery_records_the_serving_peer_on_the_backend(self):
         from integrations.agent_engine.hive_expert_discovery import HiveExpertDiscovery
         from integrations.agent_engine.model_registry import ModelRegistry
@@ -382,20 +587,40 @@ class TestHiveExpertExit:
         assert backend.config_list_entry['peer_id'] == 'peer-xyz'
 
 
+class TestServedCompletionRoute:
+
+    def test_an_sdk_call_without_the_header_earns_nothing(self, server_db):
+        from integrations.agent_engine.budget_gate import credit_served_completion
+        req = {'messages': [{'role': 'user', 'content': 'w ' * 99999}],
+               'max_tokens': 100}
+        reply = {'choices': [{'message': {'content': 'ok'}}]}
+        assert credit_served_completion({}, req, reply) == 0
+        assert _rows(server_db) == []
+
+    def test_an_empty_reply_earns_nothing(self, server_db):
+        from integrations.agent_engine.budget_gate import credit_served_completion
+        req = {'messages': [{'role': 'user', 'content': 'w ' * 99999}]}
+        headers = {'X-Hart-Requester-User': REQUESTER}
+        assert credit_served_completion(
+            headers, req, {'choices': [{'message': {'content': ''}}]}) == 0
+        assert _rows(server_db) == []
+
+
 # ─── the exits: compute mesh ───
 
-class TestComputeMeshExit:
+def _mesh(peer_id=SERVING_NODE):
+    import threading
+    from integrations.agent_engine.compute_mesh_service import (
+        ComputeMeshService, MeshPeer)
+    mesh = ComputeMeshService.__new__(ComputeMeshService)
+    mesh._lock = threading.Lock()
+    mesh._peers = {peer_id: MeshPeer(peer_id, '10.0.0.5', 'k' * 32)}
+    mesh._device_id = 'dev-' + peer_id
+    mesh.task_relay_port = 6796
+    return mesh
 
-    def _mesh(self, peer_id=SERVING_NODE):
-        from integrations.agent_engine.compute_mesh_service import (
-            ComputeMeshService, MeshPeer)
-        mesh = ComputeMeshService.__new__(ComputeMeshService)
-        import threading
-        mesh._lock = threading.Lock()
-        mesh._peers = {peer_id: MeshPeer(peer_id, '10.0.0.5', 'k' * 32)}
-        mesh._device_id = 'dev-requester'
-        mesh.task_relay_port = 6796
-        return mesh
+
+class TestComputeMeshExit:
 
     def test_completed_offload_charges_counted_tokens(self, db_factory):
         from core.token_utils import count_tokens_for_text
@@ -403,51 +628,91 @@ class TestComputeMeshExit:
         prompt, answer = 'describe ' * 30, 'a cat ' * 40
         with patch('core.http_pool.pooled_post',
                    return_value=_resp(200, {'response': answer, 'model': 'q'})):
-            out = self._mesh().offload_inference(
+            out = _mesh().offload_inference(
                 SERVING_NODE, 'llm', prompt, {'user_id': REQUESTER})
         assert out['response'] == answer
-        rows = _rows(db_factory)
-        assert [(r[0], r[1], r[3], r[4]) for r in rows] == [
+        assert [(r[0], r[1], r[3], r[4]) for r in _rows(db_factory)] == [
             (REQUESTER, OPERATOR, count_tokens_for_text(prompt),
              count_tokens_for_text(answer))]
 
-    def test_completed_offload_charges_usage_when_the_peer_reports_it(self, db_factory):
+    def test_inflated_usage_is_capped(self, db_factory):
+        from core.token_utils import count_tokens_for_text
         _seed(db_factory, requester_spark=100)
-        body = {'response': 'x', 'usage': {'prompt_tokens': _tokens_for_spark(2),
-                                           'completion_tokens': 0}}
+        body = {'response': 'x', 'usage': {'prompt_tokens': _tokens_for_spark(90),
+                                           'completion_tokens': 10 ** 6}}
         with patch('core.http_pool.pooled_post', return_value=_resp(200, body)):
-            self._mesh().offload_inference(SERVING_NODE, 'llm', 'p',
-                                           {'user_id': REQUESTER})
-        assert _spark(db_factory, REQUESTER) == 98
+            _mesh().offload_inference(SERVING_NODE, 'llm', 'p',
+                                      {'user_id': REQUESTER})
+        assert _spark(db_factory, REQUESTER) == 100
+        from integrations.agent_engine.compute_mesh_service import MESH_INFER_MAX_TOKENS
+        assert [(r[3], r[4]) for r in _rows(db_factory)] == [
+            (count_tokens_for_text('p'), MESH_INFER_MAX_TOKENS)]
 
     def test_failed_offload_charges_nothing(self, db_factory):
         _seed(db_factory, requester_spark=100)
         with patch('core.http_pool.pooled_post', return_value=_resp(502, {})):
-            out = self._mesh().offload_inference(
+            out = _mesh().offload_inference(
                 SERVING_NODE, 'llm', 'p' * 4000, {'user_id': REQUESTER})
         assert 'error' in out
         assert _rows(db_factory) == []
-
-    def test_the_peer_is_not_told_who_the_requester_is(self, db_factory):
-        """The requester's id is for this node's ledger; the peer is not
-        theirs (owner ruling 2026-09-26) and its /mesh/infer never reads it."""
-        _seed(db_factory, requester_spark=100)
-        with patch('core.http_pool.pooled_post',
-                   return_value=_resp(200, {'response': 'ok'})) as post:
-            self._mesh().offload_inference(
-                SERVING_NODE, 'llm', 'p', {'user_id': REQUESTER, 'timeout': 5})
-        sent = post.call_args.kwargs['json']
-        assert 'user_id' not in sent['options']
-        assert sent['options'] == {'timeout': 5}
-        assert len(_rows(db_factory)) == 1   # and it was still charged
 
     def test_error_body_charges_nothing(self, db_factory):
         _seed(db_factory, requester_spark=100)
         with patch('core.http_pool.pooled_post',
                    return_value=_resp(200, {'error': 'Local inference failed'})):
-            self._mesh().offload_inference(
+            _mesh().offload_inference(
                 SERVING_NODE, 'llm', 'p' * 4000, {'user_id': REQUESTER})
         assert _rows(db_factory) == []
+
+    def test_the_payload_names_the_requester_and_the_cap(self, db_factory):
+        from integrations.agent_engine.compute_mesh_service import MESH_INFER_MAX_TOKENS
+        _seed(db_factory, requester_spark=100)
+        with patch('core.http_pool.pooled_post',
+                   return_value=_resp(200, {'response': 'ok'})) as post:
+            _mesh().offload_inference(
+                SERVING_NODE, 'llm', 'p', {'user_id': REQUESTER, 'timeout': 5})
+        sent = post.call_args.kwargs['json']
+        assert sent['requester_user_id'] == REQUESTER
+        assert sent['requester_node_id'] == REQUESTER_NODE
+        assert sent['options'] == {'timeout': 5, 'max_tokens': MESH_INFER_MAX_TOKENS}
+
+    def test_spend_equals_earn_across_two_nodes(self, monkeypatch):
+        """The requester's /mesh/infer POST lands on the server's real
+        _route_infer, running on the server's own database, whose Model Bus
+        answers with an inflated usage block."""
+        nodes = _TwoNodes(monkeypatch)
+        fake_mgr = MagicMock()
+        fake_mgr.get_link.return_value = None
+        monkeypatch.setattr('core.peer_link.link_manager.get_link_manager',
+                            lambda: fake_mgr)
+        server = _mesh(REQUESTER_NODE)
+        server._compute_contribute_consented = lambda: True
+        answer = 'y ' * 900
+
+        def _post(url, json=None, timeout=None, **kw):
+            if url.endswith('/v1/chat'):          # the server's own Model Bus
+                return _resp(200, {'response': answer, 'model': 'q',
+                                   'usage': {'prompt_tokens': 10 ** 7,
+                                             'completion_tokens': 10 ** 7}})
+            nodes.be(SERVING_NODE)
+            try:
+                status, _ct, out = server._route_infer(
+                    __import__('json').dumps(json).encode('utf-8'))
+            finally:
+                nodes.be(REQUESTER_NODE)
+            return _resp(status, __import__('json').loads(out))
+
+        nodes.be(REQUESTER_NODE)
+        prompt = 'word ' * 80000
+        with patch('core.http_pool.pooled_post', side_effect=_post):
+            for _ in range(10):
+                _mesh().offload_inference(SERVING_NODE, 'llm', prompt,
+                                          {'user_id': REQUESTER})
+        spent = 1000 - _spark(nodes.req, REQUESTER)
+        earned = _spark(nodes.srv, OPERATOR)
+        assert spent > 0
+        assert spent == earned
+        assert [r[3:5] for r in _rows(nodes.req)] == [r[3:5] for r in _rows(nodes.srv)]
 
 
 class TestMeshCallersNameTheRequester:
@@ -512,16 +777,119 @@ class TestMeshCallersNameTheRequester:
         assert opts['user_id'] == 'u-vision'
 
 
-# ─── settlement has a scheduled caller ───
+# ─── the node id is the gossip id every PeerNode row is keyed by ───
+
+class TestCanonicalNodeId:
+
+    def test_unset_env_uses_the_gossip_id(self, monkeypatch):
+        from integrations.agent_engine.budget_gate import _this_node_id
+        from integrations.agent_engine.hive_capability_advertiser import _local_peer_id
+        monkeypatch.delenv('HEVOLVE_NODE_ID', raising=False)
+        monkeypatch.setattr(
+            'integrations.social.sync_engine.SyncEngine.canonical_node_id',
+            staticmethod(lambda: 'gossip-uuid-1'))
+        assert _this_node_id() == 'gossip-uuid-1'
+        assert _local_peer_id() == 'gossip-uuid-1'
+
+    def test_an_explicit_env_still_wins(self, monkeypatch):
+        from integrations.agent_engine.budget_gate import _this_node_id
+        monkeypatch.setenv('HEVOLVE_NODE_ID', 'node-prod-7')
+        monkeypatch.setattr(
+            'integrations.social.sync_engine.SyncEngine.canonical_node_id',
+            staticmethod(lambda: 'gossip-uuid-1'))
+        assert _this_node_id() == 'node-prod-7'
+
+    def test_discovery_skips_its_own_gossip_id_announce(self, monkeypatch):
+        from integrations.agent_engine.hive_expert_discovery import HiveExpertDiscovery
+        from integrations.agent_engine.model_registry import ModelRegistry
+        monkeypatch.delenv('HEVOLVE_NODE_ID', raising=False)
+        monkeypatch.setattr(
+            'integrations.social.sync_engine.SyncEngine.canonical_node_id',
+            staticmethod(lambda: 'gossip-uuid-1'))
+        reg = ModelRegistry()
+        disc = HiveExpertDiscovery(registry=reg)
+        with patch.object(HiveExpertDiscovery, '_verify_peer_trust', return_value=True), \
+                patch.object(HiveExpertDiscovery, '_ping_latency', return_value=12.0):
+            n = disc.on_peer_announce({
+                'peer_id': 'gossip-uuid-1', 'endpoint': 'https://me.example',
+                'models': [{'model_id': 'big', 'tier': 'expert',
+                            'verified_baseline': 0.9}]})
+        assert n == 0
+        assert reg.get_model('hive-gossip-uuid-1-big') is None
+
+
+# ─── migration v57: plain DDL behind an existence check ───
+
+class TestMigrationV57:
+
+    def _engine_without_column(self, tmp_path):
+        from sqlalchemy import text
+        from integrations.social import migrations as mig
+        engine = create_engine(f"sqlite:///{tmp_path / 'm.db'}")
+        mig.Base.metadata.create_all(engine)
+        with engine.connect() as conn:
+            conn.execute(text("DROP INDEX IF EXISTS "
+                              "ix_metered_api_usage_requester_user_id"))
+            conn.execute(text("ALTER TABLE metered_api_usage "
+                              "DROP COLUMN requester_user_id"))
+            conn.commit()
+        mig.set_schema_version(engine, 56)
+        return engine
+
+    def test_adds_column_and_index_with_plain_ddl(self, tmp_path, monkeypatch):
+        from sqlalchemy import event, inspect as sa_inspect
+        from integrations.social import migrations as mig
+        engine = self._engine_without_column(tmp_path)
+        sent = []
+        event.listen(engine, 'before_cursor_execute',
+                     lambda c, cur, stmt, *a: sent.append(stmt))
+        monkeypatch.setattr(mig, 'get_engine', lambda: engine)
+        monkeypatch.setattr(mig.Base.metadata, 'create_all', lambda *a, **k: None)
+        mig.run_migrations()
+        insp = sa_inspect(engine)
+        assert 'requester_user_id' in {c['name'] for c in insp.get_columns('metered_api_usage')}
+        assert 'ix_metered_api_usage_requester_user_id' in {
+            i['name'] for i in insp.get_indexes('metered_api_usage')}
+        assert mig.get_schema_version(engine) == mig.SCHEMA_VERSION
+        v57 = [s for s in sent if 'requester_user_id' in s]
+        assert v57 and not [s for s in v57 if 'IF NOT EXISTS' in s.upper()]
+
+    def test_a_failed_pass_is_not_stamped_done(self, tmp_path, monkeypatch):
+        from integrations.social import migrations as mig
+        engine = self._engine_without_column(tmp_path)
+        monkeypatch.setattr(mig, 'get_engine', lambda: engine)
+        monkeypatch.setattr(mig.Base.metadata, 'create_all', lambda *a, **k: None)
+        monkeypatch.setattr(mig, '_v57_requester_user_id', lambda e: False)
+        mig.run_migrations()
+        assert mig.get_schema_version(engine) == 56
+
+    def test_a_second_pass_is_a_no_op(self, tmp_path, monkeypatch):
+        from sqlalchemy import event
+        from integrations.social import migrations as mig
+        engine = self._engine_without_column(tmp_path)
+        assert mig._v57_requester_user_id(engine) is True
+        sent = []
+        event.listen(engine, 'before_cursor_execute',
+                     lambda c, cur, stmt, *a: sent.append(stmt))
+        assert mig._v57_requester_user_id(engine) is True
+        assert not [s for s in sent if s.lstrip().upper().startswith(('ALTER', 'CREATE'))]
+
+
+# ─── settlement (metered API rows) has a scheduled caller ───
+
+def _pending_api_row(factory):
+    with _session(factory) as db:
+        db.add(MeteredAPIUsage(node_id=SERVING_NODE, operator_id=OPERATOR,
+                               model_id='gpt-4o', task_source='hive',
+                               actual_usd_cost=0.03, settlement_status='pending'))
+
 
 class TestScheduledSettlement:
 
-    def test_daemon_tick_settles_pending_compute(self, db_factory, monkeypatch):
+    def test_daemon_tick_settles_pending_rows(self, db_factory, monkeypatch):
         from integrations.agent_engine.agent_daemon import AgentDaemon
-        from integrations.agent_engine.budget_gate import charge_remote_compute
-        _seed(db_factory, requester_spark=100)
-        charge_remote_compute(REQUESTER, SERVING_NODE, _tokens_for_spark(3), 0,
-                              source='t')
+        _seed(db_factory)
+        _pending_api_row(db_factory)
         monkeypatch.setattr('integrations.agent_engine.dispatch.should_yield_to_user',
                             lambda: False)
         d = AgentDaemon()
@@ -531,10 +899,8 @@ class TestScheduledSettlement:
 
     def test_off_cadence_tick_does_not_settle(self, db_factory, monkeypatch):
         from integrations.agent_engine.agent_daemon import AgentDaemon
-        from integrations.agent_engine.budget_gate import charge_remote_compute
-        _seed(db_factory, requester_spark=100)
-        charge_remote_compute(REQUESTER, SERVING_NODE, _tokens_for_spark(3), 0,
-                              source='t')
+        _seed(db_factory)
+        _pending_api_row(db_factory)
         monkeypatch.setattr('integrations.agent_engine.dispatch.should_yield_to_user',
                             lambda: False)
         d = AgentDaemon()

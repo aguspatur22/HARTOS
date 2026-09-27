@@ -232,3 +232,109 @@ def test_another_users_grant_does_not_make_a_name_resolvable():
 def test_known_agent_id_is_public_on_the_consent_service(raw, want):
     from integrations.social.consent_service import known_agent_id
     assert known_agent_id(raw) == want
+
+
+# ── Grants gate resolution only, never masking (reviewer, 2026-09-27) ──
+#
+# The mask used to ask the consent table which names are the owner's at MASK
+# time, so a value resolved while granted went back to the model and the log
+# in plaintext when the grant was revoked during the call, or when the
+# consent read failed ("database is locked").  A value this process handed a
+# tool stays masked for the life of the process.
+
+def _granted_site_password():
+    from integrations.social.consent_service import ConsentService
+    os.environ['SITE_PASSWORD'] = SECRET
+    with db_session(commit=True) as db:
+        ConsentService.grant_consent(db, OWNER, 'credential',
+                                     'secret:SITE_PASSWORD')
+
+
+def test_a_grant_revoked_during_the_call_still_masks_the_value(tool_log):
+    from core.tool_logging import log_tool_execution
+    from integrations.social.consent_service import ConsentService
+    _granted_site_password()
+
+    @log_tool_execution
+    def login(password: str) -> str:
+        with db_session(commit=True) as db:
+            ConsentService.revoke_consent(db, OWNER, 'credential',
+                                          'secret:SITE_PASSWORD')
+        return 'server echoed ' + password
+
+    out = login('{{secret:SITE_PASSWORD}}')
+    assert SECRET not in out and '{{secret:SITE_PASSWORD}}' in out
+    assert SECRET not in tool_log.getvalue()
+    # and the revoke did stop the NEXT resolution
+    assert _vault().resolve_aliases('{{secret:SITE_PASSWORD}}') \
+        == '{{secret:SITE_PASSWORD}}'
+
+
+def test_a_locked_consent_read_still_masks_and_fails_closed(tool_log, monkeypatch):
+    from core.tool_logging import log_tool_execution
+    from integrations.social.consent_service import ConsentService
+    _granted_site_password()
+    real_list = ConsentService.list_consents
+    calls = {'n': 0}
+
+    def locked_after_first(db, user_id, consent_type=None, agent_id=None):
+        calls['n'] += 1
+        if calls['n'] > 1:
+            raise RuntimeError('database is locked')
+        return real_list(db, user_id, consent_type, agent_id)
+
+    monkeypatch.setattr(ConsentService, 'list_consents',
+                        staticmethod(locked_after_first))
+
+    @log_tool_execution
+    def login(password: str) -> str:
+        raise RuntimeError('login failed for ' + password)
+
+    out = login('{{secret:SITE_PASSWORD}}')
+    assert calls['n'] >= 1
+    assert SECRET not in out and '{{secret:SITE_PASSWORD}}' in out
+    assert SECRET not in tool_log.getvalue()
+    # a failed read resolves nothing new
+    assert _vault().resolve_aliases('{{secret:SITE_PASSWORD}}') \
+        == '{{secret:SITE_PASSWORD}}'
+
+
+def test_a_value_changed_after_resolving_keeps_the_old_value_masked():
+    _granted_site_password()
+    vault = _vault()
+    assert vault.resolve_aliases('{{secret:SITE_PASSWORD}}') == SECRET
+    os.environ['SITE_PASSWORD'] = 'a-new-DUMMY-value-999'
+    assert vault.mask_secrets('old ' + SECRET) == 'old {{secret:SITE_PASSWORD}}'
+
+
+def test_a_percent_encoded_value_is_masked():
+    """requests puts the URL, percent-encoded, into its exception text."""
+    from urllib.parse import quote, quote_plus
+    tricky = 'Pr0be&Value-DUMMY/+=x y'
+    _vault().store_credential('url_password', tricky)
+    _vault().resolve_aliases('{{secret:URL_PASSWORD}}')
+    for spelled in (quote(tricky, safe=''), quote_plus(tricky, safe='')):
+        assert _vault().mask_secrets('url=' + spelled) \
+            == 'url={{secret:URL_PASSWORD}}'
+
+
+def test_masking_does_not_read_the_consent_table(monkeypatch):
+    """Grants gate resolution only, so a tool call with no alias costs no
+    consent query."""
+    from integrations.social.consent_service import ConsentService
+    from core.tool_logging import log_tool_execution
+
+    reads = []
+
+    def counting(*a, **k):
+        reads.append(a)
+        return []
+    monkeypatch.setattr(ConsentService, 'list_consents', staticmethod(counting))
+
+    @log_tool_execution
+    def noop(x: str) -> str:
+        return 'ok ' + x
+
+    assert noop('hello') == 'ok hello'
+    assert _vault().mask_secrets('plain') == 'plain'
+    assert reads == []

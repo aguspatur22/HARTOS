@@ -118,7 +118,9 @@ LLAMA_SLOTS_DEFAULT: int = 1
 # overhead, NOT a tokenizer under-count.  Reserve enough to cover it with head-
 # room; the cost is a slightly shorter trimmed history, which autogen tolerates.
 WIRE_TRIM_SAFETY_MARGIN_TOKENS: int = 2816       # 256 base + ~2560 template-render reserve
-WIRE_TRIM_MARKER: str = '...[truncated head]...\n'
+# Put where the wire trim elided the MIDDLE of a message (head and tail kept:
+# core.llm_outbound_logger._truncate_msg_content).
+WIRE_TRIM_MARKER: str = '\n...[truncated middle]...\n'
 # Seed injected at the wire when an outbound body carries no role='user'
 # turn.  llama-server's Qwen3 chat template raises a hard 500 "No user
 # query found in messages." whenever the messages array reaches it without

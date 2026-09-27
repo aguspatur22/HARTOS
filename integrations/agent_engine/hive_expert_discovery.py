@@ -69,7 +69,6 @@ Nothing in this file duplicates existing primitives:
 from __future__ import annotations
 
 import logging
-import os
 import threading
 import time
 from typing import Any, Dict, List, Optional, Set
@@ -352,12 +351,15 @@ class HiveExpertDiscovery:
         # The check belongs here, not in the producer, because any
         # consumer can apply it whether or not the local producer is
         # running.
-        local_peer = (os.environ.get('HEVOLVE_NODE_ID') or '').strip()
-        if local_peer and local_peer.lower() != 'local' and (
-                peer_id == local_peer):
+        # The id this node's own advertiser announces with (HEVOLVE_NODE_ID,
+        # else the canonical gossip id): one resolver for both ends.
+        from integrations.agent_engine.hive_capability_advertiser import (
+            _local_peer_id)
+        local_peer = _local_peer_id()
+        if local_peer and peer_id == local_peer:
             logger.debug(
                 "HiveExpertDiscovery: ignoring self-announce from "
-                "peer_id=%r (matches HEVOLVE_NODE_ID)", peer_id)
+                "peer_id=%r (this node's own id)", peer_id)
             return 0
 
         if not self._verify_peer_trust(msg):

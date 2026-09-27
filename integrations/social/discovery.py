@@ -56,22 +56,17 @@ def _check_announce_rate(ip: str) -> bool:
 
 
 def _rate_client_key() -> str:
-    """Who to charge a rate-limited request to.
+    """Who to charge a rate-limited request to: core.auth_local.
+    client_address(), the one "client address" rule.
 
     Behind Kong the socket peer is the gateway for EVERY node, so keying on
-    it made the whole network share one budget (55d8b9152). But
-    X-Forwarded-For is written by whoever sends the request, so it may only
-    be believed when the socket peer is a forwarder we run: the configured
-    TRUSTED_PROXY (the gate core/auth_local.py uses), or a literal loopback
-    or private address (a gateway on this host or this LAN). A direct
-    client from anywhere else is charged by its socket address, and a
-    header it sends cannot move it to a fresh budget."""
-    from security.middleware import _is_private_address
-    peer = request.remote_addr or ''
-    trusted = os.environ.get('TRUSTED_PROXY', '')
-    if peer and ((trusted and peer == trusted) or _is_private_address(peer)):
-        return _observed_ip() or peer
-    return peer or '0.0.0.0'
+    it made the whole network share one budget (55d8b9152); a node behind a
+    gateway sets TRUSTED_PROXY to it.  X-Forwarded-For is believed from that
+    forwarder or loopback only: d35926896 also believed it from any private
+    socket peer, and every LAN host escaped both limiters by rotating the
+    header (review: 199/199 announces, 100/100 device asks)."""
+    from core.auth_local import client_address
+    return client_address() or request.remote_addr or '0.0.0.0'
 
 
 def check_client_rate() -> bool:
@@ -208,7 +203,9 @@ def discover_communities():
 # ════════════════════════════════════════════════════════════════
 
 def _observed_ip() -> str:
-    """The IP this request ACTUALLY came from, as seen by us or our proxy.
+    """The IP this request ACTUALLY came from: core.auth_local.
+    client_address(), the one rule the rate limiter and the local-caller
+    check use too.
 
     Why: the peer registry is poisoned by claimed addresses — measured
     2026-08-07 on central's live table, 147 peers, 67 advertising
@@ -216,20 +213,15 @@ def _observed_ip() -> str:
     behind NAT cannot know its own public address, but the RECEIVER of its
     announce can see it.  This is the one place that truth exists.
 
-    Proxy handling: behind Kong the socket peer is the gateway, and the real
-    client is in X-Forwarded-For.  We take the LAST entry — the one appended
-    by the outermost proxy we trust — never the first, which a direct client
-    can forge outright.  (A client-forged XFF still gets the real address
-    APPENDED by Kong, so last-wins survives spoofing; and on a direct LAN
-    request there is no XFF and remote_addr is already the truth.)  Worst
-    case this field is a wrong dial CANDIDATE, never a trust input.
+    Behind Kong the real client is the LAST X-Forwarded-For hop (the one the
+    gateway appended), believed only from a forwarder this node runs
+    (TRUSTED_PROXY or loopback).  It used to be believed from ANY caller;
+    since 02da559f7 it also decides whether a direct announce makes its row
+    'active' (peer_discovery.address_evidence), so a forged header must not
+    move it.
     """
-    xff = (request.headers.get('X-Forwarded-For') or '').strip()
-    if xff:
-        last_hop = xff.split(',')[-1].strip()
-        if last_hop:
-            return last_hop
-    return request.remote_addr or ''
+    from core.auth_local import client_address
+    return client_address()
 
 
 @discovery_bp.route('/api/social/peers/announce', methods=['POST'])

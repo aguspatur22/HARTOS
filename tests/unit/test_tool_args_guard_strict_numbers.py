@@ -110,7 +110,41 @@ class StrictNumbers(unittest.TestCase):
         out = _out_args(ensure_tool_call_arguments_json(
             _call("{'key': 'user.id', 'value': 620e51403072992921}")))
         parsed = _strict_loads(out)
-        self.assertEqual(parsed['key'], 'user.id')
+        # The id survives the repair as the token the model wrote: repair_json
+        # alone turns it into Infinity, which reached the wire as the string
+        # "Infinity" (review of bb809af28/b0fa4989e, problem 3).
+        self.assertEqual(parsed, {'key': 'user.id', 'value': '620e51403072992921'})
+
+    def test_overflow_before_trailing_junk_keeps_its_token(self):
+        out = _out_args(ensure_tool_call_arguments_json(_call('{"v":1e999} xyz')))
+        self.assertEqual(_strict_loads(out), {'v': '1e999'})
+
+    def test_negative_overflow_in_broken_json_keeps_its_token(self):
+        out = _out_args(ensure_tool_call_arguments_json(
+            _call("{'v': -620e51403072992921}")))
+        self.assertEqual(_strict_loads(out), {'v': '-620e51403072992921'})
+
+    def test_repair_leaves_an_overflow_inside_a_string_and_finite_numbers_alone(self):
+        # Only a bare overflowing number is quoted: the same text inside a
+        # string stays the string it was, and a finite int stays an int.
+        out = _out_args(ensure_tool_call_arguments_json(
+            _call("{'note': 'id 1e999, see \\'x\\'', 'n': 3, 'v': 1e999}")))
+        parsed = _strict_loads(out)
+        self.assertEqual(parsed, {'note': "id 1e999, see 'x'", 'n': 3, 'v': '1e999'})
+        self.assertIs(type(parsed['n']), int)
+
+    def test_a_coerced_call_keeps_each_finite_number_its_own_type(self):
+        # Coercion re-serialises the whole call: the overflow becomes its own
+        # string, and every finite number must come back as it was written,
+        # an int as an int (not 3.0) and a float unchanged.
+        out = _out_args(ensure_tool_call_arguments_json(_call(
+            '{"key":"user.id","count":3,"ratio":1.5,"value":620e51403072992921}')))
+        parsed = json.loads(out)
+        self.assertEqual(parsed, {'key': 'user.id', 'count': 3, 'ratio': 1.5,
+                                  'value': '620e51403072992921'})
+        self.assertIs(type(parsed['count']), int)
+        self.assertIs(type(parsed['ratio']), float)
+        self.assertIn('"count": 3,', out)
 
     def test_refused_non_object_falls_back_to_empty_object(self):
         # arguments must be an object; a list carrying NaN is neither

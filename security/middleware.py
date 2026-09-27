@@ -360,9 +360,11 @@ def _apply_api_auth(app: Flask, register: bool = True):
         user can stand in for it.
 
         Filing is what an unauthenticated peer can trigger, so it is paced
-        per address with the gossip announce limiter (discovery.
-        _check_announce_rate): past the limit the ask is not filed and the
-        answer is still ``consent_pending``, which an honest phone retries.
+        per CLIENT with the gossip announce limiter (discovery.
+        check_client_rate, keyed by core.auth_local.client_address: a LAN
+        host cannot rotate X-Forwarded-For into a fresh budget): past the
+        limit the ask is not filed and the answer is still
+        ``consent_pending``, which an honest phone retries.
         """
         auth_header = request.headers.get('Authorization', '')
         if not auth_header.startswith('Bearer '):

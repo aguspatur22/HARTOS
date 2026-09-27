@@ -1637,6 +1637,13 @@ try:
         except Exception as fwd_err:
             return jsonify({'error': f'HevolveAI backend unavailable: {fwd_err}'}), 502
 
+        # The serving half of a hive expert exchange: a peer's person asked,
+        # this node's operator earns the compute served (owner ruling
+        # 2026-09-26).  No requester header (an SDK client) earns nothing.
+        if resp.status_code == 200:
+            from integrations.agent_engine.budget_gate import credit_served_completion
+            credit_served_completion(request.headers, data, result)
+
         # Meter usage for the 90/9/1 revenue split. This passed keywords
         # record_metered_usage does not accept (provider/model/tokens/source);
         # the TypeError was swallowed below, so SDK usage was NEVER metered

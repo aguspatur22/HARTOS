@@ -287,6 +287,23 @@ def test_allow_asking_again_is_not_a_yes(world, card):
     assert 'SITE_PASSWORD' not in get_ai_key_vault().owner_credential_names()
 
 
+def test_reopen_never_brings_a_revoked_grant_back(world, card):
+    """The privacy page's own revoke (consent_api.revoke_consent) keeps
+    granted=True and sets revoked_at.  Reopening that row must not make it
+    an active grant again."""
+    from integrations.social.consent_service import ConsentService
+    from hartos.ai_key_vault import get_ai_key_vault
+    card('', {'consent_type': 'credential', 'scope': 'secret:SITE_PASSWORD'})
+    assert card('/revoke', {'consent_type': 'credential',
+                            'scope': 'secret:SITE_PASSWORD'}).status_code == 200
+    assert card('/reopen', {'consent_type': 'credential',
+                            'scope': 'secret:SITE_PASSWORD'}).status_code == 200
+    with db_session() as db:
+        assert ConsentService.active_grant(
+            db, OWNER, 'credential', 'secret:SITE_PASSWORD') is None
+    assert 'SITE_PASSWORD' not in get_ai_key_vault().owner_credential_names()
+
+
 def test_reopen_leaves_other_credentials_declined(world, card):
     from hartos.ai_key_vault import request_credential
     other = ASK.replace('site_password', 'other_key')

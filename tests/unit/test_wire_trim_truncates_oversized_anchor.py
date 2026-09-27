@@ -143,7 +143,7 @@ class WireTrimTruncatesOversizedAnchor(unittest.TestCase):
         self.assertIn('user', roles, 'anchor must survive as a user message')
         a_text = next(m['content'] for m in trimmed['messages']
                       if m.get('role') == 'user')
-        self.assertTrue(a_text.startswith(WIRE_TRIM_MARKER),
+        self.assertIn(WIRE_TRIM_MARKER, a_text,
                         'truncated anchor must carry the wire-trim marker')
         self.assertIn('TASK TAIL.', a_text,
                       'left-truncation must preserve the tail of the task')
@@ -190,7 +190,7 @@ class WireTrimTruncatesOversizedAnchor(unittest.TestCase):
             'the oversized system message was never truncated, so the '
             'request goes out doomed (measured 86x live)')
         sys_text = trimmed['messages'][0]['content']
-        self.assertTrue(sys_text.startswith(WIRE_TRIM_MARKER))
+        self.assertIn(WIRE_TRIM_MARKER, sys_text)
         self.assertIn('ACTIONABLE TAIL.', sys_text,
                       'left-truncation must keep the system tail')
 

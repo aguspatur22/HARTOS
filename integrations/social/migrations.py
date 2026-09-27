@@ -166,6 +166,41 @@ def _rekey_legacy_consent_flag(engine) -> tuple:
     return renamed, remaining
 
 
+def _v57_requester_user_id(engine) -> bool:
+    """Add metered_api_usage.requester_user_id and its index if absent.
+    True when the column exists afterwards."""
+    from sqlalchemy import inspect as sa_inspect
+
+    def _state():
+        insp = sa_inspect(engine)
+        if 'metered_api_usage' not in insp.get_table_names():
+            return False, False
+        cols = {c['name'] for c in insp.get_columns('metered_api_usage')}
+        idx = {i['name'] for i in insp.get_indexes('metered_api_usage')}
+        return ('requester_user_id' in cols,
+                'ix_metered_api_usage_requester_user_id' in idx)
+
+    has_col, has_idx = _state()
+    for needed, sql, label in [
+        (not has_col,
+         "ALTER TABLE metered_api_usage ADD COLUMN requester_user_id VARCHAR(64)",
+         "ADD COLUMN metered_api_usage.requester_user_id"),
+        (not has_idx,
+         "CREATE INDEX ix_metered_api_usage_requester_user_id "
+         "ON metered_api_usage (requester_user_id)",
+         "CREATE INDEX metered_api_usage(requester_user_id)"),
+    ]:
+        if not needed:
+            continue
+        try:
+            with engine.connect() as conn:
+                conn.execute(text(sql))
+                conn.commit()
+        except Exception as e:
+            logger.warning("v57 migration: %s failed: %s", label, e)
+    return _state()[0]
+
+
 def get_schema_version(engine) -> int:
     """Get current schema version from DB."""
     try:
@@ -2068,32 +2103,24 @@ def run_migrations():
 
     if current < 57:
         # v57 (2026-09-26): metered_api_usage.requester_user_id.  Owner ruling:
-        # a task run on a node its person does not own is charged to that
-        # person "proportinal to compute spent and earned".  The requesting
-        # node writes one row per completed remote call
-        # (budget_gate.charge_remote_compute); this column says whose task it
-        # was, so the fraction of a Spark not yet debited carries per person
-        # and operator.  Nullable, NULL on every other row.
+        # a task run on a node its person does not own is charged "proportinal
+        # to compute spent and earned".  Each node writes one ledger row per
+        # exchange naming the requester (budget_gate.charge_remote_compute on
+        # the requesting node, credit_served_compute on the serving one), so
+        # the fraction of a Spark not yet moved carries per person and
+        # operator.  Nullable, NULL on every other row.
+        #
+        # Plain DDL behind an inspector check, v38 style: MySQL 8 rejects
+        # CREATE INDEX IF NOT EXISTS.  The version is stamped only once the
+        # column exists, so a pass that fails is retried on the next boot
+        # instead of being recorded as done.
         logger.info("HevolveSocial: migrating to v57 "
                     "(metered_api_usage.requester_user_id)")
-        for sql, label in [
-            ("ALTER TABLE metered_api_usage ADD COLUMN requester_user_id "
-             "VARCHAR(64)", "ADD COLUMN metered_api_usage.requester_user_id"),
-            ("CREATE INDEX IF NOT EXISTS ix_metered_api_usage_requester_user_id "
-             "ON metered_api_usage (requester_user_id)",
-             "INDEX metered_api_usage(requester_user_id)"),
-        ]:
-            try:
-                with engine.connect() as conn:
-                    conn.execute(text(sql))
-                    conn.commit()
-            except Exception as e:
-                if _is_already_exists_error(e):
-                    logger.info("v57 migration: %s skipped (already exists)",
-                                label)
-                else:
-                    logger.warning("v57 migration: %s failed: %s", label, e)
-        set_schema_version(engine, 57)
+        if _v57_requester_user_id(engine):
+            set_schema_version(engine, 57)
+        else:
+            logger.warning("v57 migration: metered_api_usage.requester_user_id "
+                           "is still missing; retrying on the next boot")
 
     # v56's DATA repair, deliberately OUTSIDE the version gate above.
     #

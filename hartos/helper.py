@@ -1068,6 +1068,48 @@ def load_wire_json(text):
     return _wire_json_loads(text, _keep_refused_token)
 
 
+# A bare number token, and the string delimiters json_repair reads (its
+# constants.STRING_DELIMITERS: " ' and the curly pair), each with its closer.
+_BARE_NUMBER = re.compile(r'-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?')
+_STRING_CLOSER = {'"': '"', "'": "'", '“': '”', '”': '”'}
+
+
+def _quote_overflowing_numbers(text):
+    """``text`` with every bare number a double cannot hold put in double
+    quotes, for ``repair_json``: it reads such a number as inf and writes
+    Infinity, so the token the model wrote (an unquoted id like
+    ``620e51403072992921``) would be lost before ``load_wire_json`` sees it.
+    Text inside a string literal, and finite numbers, are left as they are;
+    a string whose delimiter never closes swallows the rest, which is then
+    left as it was."""
+    out, i, closer = [], 0, None
+    while i < len(text):
+        ch = text[i]
+        if closer:
+            step = 2 if ch == '\\' else 1
+            out.append(text[i:i + step])
+            if ch == closer:
+                closer = None
+            i += step
+            continue
+        if ch in _STRING_CLOSER:
+            closer = _STRING_CLOSER[ch]
+            out.append(ch)
+            i += 1
+            continue
+        match = _BARE_NUMBER.match(text, i)
+        if match and not (i and (text[i - 1].isalnum() or text[i - 1] in '_.')):
+            token, end = match.group(), match.end()
+            bounded = end == len(text) or not (text[end].isalnum() or text[end] in '_.')
+            out.append(json.dumps(token)
+                       if bounded and not math.isfinite(float(token)) else token)
+            i = end
+            continue
+        out.append(ch)
+        i += 1
+    return ''.join(out)
+
+
 def ensure_tool_call_arguments_json(messages):
     """Coerce every tool_call / function_call ``arguments`` field to a valid
     JSON-object string, in place, and return the same list.
@@ -1143,9 +1185,11 @@ def ensure_tool_call_arguments_json(messages):
                 # parameters at all (measured on :8080, review of b0fa4989e).
                 continue
             fixed = '{}'
-            # The original text first: repair_json itself turns an
-            # overflowing number into Infinity, losing the token.
-            for candidate in (lambda: args, lambda: repair_json(args)):
+            # The original text first; before repair, each overflowing
+            # number is quoted, since repair_json itself would turn it into
+            # Infinity and lose the token.
+            for candidate in (lambda: args, lambda: repair_json(
+                    _quote_overflowing_numbers(args))):
                 try:
                     obj = load_wire_json(candidate())
                 except Exception:

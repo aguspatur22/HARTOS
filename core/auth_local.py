@@ -93,8 +93,46 @@ def _token_matches(candidate: str) -> bool:
     )
 
 
+def _is_forwarder(peer: str) -> bool:
+    """Is the socket peer a forwarder this node runs: the configured
+    TRUSTED_PROXY, or loopback (a proxy on this machine)?  A private LAN
+    address is NOT one: it is another machine, and its X-Forwarded-For is
+    whatever it chose to write (review of d35926896)."""
+    if not peer:
+        return False
+    trusted = os.environ.get('TRUSTED_PROXY', '')
+    if trusted and peer == trusted:
+        return True
+    return peer in ('127.0.0.1', '::1') or peer.startswith('127.')
+
+
+def client_address() -> str:
+    """The address of the client this request came from.  The ONE rule:
+    _is_local_request, the gossip / device-ask rate limiter
+    (integrations.social.discovery._rate_client_key) and the announce
+    vantage (discovery._observed_ip) all read it.
+
+    The socket peer, unless it is a forwarder we run (_is_forwarder); then
+    the LAST X-Forwarded-For hop, the one that forwarder appended (earlier
+    hops were written by the client and prove nothing).  A TRUSTED_PROXY
+    that sends no header answers '' (fail closed: nothing to believe); a
+    loopback peer with no header is itself the client.
+    """
+    peer = request.remote_addr or ''
+    if not _is_forwarder(peer):
+        return peer
+    hops = [h.strip() for h in
+            (request.headers.get('X-Forwarded-For') or '').split(',')
+            if h.strip()]
+    if hops:
+        return hops[-1]
+    trusted = os.environ.get('TRUSTED_PROXY', '')
+    return '' if (trusted and peer == trusted) else peer
+
+
 def _is_local_request() -> bool:
-    """True if the request is from localhost, honouring TRUSTED_PROXY.
+    """True if the request is from localhost (client_address), honouring
+    TRUSTED_PROXY.
 
     Nunba's staging container trusts every caller (ci_trusts_every_caller:
     NUNBA_CI=1 in a build run from source), as Nunba's
@@ -102,12 +140,7 @@ def _is_local_request() -> bool:
     """
     if ci_trusts_every_caller():
         return True
-    trusted_proxy = os.environ.get('TRUSTED_PROXY', '')
-    if trusted_proxy and request.remote_addr == trusted_proxy:
-        forwarded_for = (request.headers.get('X-Forwarded-For', '')
-                         .split(',')[0].strip())
-        return forwarded_for in ('127.0.0.1', '::1', 'localhost')
-    return request.remote_addr in ('127.0.0.1', '::1')
+    return client_address() in ('127.0.0.1', '::1', 'localhost')
 
 
 # ── CSRF defense-in-depth (Phase 9.5) ──────────────────────────────

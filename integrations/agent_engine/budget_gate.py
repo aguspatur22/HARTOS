@@ -961,3 +961,31 @@ def credit_served_compute(requester_user_id, requester_node_id, tokens_in,
         logger.warning("Served compute credit failed (the work itself is "
                        "unaffected): %s", e)
         return 0
+
+
+def credit_served_completion(headers, request_body, response_body) -> int:
+    """The serving half of a hive expert exchange, for the node's
+    /v1/chat/completions route: who asked comes from the requester headers,
+    the measure from completion_exchange, the same one the requester's
+    SpeculativeDispatcher._charge_hive_expert debits with.  A reply with no
+    content did not complete and earns nothing; a call without the headers
+    (an SDK client, not a hive peer) earns nothing here.  Never raises."""
+    try:
+        get = getattr(headers, 'get', None)
+        requester = (get(REQUESTER_USER_HEADER) if get else '') or ''
+        if not requester:
+            return 0
+        body = response_body if isinstance(response_body, dict) else {}
+        choices = body.get('choices') or []
+        msg = ((choices[0] or {}).get('message') or {}) if choices else {}
+        if not (isinstance(msg, dict) and msg.get('content')):
+            return 0
+        tin, tout = completion_exchange(request_body, body)
+        model = (request_body or {}).get('model') if isinstance(
+            request_body, dict) else ''
+        return credit_served_compute(
+            requester, get(REQUESTER_NODE_HEADER) or '', tin, tout,
+            source='hive_expert', model_id=str(model or 'hive_expert'))
+    except Exception as e:
+        logger.warning("Served completion credit skipped: %s", e)
+        return 0

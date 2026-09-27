@@ -398,15 +398,21 @@ def test_trusted_proxy_forwarded_remote_rejected(app, monkeypatch):
     assert resp.status_code == 401
 
 
-def test_trusted_proxy_uses_first_forwarded_hop(app, monkeypatch):
-    """XFF can be a comma list (client, proxy1, proxy2).  The original
-    client is the FIRST hop; a loopback first hop is accepted even when
-    later hops are non-loopback."""
+def test_trusted_proxy_believes_only_the_hop_it_appended(app, monkeypatch):
+    """SECURITY: XFF is a comma list the CLIENT starts and each proxy
+    appends to.  Only the LAST hop was written by our trusted proxy; the
+    first is whatever the client sent.  The old first-hop rule let a remote
+    client send 'X-Forwarded-For: 127.0.0.1' through the proxy and be
+    treated as this machine (the proxy appends 10.0.0.9, its real view)."""
     monkeypatch.setenv('TRUSTED_PROXY', PROXY_IP)
     client = app.test_client()
     resp = client.post('/test/local-only',
                        environ_base={'REMOTE_ADDR': PROXY_IP},
                        headers={'X-Forwarded-For': '127.0.0.1, 10.0.0.9'})
+    assert resp.status_code == 401
+    resp = client.post('/test/local-only',
+                       environ_base={'REMOTE_ADDR': PROXY_IP},
+                       headers={'X-Forwarded-For': '203.0.113.9, 127.0.0.1'})
     assert resp.status_code == 200
 
 

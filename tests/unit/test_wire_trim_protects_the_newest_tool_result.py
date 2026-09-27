@@ -59,7 +59,7 @@ def test_the_reviewed_shape_keeps_real_content_in_both(monkeypatch):
     # The larger (the result) is cut; the task is not cut at all when
     # cutting the result is enough.
     assert kept_task['content'] == task['content']
-    assert kept_result['content'].startswith(WIRE_TRIM_MARKER)
+    assert WIRE_TRIM_MARKER in kept_result['content']
     assert kept_result['content'].endswith('PAGETAIL')
     # Real content, not the floor: several times the 64-token floor.
     assert _tokens(kept_result) > 4 * _FLOOR_TOKENS, _tokens(kept_result)
@@ -79,7 +79,7 @@ def test_a_larger_task_is_cut_before_the_result_is_floored(monkeypatch):
     assert kept_result['content'] == result['content'], (
         'the result was cut (%d tok) although cutting the larger task fits'
         % _tokens(kept_result))
-    assert kept_task['content'].startswith(WIRE_TRIM_MARKER)
+    assert WIRE_TRIM_MARKER in kept_task['content']
     assert _tokens(kept_task) > 4 * _FLOOR_TOKENS, _tokens(kept_task)
     assert est_after <= budget
 

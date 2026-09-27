@@ -97,6 +97,12 @@ class AIKeyVault:
         # HEVOLVE_MASTER_KEY the value lives only in os.environ, so the
         # vault cache alone cannot say which env vars are user credentials.
         self._stored: set = set()
+        # Every value resolve_aliases handed a tool this process -> its name.
+        # Keyed by VALUE and never pruned: once a value has left the vault it
+        # is masked for the life of the process, whatever the grant, the
+        # consent table or the env says later (a revoke during the call, a
+        # locked database, an owner who re-enters a different value).
+        self._resolved: Dict[str, str] = {}
 
     @classmethod
     def get_instance(cls) -> 'AIKeyVault':
@@ -277,6 +283,9 @@ class AIKeyVault:
 
         Any other alias (a missing credential, or a name that is only an
         environment variable) is left as written, never as an empty string.
+        The grant decides resolution only: every value handed out is
+        remembered, and mask_secrets masks it from then on.  A consent read
+        that fails resolves no granted name (owner_credential_names).
         """
         names = None
 
@@ -285,28 +294,43 @@ class AIKeyVault:
             if names is None:
                 names = self.owner_credential_names()
             real = self.owner_credential(match.group(1), names)
-            return real or match.group(0)
+            if not real:
+                return match.group(0)
+            with self._lock:
+                self._resolved[real] = match.group(1)
+            return real
         return self._map_strings(value, lambda s: SECRET_ALIAS_RE.sub(_real, s))
+
+    @staticmethod
+    def _spellings(real: str) -> set:
+        """How a value can come back in a tool's text: as written, as
+        json.dumps escapes it (the autogen error envelope), and
+        percent-encoded (an HTTP client puts the URL in its exception)."""
+        from urllib.parse import quote, quote_plus
+        return {real, json.dumps(real)[1:-1], quote(real, safe=''),
+                quote_plus(real, safe='')}
 
     def mask_secrets(self, value):
         """Replace every credential value in ``value`` with its alias.
 
-        Covers every value resolve_aliases can hand a tool (the owner-entered
-        credentials) and the encrypted vault's own.  A value is matched both
-        as written and as json.dumps spells it (a quote, backslash or
-        non-ASCII character is escaped there), longest first so a credential
-        that contains another is masked whole.
+        Covers every value resolve_aliases handed a tool this process
+        (remembered, so a grant revoked since or a consent table that cannot
+        be read changes nothing), what store_credential stored, and the
+        encrypted vault's own.  It never asks the consent table: grants gate
+        resolution, not masking.  Every spelling in _spellings is matched,
+        longest first so a credential that contains another is masked whole.
         """
-        names = self.owner_credential_names() | set(self._secrets_manager()._cache)
-        pairs = []
-        for name in names:
+        with self._lock:
+            known = dict(self._resolved)
+        for name in set(self._stored) | set(self._secrets_manager()._cache):
             real = self.get_tool_key(name)
-            if real and len(real) >= MIN_MASKED_SECRET_LEN:
+            if real:
+                known.setdefault(real, name)
+        pairs = []
+        for real, name in known.items():
+            if len(real) >= MIN_MASKED_SECRET_LEN:
                 alias = '{{secret:' + name + '}}'
-                pairs.append((real, alias))
-                escaped = json.dumps(real)[1:-1]
-                if escaped != real:
-                    pairs.append((escaped, alias))
+                pairs.extend((s, alias) for s in self._spellings(real))
         pairs.sort(key=lambda p: -len(p[0]))
 
         def _mask(text):
@@ -529,7 +553,8 @@ def request_credential(resource_description, agent_id=None) -> str:
                 f"unavailable.")
 
     if declined:
-        return f"The owner of this computer said no to providing '{label}'."
+        return (f"The owner of this computer said no to providing '{label}'. "
+                f"They can choose \"Allow asking again\" in Privacy settings.")
     if exhausted:
         logger.info("credential %s: rejected after %d entries, not asked again",
                     name, entries)
