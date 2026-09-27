@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -56,6 +57,9 @@ from .schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: One admin-config save at a time (AdminAPI._save_config).
+_SAVE_CONFIG_LOCK = threading.Lock()
 
 # Create the blueprint
 admin_bp = Blueprint("admin", __name__, url_prefix="/api/admin")
@@ -174,32 +178,26 @@ class AdminAPI:
         """Atomically persist admin state (channels + workflows + identity) so it
         survives a restart (#45).  Serializes the LIVE attrs — the previous
         version dumped an always-empty self._config, persisting nothing."""
+        from core.file_cache import atomic_json_write
         config_path = self._config_path()
-        payload = {
-            "channels": self._channels,
-            "workflows": {k: w.to_dict() for k, w in self._workflows.items()},
-            "identity": self._identity.to_dict() if self._identity else None,
-        }
-        try:
-            config_dir = os.path.dirname(config_path)
-            os.makedirs(config_dir, exist_ok=True)
-            # Write to a temp file first, then atomic rename to prevent
-            # corruption.  One fixed temp name, not tempfile.mkstemp: on
-            # Windows mkstemp retries a PermissionError up to 2**31 times
-            # whenever os.access calls the dir writable, and a consent grant
-            # that ran this spun for minutes holding the SQLite write lock.
-            tmp_path = config_path + '.tmp'
+        # Saves run on many threads at once (admin routes, every camera or
+        # screen consent answer).  One at a time, and the state is read
+        # inside the lock, so the last save writes the latest state.  The
+        # shared writer gives each save its own temp file and creates it with
+        # one exclusive open (never mkstemp's 2**31 retries on Windows).
+        with _SAVE_CONFIG_LOCK:
             try:
-                with open(tmp_path, 'w', encoding='utf-8') as f:
-                    json.dump(payload, f, indent=2, default=str)
-                os.replace(tmp_path, config_path)  # atomic rename
-            except Exception:
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-                raise
-            logger.info("Saved admin configuration to %s", config_path)
-        except Exception as e:
-            logger.warning("Failed to save admin config: %s", e)
+                payload = {
+                    "channels": self._channels,
+                    "workflows": {k: w.to_dict()
+                                  for k, w in self._workflows.items()},
+                    "identity": (self._identity.to_dict()
+                                 if self._identity else None),
+                }
+                atomic_json_write(config_path, payload, indent=2)
+                logger.info("Saved admin configuration to %s", config_path)
+            except Exception as e:
+                logger.warning("Failed to save admin config: %s", e)
 
     def get_uptime(self) -> float:
         """Get system uptime in seconds."""
