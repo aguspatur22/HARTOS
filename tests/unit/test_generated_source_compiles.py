@@ -48,13 +48,13 @@ def test_the_program_compiles_with_no_syntax_warning(name):
 
 def test_the_hevolveai_boot_program_compiles():
     """The program the supervisor actually spawns: the armor prefix plus the
-    uvicorn boot, as _spawn_command builds it with no repo checkout."""
+    uvicorn boot, as _build_cmd builds it with no repo checkout."""
     class _Bare:
         python_exe = 'python'
         repo_root = None
         repo_python = None
 
-    cmd = sup.HevolveAISupervisor._spawn_command(_Bare())
+    cmd = sup._Supervisor._build_cmd(_Bare())
     assert cmd[1] == '-c'
     _compile('hevolveai boot', cmd[2])
 

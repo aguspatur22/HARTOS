@@ -32,8 +32,14 @@ partition the hive; 10.1.x and 192.168.x are real LANs, see
 test_peer_url_hygiene):
 
 - a NEW row is 'active' when a direct announce came FROM the address it
-  claims (or the vantage is unknown, as before); otherwise it is 'stale'
-  until the health round's ping reaches it, which makes it 'active';
+  claims (or the vantage is unknown, as before), or when the node SIGNED its
+  own direct announce (alive and admitted wherever it announced from: the
+  review of 02da559f7 measured every NAT'd peer on central kept 'stale' and
+  out of OTA fan-out); a relayed hint or an unsigned claim from elsewhere is
+  'stale' until the health round's ping reaches it;
+- the integrity round does not dial a row whose last health ping failed:
+  reachability is asked where dialling happens, never by dropping the row
+  from the fleet;
 - a loopback URL is refused when relayed, or when the announce came from
   another machine; a co-located node announcing over loopback is admitted;
 - a relayed record never carries the relayer's metadata into the new row.

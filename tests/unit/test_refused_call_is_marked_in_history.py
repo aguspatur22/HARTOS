@@ -480,10 +480,6 @@ class ProductionTransformsKeepTheMark(unittest.TestCase):
         self.assertEqual(json.loads(sent[0])[REFUSED_ARGUMENTS_KEY], UNQUOTED)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class ArgumentsThatAreNotText(_Chat):
     """Review of the defect-14 fix: arguments handed as a dict or None (not
     text) reached the executor's parser as they were: _format_json_str
@@ -545,14 +541,10 @@ class FallbackThatFailsIsMarked(_Chat):
             self.assertIn('not valid JSON', parsed[REFUSED_BECAUSE_KEY])
 
 
-class KwargsToolsGetNoInventedKeys(_Chat):
-    """Review of the defect-14 fix: a tool that takes **kwargs binds any
-    name, so json_repair's split of an unquoted value (a bare
-    ``status: ok`` read as a key) reached it with the value cut short.  The
-    MCP tool_executor and service_tools endpoint_executor keep a **kwargs
-    signature when a tool has no schema.  After a repair, a key the model
-    did not write in quotes and the tool does not declare is refused, as it
-    is for a fixed signature."""
+class _KwargsChat(_Chat):
+    """_Chat plus ``run_command``, a tool that takes **kwargs (the MCP
+    tool_executor and service_tools endpoint_executor keep such a signature
+    when a tool has no schema)."""
 
     def setUp(self):
         super().setUp()
@@ -565,12 +557,25 @@ class KwargsToolsGetNoInventedKeys(_Chat):
         self.executor.register_function({
             'run_command': self.executor._wrap_function(run_command)})
 
-    def _assert_refused_and_marked(self, text):
-        reply = self.call('run_command', text)
+    def _assert_refused_and_marked(self, text, name='run_command'):
+        """``text`` sent to ``name`` runs no tool, is answered as broken
+        JSON, and the next request carries the refused stand-in.  The
+        reply."""
+        reply = self.call(name, text)
         self.assertEqual(self.ran, [])
+        self.assertEqual(self.calls, [])
         self.assertIn('not valid JSON', reply['content'])
         parsed = json.loads(self.next_request_arguments())
         self.assertEqual(parsed[REFUSED_ARGUMENTS_KEY], text)
+        return reply['content']
+
+
+class KwargsToolsGetNoInventedKeys(_KwargsChat):
+    """Review of the defect-14 fix: a tool that takes **kwargs binds any
+    name, so json_repair's split of an unquoted value (a bare
+    ``status: ok`` read as a key) reached it with the value cut short.
+    After a repair, a key the model did not write in quotes and the tool
+    does not declare is refused, as it is for a fixed signature."""
 
     def test_an_unquoted_value_split_into_a_key_is_refused(self):
         self._assert_refused_and_marked(
@@ -623,18 +628,18 @@ class KwargsRefusalsNameTheRealFix(KwargsToolsGetNoInventedKeys):
         self.assertEqual(self.ran, [{'command': 'ls', 'cwd': ''}])
 
 
-class QuotedKeysAreReadOnce(unittest.TestCase):
-    """The quoted-key scan is a full read of the text: once per call after
-    a repair, never on strict JSON (review of 30042a2b6: 0.42 s on a 20-key
-    100 KB call, once per extra key)."""
+class WrittenKeysAreReadOnce(unittest.TestCase):
+    """Reading the written keys is a full read of the text: once per call
+    after a repair, never on strict JSON (review of 30042a2b6: 0.42 s on a
+    20-key 100 KB call, once per extra key)."""
 
     def _count(self, arguments, repaired, as_written):
         import hartos.helper as h
 
         def run_command(command: str = '', **kwargs):
             return 'done'
-        with mock.patch.object(h, '_quoted_top_level_keys',
-                               wraps=h._quoted_top_level_keys) as scan:
+        with mock.patch.object(h, '_outermost_entries',
+                               wraps=h._outermost_entries) as scan:
             h.tool_argument_error(run_command, 'run_command', arguments,
                                   repaired, as_written=as_written)
         return scan.call_count
@@ -644,40 +649,75 @@ class QuotedKeysAreReadOnce(unittest.TestCase):
         self.assertEqual(self._count(args, False, json.dumps(args)), 0)
 
     def test_a_repaired_call_is_scanned_once(self):
-        text = '{"command": "ls", a: "1", b: "2", c: "3"}'
-        args = {'command': 'ls', 'a': '1', 'b': '2', 'c': '3'}
+        text = '{"command": "", a: "1", b: "2", c: ""}'
+        args = {'command': '', 'a': '1', 'b': '2', 'c': ''}
         self.assertEqual(self._count(args, True, text), 1)
 
+    def test_a_repaired_call_with_only_declared_keys_is_scanned(self):
+        # A declared key can be json_repair's split too (problem 1 of the
+        # review of 30042a2b6), so no extra key is needed for the read.
+        self.assertEqual(self._count({'command': 'rm'}, True,
+                                     '{"command": ls, command: rm}'), 1)
 
-class QuotedTopLevelKeys(unittest.TestCase):
-    """The keys the rule above credits: quoted, in the outermost object,
-    followed by ':' -- never a nested key, a quoted value, or a bare word."""
 
-    def test_only_quoted_outermost_keys(self):
-        from hartos.helper import _quoted_top_level_keys
+def _entries(text):
+    from hartos.helper import _outermost_entries
+    return [(e.key, e.quoted, e.doubtful, e.empty)
+            for e in _outermost_entries(text)]
+
+
+class OutermostEntries(unittest.TestCase):
+    """The one reader of what the model wrote in the outermost object: each
+    key written where a key starts (after '{' or ','), followed by ':'."""
+
+    def test_keys_where_a_key_starts(self):
         text = ('{"a": "z", d: "x", "b": {"c": 2}, "e" : "f", '
                 "'g': [\"h\"], \"i\\u006a\": 0}")
-        self.assertEqual(_quoted_top_level_keys(text),
-                         {'a', 'b', 'e', 'g', 'ij'})
+        self.assertEqual([(k, q) for k, q, _, _ in _entries(text)],
+                         [('a', True), ('d', False), ('b', True), ('e', True),
+                          ('g', True), ('ij', True)])
 
-    def test_a_split_word_is_not_a_quoted_key(self):
-        from hartos.helper import _quoted_top_level_keys
-        self.assertEqual(_quoted_top_level_keys(
-            '{"command": deploy the app, then report status: ok}'),
-            {'command'})
+    def test_a_split_word_is_not_a_key(self):
+        self.assertEqual([k for k, *_ in _entries(
+            '{"command": deploy the app, then report status: ok}')],
+            ['command'])
 
+    def test_a_quoted_word_inside_a_value_is_not_a_key(self):
+        # Review of 30042a2b6, problem 6.
+        self.assertEqual([k for k, *_ in _entries(
+            '{"command": echo the "status": ok}')], ['command'])
 
-class KeysWrittenEmpty(unittest.TestCase):
-    """The keys the empty-value rule credits: outermost keys, quoted or
-    bare, whose value the model left empty -- never a nested one, and never
-    one whose value it wrote (review of e9daad6c5: a count named every
-    empty key, "a" included, when only "cwd" was emptied)."""
+    def test_a_bare_key_after_an_unquoted_value_is_doubtful(self):
+        self.assertEqual(_entries('{"text": Hello, response_type: Happy}'),
+                         [('text', True, False, False),
+                          ('response_type', False, True, False)])
+        self.assertEqual(_entries('{"text": "Hello", response_type: Happy}'),
+                         [('text', True, False, False),
+                          ('response_type', False, False, False)])
+        self.assertEqual(_entries('{"a": "x" "y", b: 1}')[1],
+                         ('b', False, True, False))
+
+    def test_whole_values_leave_a_bare_key_certain(self):
+        text = ('{"a": -1.5e3, b: true, c: null, d: [1, 2], e: {"f": g h}, '
+                'i: "j", k: 1}')
+        self.assertEqual([d for _, _, d, _ in _entries(text)], [False] * 7)
+
+    def test_a_comment_is_not_what_was_written(self):
+        self.assertEqual(_entries('{/* c */ "command": // d\n "x",}'),
+                         [('command', True, False, False)])
 
     def test_only_outermost_keys_left_empty(self):
-        from hartos.helper import _keys_written_empty
-        self.assertEqual(_keys_written_empty(
+        # Review of e9daad6c5: by key, never a nested one or a written value.
+        self.assertEqual({k for k, _, _, e in _entries(
             '{"a": "", "b": null, "c": , d: " ", "e": {"f": ""}, '
-            '"g": /tmp, "h": "x", "i":'), {'a', 'b', 'c', 'd', 'i'})
+            '"g": /tmp, "h": "x", "i":') if e}, {'a', 'b', 'c', 'd', 'i'})
+
+    def test_a_key_is_read_as_the_reader_reads_it(self):
+        # A lone surrogate becomes U+FFFD and an invalid escape stays as
+        # written: the names load_wire_json / json_repair give the key.
+        self.assertEqual([k for k, *_ in _entries(
+            '{"\\ud800s": 1, "st\\qatus": 2, \'s\': 3}')],
+                         ['\ufffds', 'st\\qatus', 's'])
 
 
 class OnlyTheEmptiedKeyIsNamed(KwargsToolsGetNoInventedKeys):
@@ -688,3 +728,76 @@ class OnlyTheEmptiedKeyIsNamed(KwargsToolsGetNoInventedKeys):
         tail = reply['content'].split('came out empty:', 1)[1]
         named = tail.split('.', 1)[0]
         self.assertEqual(named.strip(), 'cwd')
+
+
+class SplitKeysNeverReplaceAWrittenValue(_KwargsChat):
+    """Review of 30042a2b6, problem 1: json_repair's split of an unquoted
+    value can make a key the tool DECLARES, and the dict keeps only the last
+    value, so the tool ran with a value the model never gave it:
+    '{"command": ls -la, command: rm -rf /tmp/x}' ran rm -rf /tmp/x, and
+    '{"text": Hi there, text: again}' sent 'again'.  After a repair, a key
+    written twice, a bare key after a value that is not one whole value (the
+    comma before it may be part of that value), and a quoted word that is
+    not where a key starts are refused, whatever the signature."""
+
+    def test_a_split_that_repeats_a_declared_key_is_refused(self):
+        content = self._assert_refused_and_marked(
+            '{"command": ls -la, command: rm -rf /tmp/x}')
+        self.assertIn('command', content.split('value before them', 1)[1])
+
+    def test_a_split_that_repeats_the_message_text_is_not_sent(self):
+        self._assert_refused_and_marked('{"text": Hi there, text: again}',
+                                        name='send_message_to_user')
+
+    def test_a_bare_declared_key_after_an_unquoted_value_is_refused(self):
+        self._assert_refused_and_marked(
+            '{"text": Hello, response_type: Happy}',
+            name='send_message_to_user')
+
+    def test_a_quoted_key_written_twice_is_refused_after_a_repair(self):
+        content = self._assert_refused_and_marked(
+            '{"text": "Hi", "text": "again",}', name='send_message_to_user')
+        self.assertIn('text', content.split('value before them', 1)[1])
+
+    def test_a_quoted_word_inside_an_unquoted_value_is_not_a_key(self):
+        # Review of 30042a2b6, problem 6: ran as ('echo the', status='ok').
+        self._assert_refused_and_marked('{"command": echo the "status": ok}')
+
+    def test_a_bare_key_after_a_whole_value_still_runs(self):
+        self.call('send_message_to_user',
+                  '{"text": "Hello", response_type: Happy}')
+        self.assertEqual(self.calls, ['Hello'])
+
+    def test_a_quoted_key_after_an_unquoted_value_still_runs(self):
+        self.call('send_message_to_user',
+                  '{"text": Hello, "response_type": "Happy"}')
+        self.assertEqual(self.calls, ['Hello'])
+
+    def test_a_comment_before_the_first_key_still_runs(self):
+        self.call('run_command', '{/* c */ "command": "x",}')
+        self.assertEqual(self.ran, [{'command': 'x'}])
+
+    def test_strict_json_with_a_repeated_key_is_the_model_s_own(self):
+        # Not a repair: json.loads keeps the last value, as before.
+        self.call('run_command', '{"command": "a", "command": "b"}')
+        self.assertEqual(self.ran, [{'command': 'b'}])
+
+
+class QuotedKeysAreReadAsTheReaderReadsThem(_KwargsChat):
+    """Review of 30042a2b6, problem 2 (surviving mutants r02, r03): a
+    quoted key is credited under the name the reader gives it, so a key
+    with a lone surrogate (U+FFFD after the read) or an invalid escape
+    (kept as written) runs like any other quoted key after a benign
+    repair."""
+
+    def test_a_key_with_a_lone_surrogate_runs(self):
+        self.call('run_command', '{"command": "x", "\\ud800s": "ok",}')
+        self.assertEqual(self.ran, [{'command': 'x', '\ufffds': 'ok'}])
+
+    def test_a_key_with_an_invalid_escape_runs(self):
+        self.call('run_command', '{"command": "x", "st\\qatus": "ok",}')
+        self.assertEqual(self.ran, [{'command': 'x', 'st\\qatus': 'ok'}])
+
+
+if __name__ == '__main__':
+    unittest.main()

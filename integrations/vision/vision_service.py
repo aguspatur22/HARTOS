@@ -246,6 +246,12 @@ class VisionService:
         state = {'capture': None}
 
         def _consent_ok() -> bool:
+            # The owner's No, or the eye button's cut, first: in memory, set
+            # on the answering thread, so no screenshot is taken after it
+            # even before the stored row is read or the service stopped.
+            from core.ai_sensing import allowed
+            if not allowed('screen'):
+                return False
             from integrations.social.models import db_session
             from integrations.social.consent_service import ConsentService
             with db_session(commit=True) as db:

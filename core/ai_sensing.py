@@ -11,7 +11,9 @@ flip this; only the human UI (POST /api/shell/ai-sensing) does.
 This is the desktop expression of HART's "humans are always in control".
 
 Single source of truth: import `allowed(sensor)` at every sensor ingestion point
-rather than re-implementing a per-feature mute.
+rather than re-implementing a per-feature mute.  It also answers the owner's
+standing No to the camera or screen feed (`withhold`), so the vision frame
+store and the screen-capture loop stop the moment the owner says No.
 
 Cross-process authority (Phase 7): in-process `allowed()` is per-process memory.
 A separate process (e.g. xdg-desktop-portal-hart's ScreenCast handler, which is
@@ -27,6 +29,14 @@ import threading
 _lock = threading.RLock()
 # True = that sense is DISABLED (the AI is blind/deaf to it). Default: sensing on.
 _state = {'mic': False, 'camera': False, 'screen': False}
+# True = the owner's standing No to that feed: a camera/screen consent revoked,
+# or the feed switched off in settings.  A second, separate answer from the eye
+# button above: enable_all() wakes the senses the eye button cut and must not
+# lift a No the owner gave on a consent card, and a consent Yes must not undo
+# the eye button.  Written ONLY by admin.api.apply_embodied_answer, on the
+# answering thread, so the No holds from that instant -- the hardware stop runs
+# later, on its own worker, and may be stuck behind a start that never returns.
+_withheld = {'camera': False, 'screen': False}
 
 _SENSES = ('mic', 'camera', 'screen')
 
@@ -36,9 +46,23 @@ def is_disabled(sensor: str) -> bool:
         return bool(_state.get(sensor, False))
 
 
+def withhold(sensor: str, withheld: bool) -> None:
+    """Record the owner's answer for a feed: True = No, False = Yes."""
+    with _lock:
+        if sensor in _withheld:
+            _withheld[sensor] = bool(withheld)
+
+
+def is_withheld(sensor: str) -> bool:
+    with _lock:
+        return bool(_withheld.get(sensor, False))
+
+
 def allowed(sensor: str) -> bool:
-    """Gate for sensor ingestion. False => the human has cut this sense."""
-    return not is_disabled(sensor)
+    """Gate for sensor ingestion. False => the human has cut this sense, or
+    the owner has said No to this feed."""
+    with _lock:
+        return not (_state.get(sensor, False) or _withheld.get(sensor, False))
 
 
 def any_disabled() -> bool:
@@ -96,9 +120,11 @@ def status() -> dict:
     """Live proof: the human-set gate flags + a REAL check where one exists."""
     with _lock:
         disabled = dict(_state)
+        withheld = dict(_withheld)
     return {
         'sensing_enabled': not all(disabled.values()),   # any sense still on?
         'disabled': disabled,                            # per-sense human gate
+        'withheld': withheld,                            # the owner's feed No
         'proof': {
             # Observable OS-level state, not just the flag — this is the bit the
             # AI cannot fake. (mic/screen are enforced at ingestion by the flag.)

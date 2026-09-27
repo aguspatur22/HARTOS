@@ -1139,71 +1139,102 @@ def _written_value_counts(original):
     return counts
 
 
-def _quoted_top_level_keys(original):
-    """The keys the model wrote IN QUOTES in the outermost object of
-    ``original``: a quoted string at depth one followed by ``:``.  Read
-    with the one scanner (_scan_segments).  json_repair also reads a bare
-    ``word:`` inside an unquoted value as a key (``{"command": deploy, then
-    report status: ok}`` -> ``status``); such a key is never in this set."""
-    keys, depth, pending = set(), 0, None
+class _WrittenEntry:
+    """One ``key: value`` the model wrote in the outermost object (see
+    _outermost_entries)."""
+    __slots__ = ('key', 'quoted', 'doubtful', 'empty')
+
+    def __init__(self, key, quoted, doubtful):
+        self.key, self.quoted, self.doubtful = key, quoted, doubtful
+        self.empty = True
+
+
+# A bare word that is a whole JSON value on its own.
+_WHOLE_VALUE_WORDS = ('true', 'false', 'null')
+
+
+def _written_key(kind, piece):
+    """A key token as the reader names it: a double-quoted key decoded (a
+    lone surrogate as U+FFFD, like load_wire_json; an invalid escape kept
+    as written, like json_repair), another quoted key without its quotes,
+    a bare key as it is."""
+    if kind != "string":
+        return piece
+    try:
+        key = json.loads(piece) if piece[0] == '"' else piece[1:-1]
+    except ValueError:
+        key = piece[1:-1]
+    return _LONE_SURROGATE.sub(chr(0xFFFD), key)
+
+
+def _outermost_entries(original):
+    """What the model wrote in the outermost object of ``original``: THE
+    one reader of it, with the one scanner (_scan_segments), for both rules
+    tool_argument_error applies after a repair.  One _WrittenEntry per key,
+    in order.  A key is a quoted string, word or number where a key starts
+    (right after ``{`` or ``,``) followed by ``:``; a quoted word inside an
+    unquoted value (``{"command": echo the "status": ok}``) is not one
+    (review of 30042a2b6, problem 6), nor a split word (``..., then report
+    status: ok``).
+
+    ``quoted``: the key is in quotes.  ``doubtful``: a bare key after a
+    value that was not one whole value (a quoted string, a number, true /
+    false / null, or one [...] / {...}): the comma before it may be part of
+    that unquoted value, which json_repair cut there (``{"text": Hi there,
+    text: again}`` sent 'again', review of 30042a2b6, problem 1).
+    ``empty``: the model left the value empty: a quoted string of nothing
+    but whitespace, ``null``, or no value (``"a": ,`` or the text ending);
+    review of e9daad6c5."""
+    entries = []
+    depth, key_start, loose = 0, False, False
+    candidate, entry, items = None, None, None
+
+    def close():
+        # The value of ``entry`` ends: was it one whole value, and empty?
+        nonlocal loose, entry, items
+        if entry is not None:
+            whole = len(items) <= 1 and all(
+                kind in ("string", "number", "group")
+                or kind == "run" and piece in _WHOLE_VALUE_WORDS
+                for kind, piece in items)
+            loose = loose or not whole
+            entry.empty = not items or items == [("run", "null")] or (
+                items[0][0] == "string" and len(items) == 1
+                and not items[0][1][1:-1].strip())
+        entry, items = None, None
+
     for kind, piece in _scan_segments(str(original)):
         if kind == "char" and piece.isspace() or kind == "comment":
             continue
-        if pending is not None and kind == "char" and piece == ":":
-            keys.add(pending)
-        pending = None
-        if kind == "string" and depth == 1:
-            try:
-                key = json.loads(piece) if piece[0] == '"' else piece[1:-1]
-            except ValueError:
-                key = piece[1:-1]
-            pending = _LONE_SURROGATE.sub(chr(0xFFFD), key) if isinstance(
-                key, str) else None
-        elif kind == "char" and piece in "{[":
+        opens = kind == "char" and piece in "{["
+        shuts = kind == "char" and piece in "}]"
+        if depth == 1:
+            if candidate is not None and kind == "char" and piece == ":":
+                entry = _WrittenEntry(_written_key(*candidate),
+                                      candidate[0] == "string",
+                                      candidate[0] != "string" and loose)
+                entries.append(entry)
+                candidate, items = None, []
+                continue
+            candidate = None
+            if kind == "char" and piece == ",":
+                close()
+                key_start = True
+                continue
+            if shuts:
+                close()
+            elif key_start and kind in ("string", "run", "number"):
+                candidate = (kind, piece)
+            elif items is not None:
+                items.append(("group", piece) if opens else (kind, piece))
+            key_start = False
+        if opens:
             depth += 1
-        elif kind == "char" and piece in "}]":
+            key_start = depth == 1
+        elif shuts:
             depth -= 1
-    return keys
-
-
-def _keys_written_empty(original):
-    """The keys of the outermost object of ``original`` whose value the
-    model left EMPTY: a quoted string of nothing but whitespace, a bare
-    ``null``, or no value at all (``"a": ,`` or the text ending).  A key is
-    the quoted string or bare word before a ``:`` at depth one.  Read with
-    the one scanner (_scan_segments).  After a repair, an empty value under
-    any other key is one the repair emptied (``"cwd": /tmp`` -> ``""``,
-    review of 30042a2b6); by key, not by count, so a key the model wrote
-    empty is never named (review of e9daad6c5)."""
-    keys, depth, candidate, key = set(), 0, None, None
-    for kind, piece in _scan_segments(str(original)):
-        if kind == "char" and piece.isspace() or kind == "comment":
-            continue
-        if key is not None:
-            if (kind == "string" and not piece[1:-1].strip()
-                    or kind == "run" and piece == "null"
-                    or kind == "char" and piece in ",}]"):
-                keys.add(key)
-            key = None
-        elif candidate is not None and kind == "char" and piece == ":":
-            key, candidate = candidate, None
-            continue
-        candidate = None
-        if depth == 1 and kind == "string":
-            try:
-                word = json.loads(piece) if piece[0] == '"' else piece[1:-1]
-            except ValueError:
-                word = piece[1:-1]
-            candidate = word if isinstance(word, str) else None
-        elif depth == 1 and kind == "run":
-            candidate = piece
-        if kind == "char" and piece in "{[":
-            depth += 1
-        elif kind == "char" and piece in "}]":
-            depth -= 1
-    if key is not None:
-        keys.add(key)
-    return keys
+    close()
+    return entries
 
 
 def _invents_a_constant(value, original):
@@ -4472,7 +4503,15 @@ def tool_argument_error(func, func_name, arguments, repaired, as_written=None):
     (review of 30042a2b6: that steered the model into dropping ``cwd``).
     Strict JSON quotes every key, so it is not scanned.  After a repair, a
     value left empty that the model did not write empty (``"cwd": /tmp``
-    -> ``""``) is refused like a required one (_keys_written_empty).
+    -> ``""``) is refused like a required one.
+
+    A declared name is no safer (review of 30042a2b6, problem 1): the split
+    can make a key the tool declares, and the dict keeps only the last
+    value, so ``{"command": ls -la, command: rm -rf /tmp/x}`` ran
+    ``rm -rf /tmp/x``.  So after a repair every key must be one the model
+    wrote where a key starts, and a key written twice, or written bare after
+    a value that was not one whole value, is refused.  All of it is read by
+    the one reader, once (_outermost_entries).
     """
     import inspect
     if not isinstance(arguments, dict):
@@ -4520,10 +4559,14 @@ def tool_argument_error(func, func_name, arguments, repaired, as_written=None):
     # not left empty by the model (review of 30042a2b6: "cwd": /tmp ran a
     # **kwargs tool with cwd='').
     blanks = [k for k, v in kwargs.items() if blank(v) and k not in emptied]
-    emptied_written = []
-    if repaired and as_written is not None and blanks:
-        written_empty = _keys_written_empty(as_written)
-        emptied_written = [k for k in blanks if k not in written_empty]
+    # What the model wrote, read once and only after a repair: strict JSON
+    # quotes every key and cannot be split (review of 30042a2b6: a scan per
+    # extra key took 0.42 s on 100 KB).
+    written = (_outermost_entries(as_written)
+               if repaired and as_written is not None else None)
+    emptied_written = ([k for k in blanks
+                        if k not in {e.key for e in written if e.empty}]
+                       if written is not None else [])
     unholdable = (_numbers_out_of_range(params, bound)
                   if bound is not None else [])
     if unholdable:
@@ -4535,16 +4578,26 @@ def tool_argument_error(func, func_name, arguments, repaired, as_written=None):
                 f"{', '.join(unholdable)} must be a finite number, and the "
                 f"value given cannot be held as one. Call {func_name} again "
                 f"with a number in range.")
-    # Strict JSON quotes every key, so only a repaired call is scanned, and
-    # once (review of 30042a2b6: once per extra key, 0.42 s on 100 KB).
+    # After a repair, every key must be one the model wrote as a key: in
+    # quotes when the tool does not declare it; and none written twice or
+    # bare after an unquoted value, where the dict would keep a value cut
+    # out of the one before (review of 30042a2b6, problem 1).
     declared = {p.name for p in params}
-    extra = [k for k in kwargs if k not in declared]
-    quoted = (_quoted_top_level_keys(as_written)
-              if repaired and extra and as_written is not None
-              and bound is not None else None)
-    invented = [k for k in extra if k not in quoted] if quoted is not None else []
+    invented, suspect = [], []
+    if written is not None:
+        as_keys = [e.key for e in written if not e.doubtful]
+        quoted = {e.key for e in written if e.quoted}
+        invented = [k for k in kwargs
+                    if k not in (as_keys if k in declared else quoted)]
+        seen, twice = set(), []
+        for k in as_keys:
+            if k in seen:
+                twice.append(k)
+            seen.add(k)
+        suspect = list(dict.fromkeys(
+            [e.key for e in written if e.doubtful] + twice))
     if (bound is not None and not emptied and not emptied_written
-            and not invented):
+            and not invented and not suspect):
         return None
     takes_any = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
     names = {p.name for p in params}
@@ -4578,11 +4631,15 @@ def tool_argument_error(func, func_name, arguments, repaired, as_written=None):
     if emptied_written:
         text += (f" Value(s) that could not be read and came out empty: "
                  f"{', '.join(map(str, emptied_written))}.")
+    if suspect:
+        text += (f" Key(s) written twice, or bare after a value not in double "
+                 f"quotes, so they may be part of the value before them: "
+                 f"{', '.join(map(str, suspect))}.")
     if takes_any:
         # Any name is accepted: the declared ones are not the only ones, so
         # they are not offered as the fix -- quoting is (review of 30042a2b6).
         if invented:
-            text += (f" Key(s) not written in double quotes: "
+            text += (f" Key(s) not written as a key in double quotes: "
                      f"{', '.join(map(str, invented))}.")
         return (text + f" Declared parameters: {expected}; {func_name} also "
                 f"takes other named values. Call {func_name} again with one "
