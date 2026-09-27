@@ -323,7 +323,9 @@ class ReuseLegReconcilesItsToolsWithTheServer(unittest.TestCase):
         body = _func('get_agent_response', _src())
         self.assertTrue(body, 'get_agent_response not found')
         named = body.find('_attach_named_tools_for_action(')
-        tags = body.find('attach_for_tags(')
+        # The tag attach is core.agent_tool_menu.attach_for_turn, the one
+        # per-turn attach shared with CREATE (review of d99b1aa88).
+        tags = body.find('attach_for_turn(')
         self.assertNotEqual(named, -1, 'named attach call not found')
         self.assertNotEqual(tags, -1, 'tag attach call not found')
         self.assertLess(

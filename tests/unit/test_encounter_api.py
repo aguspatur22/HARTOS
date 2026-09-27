@@ -662,6 +662,23 @@ def test_sighting_numbers_must_be_numbers(client, key, raw):
     assert key in r.get_json()['error']
 
 
+@pytest.mark.parametrize('key,raw', [('lat', 'NaN'), ('lng', 'Infinity'),
+                                     ('lat', '-Infinity')])
+def test_sighting_location_must_be_finite(client, key, raw):
+    """Python's JSON parser accepts NaN / Infinity; a map pin at NaN is
+    not a location."""
+    pk = 'dcdc' * 8
+    _make_discoverable(client, 76)
+    _register_pubkey(client, 76, pk)
+    fields = {'lat': '12.9', 'lng': '77.5', key: raw}
+    body = ('{"peer_pubkey": "%s", "rssi_peak": -40, "dwell_sec": 4, '
+            '"lat": %s, "lng": %s}' % (pk, fields['lat'], fields['lng']))
+    r = client.post('/api/social/encounter/sighting', data=body,
+                    content_type='application/json', headers=_as_user(77))
+    assert r.status_code == 400
+    assert key in r.get_json()['error']
+
+
 def test_sighting_numbers_accept_numbers_and_null_location(client):
     pk = 'dbdb' * 8
     _make_discoverable(client, 78)

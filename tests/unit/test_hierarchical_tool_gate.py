@@ -186,7 +186,11 @@ class HierarchicalToolGate(unittest.TestCase):
         drift hook (message-driven, stored tags already resolved at
         construction).  create: 1 resolution.  reuse: 2.
         Any count above these means a detection regrew somewhere."""
-        expected_detect = {'create_recipe.py': 1, 'reuse_recipe.py': 2}
+        # The per-turn drift scan is ONE shared helper now,
+        # core.agent_tool_menu.attach_for_turn, called from each pipeline's
+        # turn entry (review of d99b1aa88): each file has its construction
+        # resolution plus exactly one attach_for_turn call.
+        expected_detect = {'create_recipe.py': 1, 'reuse_recipe.py': 1}
         for fname, n_expected in expected_detect.items():
             src = (_ROOT / 'hartos' / fname).read_text(encoding='utf-8',
                                                        errors='replace')
@@ -215,6 +219,10 @@ class HierarchicalToolGate(unittest.TestCase):
             self.assertEqual(
                 n_filter, 1,
                 f'{fname}: expected exactly one Tier-1 gate call')
+            n_turn = sum(name == 'attach_for_turn' for name in _called)
+            self.assertEqual(
+                n_turn, 1,
+                f'{fname}: expected exactly one per-turn attach call')
 
     def test_attach_for_tags_attaches_matching_family(self):
         """Per-turn drift: capability tags attach the matching family via
