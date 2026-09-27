@@ -21,7 +21,10 @@ def ledger(tmp_path):
 
 
 @pytest.fixture
-def wired(ledger):
+def wired(ledger, monkeypatch):
+    # The desktop owner is its own recipient (see the owner tests below);
+    # these tests count the run user's messages only.
+    monkeypatch.delenv('HEVOLVE_OWNER_USER_ID', raising=False)
     with patch.object(activity_stream, '_ledger_for', return_value=ledger), \
          patch.object(activity_stream, 'resolve_steering_agent_id', return_value='goal-42'), \
          patch('integrations.social.realtime.on_notification') as notify:
@@ -123,3 +126,29 @@ def test_a_failed_ledger_write_emits_nothing(ledger, wired):
 def test_an_unknown_step_phase_is_refused(ledger, wired):
     assert _step('run_completed', 1) is None
     wired.assert_not_called()
+
+
+def test_the_desktop_owner_sees_a_run_started_by_another_user(
+        ledger, wired, monkeypatch):
+    """Live 2026-09-27 15:22-15:34: eleven runs of agent 88555124130 drove
+    this desktop for user c23d388c, every step reached SSE as targeted=0, and
+    the floating window -- signed in as the owner, 10202 -- showed nothing
+    while the ribbon showed every step."""
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', 'owner-1')
+    started = _step('executing', 1)
+    closed = activity_stream.finish_run(
+        user_id='guest', prompt_id='42', run_id='run1', exit_reason='done',
+        iteration=1)
+    recipients = [c.args[0] for c in wired.call_args_list]
+    assert recipients == ['guest', 'owner-1', 'guest', 'owner-1']
+    # The owner gets the same message, so a client subscribed as both
+    # dedupes it by msg_id.
+    assert wired.call_args_list[1].args[1] == started
+    assert wired.call_args_list[3].args[1] == closed
+
+
+def test_the_owner_is_not_told_twice_about_their_own_run(
+        ledger, wired, monkeypatch):
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', 'guest')
+    _step('executing', 1)
+    assert [c.args[0] for c in wired.call_args_list] == ['guest']

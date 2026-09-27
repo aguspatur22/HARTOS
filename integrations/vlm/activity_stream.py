@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import uuid
 from typing import Any, Dict, Optional
 
@@ -230,16 +231,32 @@ def _ribbon_line(phase: str, caption: str, error: str) -> str:
     return f'{head}: {detail}' if detail else head
 
 
+def _recipients(user_id: str) -> list:
+    """Who is told about a step: the run's user, then this desktop's owner.
+
+    A run drives THIS machine's mouse and keyboard, whoever asked for it, so
+    the owner of the machine (HEVOLVE_OWNER_USER_ID, the same identity the
+    camera, screen and computer-control asks go to) is told every step --
+    the ribbon already shows it to whoever sits at the screen; this is the
+    same line reaching the owner's floating window.  Measured 2026-09-27
+    15:22-15:34: eleven runs for another user drove this desktop, every step
+    was broadcast as targeted=0, and the owner's companion showed nothing.
+    """
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    return [user_id] + ([owner] if owner and owner != user_id else [])
+
+
 def _fan_out(user_id: str, payload: Dict[str, Any]) -> None:
-    try:
-        from integrations.social.realtime import on_notification
-        on_notification(user_id, payload)
-    except Exception:
-        # Persistence succeeded; the Task Ledger remains authoritative and a
-        # later refresh recovers the state.  Never roll the task back because
-        # a best-effort fanout leg was unavailable.
-        logger.exception('computer-use projection failed for task=%s',
-                         payload.get('task_id'))
+    for recipient in _recipients(user_id):
+        try:
+            from integrations.social.realtime import on_notification
+            on_notification(recipient, payload)
+        except Exception:
+            # Persistence succeeded; the Task Ledger remains authoritative and
+            # a later refresh recovers the state.  Never roll the task back
+            # because a best-effort fanout leg was unavailable.
+            logger.exception('computer-use projection failed for task=%s',
+                             payload.get('task_id'))
 
 
 def record_activity(*, user_id: Any, prompt_id: Any, run_id: str,
