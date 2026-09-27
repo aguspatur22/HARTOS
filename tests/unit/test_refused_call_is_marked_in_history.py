@@ -665,3 +665,14 @@ class QuotedTopLevelKeys(unittest.TestCase):
         self.assertEqual(_quoted_top_level_keys(
             '{"command": deploy the app, then report status: ok}'),
             {'command'})
+
+
+class WrittenEmptyValues(unittest.TestCase):
+    """The count the empty-value rule compares with: values the model left
+    empty in the outermost object, never a nested one or a written word."""
+
+    def test_counts_only_outermost_empty_values(self):
+        from hartos.helper import _written_empty_values
+        self.assertEqual(_written_empty_values(
+            '{"a": "", "b": null, "c": , "d": " ", "e": {"f": ""}, '
+            '"g": /tmp, "h": "x", "i":'), 5)

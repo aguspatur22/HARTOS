@@ -205,8 +205,8 @@ def app(sf, monkeypatch, tmp_path):
          patch('integrations.distributed_agent.api._get_coordinator',
                return_value=coordinator), \
          patch('integrations.distributed_agent.coordinator_backends.GossipTaskBridge') as gossip, \
-         patch('integrations.distributed_agent.api._submitters_path',
-               return_value=str(tmp_path / 'distributed_submitters.json')), \
+         patch('integrations.distributed_agent.requesters._dir',
+               return_value=str(tmp_path)), \
          patch('integrations.coding_agent.api._IS_CENTRAL', True), \
          patch('security.immutable_audit_log.get_audit_log'), \
          patch('core.http_pool.pooled_post', return_value=chat) as posted, \
@@ -532,7 +532,7 @@ def test_interviewing_a_machine_goal_runs_it_as_the_caller(app, client, sf):
 def test_distributed_progress_of_an_api_submitted_goal_is_its_submitters(
         app, client, sf):
     """A goal submitted to /api/distributed/goals has no AgentGoal row.  Who
-    submitted it is kept on THIS node (_record_submitter), never in the
+    submitted it is kept on THIS node (requesters.record_submitter), never in the
     coordinator's shared context or the gossip announce."""
     submitter = _user(sf)
     from integrations.distributed_agent import api as dist_api

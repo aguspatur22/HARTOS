@@ -1166,13 +1166,13 @@ def _quoted_top_level_keys(original):
     return keys
 
 
-def _written_blank_values(original):
-    """How many values the model wrote EMPTY in the outermost object of
-    ``original``: a quoted string of nothing but whitespace, or a bare
-    ``null``, right after a ``:`` at depth one.  Read with the one scanner
-    (_scan_segments).  A repair that leaves more empty values than this
-    emptied one the model wrote (``"cwd": /tmp`` -> ``"cwd": ""``, review
-    of 30042a2b6)."""
+def _written_empty_values(original):
+    """How many values the model left EMPTY in the outermost object of
+    ``original``, right after a ``:`` at depth one: a quoted string of
+    nothing but whitespace, a bare ``null``, or no value at all (``"a": ,``
+    or the text ending).  Read with the one scanner (_scan_segments).  A
+    repair that leaves more empty values than this emptied one the model
+    wrote (``"cwd": /tmp`` -> ``"cwd": ""``, review of 30042a2b6)."""
     count, depth, after_colon = 0, 0, False
     for kind, piece in _scan_segments(str(original)):
         if kind == "char" and piece.isspace() or kind == "comment":
@@ -1182,11 +1182,15 @@ def _written_blank_values(original):
                 count += 1
             elif kind == "run" and piece == "null":
                 count += 1
+            elif kind == "char" and piece in ",}]":
+                count += 1
         after_colon = kind == "char" and piece == ":"
         if kind == "char" and piece in "{[":
             depth += 1
         elif kind == "char" and piece in "}]":
             depth -= 1
+    if after_colon and depth == 1:
+        count += 1
     return count
 
 
@@ -4456,7 +4460,7 @@ def tool_argument_error(func, func_name, arguments, repaired, as_written=None):
     (review of 30042a2b6: that steered the model into dropping ``cwd``).
     Strict JSON quotes every key, so it is not scanned.  After a repair, a
     value left empty that the model did not write empty (``"cwd": /tmp``
-    -> ``""``) is refused like a required one (_written_blank_values).
+    -> ``""``) is refused like a required one (_written_empty_values).
     """
     import inspect
     if not isinstance(arguments, dict):
@@ -4505,7 +4509,7 @@ def tool_argument_error(func, func_name, arguments, repaired, as_written=None):
     # ran a **kwargs tool with cwd='').
     blanks = [k for k, v in kwargs.items() if blank(v)]
     emptied_written = (blanks if repaired and as_written is not None
-                       and len(blanks) > _written_blank_values(as_written)
+                       and len(blanks) > _written_empty_values(as_written)
                        else [])
     emptied_written = [k for k in emptied_written if k not in emptied]
     unholdable = (_numbers_out_of_range(params, bound)
