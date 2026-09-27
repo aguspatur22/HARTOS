@@ -1166,32 +1166,44 @@ def _quoted_top_level_keys(original):
     return keys
 
 
-def _written_empty_values(original):
-    """How many values the model left EMPTY in the outermost object of
-    ``original``, right after a ``:`` at depth one: a quoted string of
-    nothing but whitespace, a bare ``null``, or no value at all (``"a": ,``
-    or the text ending).  Read with the one scanner (_scan_segments).  A
-    repair that leaves more empty values than this emptied one the model
-    wrote (``"cwd": /tmp`` -> ``"cwd": ""``, review of 30042a2b6)."""
-    count, depth, after_colon = 0, 0, False
+def _keys_written_empty(original):
+    """The keys of the outermost object of ``original`` whose value the
+    model left EMPTY: a quoted string of nothing but whitespace, a bare
+    ``null``, or no value at all (``"a": ,`` or the text ending).  A key is
+    the quoted string or bare word before a ``:`` at depth one.  Read with
+    the one scanner (_scan_segments).  After a repair, an empty value under
+    any other key is one the repair emptied (``"cwd": /tmp`` -> ``""``,
+    review of 30042a2b6); by key, not by count, so a key the model wrote
+    empty is never named (review of e9daad6c5)."""
+    keys, depth, candidate, key = set(), 0, None, None
     for kind, piece in _scan_segments(str(original)):
         if kind == "char" and piece.isspace() or kind == "comment":
             continue
-        if after_colon and depth == 1:
-            if kind == "string" and not piece[1:-1].strip():
-                count += 1
-            elif kind == "run" and piece == "null":
-                count += 1
-            elif kind == "char" and piece in ",}]":
-                count += 1
-        after_colon = kind == "char" and piece == ":"
+        if key is not None:
+            if (kind == "string" and not piece[1:-1].strip()
+                    or kind == "run" and piece == "null"
+                    or kind == "char" and piece in ",}]"):
+                keys.add(key)
+            key = None
+        elif candidate is not None and kind == "char" and piece == ":":
+            key, candidate = candidate, None
+            continue
+        candidate = None
+        if depth == 1 and kind == "string":
+            try:
+                word = json.loads(piece) if piece[0] == '"' else piece[1:-1]
+            except ValueError:
+                word = piece[1:-1]
+            candidate = word if isinstance(word, str) else None
+        elif depth == 1 and kind == "run":
+            candidate = piece
         if kind == "char" and piece in "{[":
             depth += 1
         elif kind == "char" and piece in "}]":
             depth -= 1
-    if after_colon and depth == 1:
-        count += 1
-    return count
+    if key is not None:
+        keys.add(key)
+    return keys
 
 
 def _invents_a_constant(value, original):
@@ -4460,7 +4472,7 @@ def tool_argument_error(func, func_name, arguments, repaired, as_written=None):
     (review of 30042a2b6: that steered the model into dropping ``cwd``).
     Strict JSON quotes every key, so it is not scanned.  After a repair, a
     value left empty that the model did not write empty (``"cwd": /tmp``
-    -> ``""``) is refused like a required one (_written_empty_values).
+    -> ``""``) is refused like a required one (_keys_written_empty).
     """
     import inspect
     if not isinstance(arguments, dict):
@@ -4504,14 +4516,14 @@ def tool_argument_error(func, func_name, arguments, repaired, as_written=None):
     emptied = ([p.name for p in params
                 if p.default is p.empty and blank(bound.get(p.name))]
                if repaired and bound is not None else [])
-    # Any value, required or not, that the repair emptied: more empty
-    # values than the model wrote empty (review of 30042a2b6: "cwd": /tmp
-    # ran a **kwargs tool with cwd='').
-    blanks = [k for k, v in kwargs.items() if blank(v)]
-    emptied_written = (blanks if repaired and as_written is not None
-                       and len(blanks) > _written_empty_values(as_written)
-                       else [])
-    emptied_written = [k for k in emptied_written if k not in emptied]
+    # Any value, required or not, that the repair emptied: empty now, but
+    # not left empty by the model (review of 30042a2b6: "cwd": /tmp ran a
+    # **kwargs tool with cwd='').
+    blanks = [k for k, v in kwargs.items() if blank(v) and k not in emptied]
+    emptied_written = []
+    if repaired and as_written is not None and blanks:
+        written_empty = _keys_written_empty(as_written)
+        emptied_written = [k for k in blanks if k not in written_empty]
     unholdable = (_numbers_out_of_range(params, bound)
                   if bound is not None else [])
     if unholdable:
@@ -4531,7 +4543,8 @@ def tool_argument_error(func, func_name, arguments, repaired, as_written=None):
               if repaired and extra and as_written is not None
               and bound is not None else None)
     invented = [k for k in extra if k not in quoted] if quoted is not None else []
-    if bound is not None and not emptied and not emptied_written             and not invented:
+    if (bound is not None and not emptied and not emptied_written
+            and not invented):
         return None
     takes_any = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
     names = {p.name for p in params}

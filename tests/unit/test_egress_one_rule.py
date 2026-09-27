@@ -314,8 +314,10 @@ def test_the_ownership_rule_answers_for_concrete_uris():
     # 'com.hertzai.hevolve.{user_id}' would also match it
     assert own('com.hertzai.hevolve.confirmation', '') is False
     assert own('com.hertzai.hevolve.chat.new', '') is False
-    # ...and the catch-all chat.general template attributes nobody
-    assert own('com.hertzai.hevolve.u9', 'u9') is False
+    # the catch-all chat.general template: its instance for the NAMED user
+    # is theirs; it attributes nobody when no user is named
+    assert own('com.hertzai.hevolve.u9', 'u9') is True
+    assert own('com.hertzai.hevolve.u9', '') is False
 
 
 def test_a_one_person_event_bridges_only_onto_its_owners_uri(legs, monkeypatch):
@@ -733,12 +735,12 @@ def test_a_secret_keyed_value_no_pattern_knows_is_withheld():
     from security.edge_privacy import scrub_for_egress
     out = scrub_for_egress({
         'api_key': 'AIzaSyShort123', 'auth_token': 'abc123def456',
-        'secret_hash': 'hunter2hunter2', 'session_token_id': '4155550199',
-        'password': 'correcthorse', 'token': 'none',
+        'db_secret': 'hunter2hunter2', 'password': 'correcthorse',
+        'token': 'none',
     })
     blob = json.dumps(out)
     for v in ('AIzaSyShort123', 'abc123def456', 'hunter2hunter2',
-              '4155550199', 'correcthorse'):
+              'correcthorse'):
         assert v not in blob, v
     assert out['token'] == 'none'          # a status word, not a secret
 
@@ -792,7 +794,7 @@ def test_an_undeclared_uri_under_the_catch_all_is_nobodys():
     from security.edge_privacy import per_user_uri_owner
     assert per_user_uri_owner('com.hertzai.hevolve.intermediate2') == ''
     assert own('com.hertzai.hevolve.somethingnew', '') is False
-    assert own('com.hertzai.hevolve.somethingnew', 'somethingnew') is False
+    assert own('com.hertzai.hevolve.somethingnew', 'u1') is False
     # declared, more specific templates still name their user
     assert per_user_uri_owner('com.hertzai.hevolve.chat.u-1') == 'u-1'
     assert per_user_uri_owner('com.hertzai.hevolve.social.u-1') == 'u-1'
@@ -827,6 +829,7 @@ def test_publish_async_scrubs_an_undeclared_catch_all_uri(legs):
     ('https://api.example.com/v1/data?key=AIzaSyShort123', 'AIzaSyShort123'),
     ('https://api.example.com/v1/data?x=1&api_key=abc123', 'abc123'),
     ('phone_4155550199', '4155550199'),
+    ('node-4155550199.hive.local', '4155550199'),
 ])
 def test_the_one_scrub_closes_the_remaining_raw_leaks(text, raw):
     from security.edge_privacy import scrub_for_egress, scrub_text
@@ -844,3 +847,168 @@ def test_the_new_patterns_keep_protocol_and_plain_text():
                   'the pass rate was high', 'password=none',
                   'you pass: nothing', 'hash deadbeefcafe'):
         assert scrub_text(plain) == plain, plain
+
+
+# ── review of the c072913e4 / d2c9f6b59 / df0e35e0a egress set ───────────
+#
+# 1 (CRITICAL): *_id keys exempted spaceless values, so hive.signal.* with
+#   sender_id = a phone number went raw to every node.
+# 2: chat.general's own instance for its user was scrubbed (two answers).
+# 3: a phone / email / ip span inside a spaceless token was kept whole.
+# 4: the email pattern was quadratic.
+# 5: secret words matched as substrings (tokenizer, max_tokens withheld).
+
+@pytest.mark.parametrize('key, value', [
+    ('sender_id', '+14155550199'), ('wa_id', '14155550199'),
+    ('caller_id', '+14155550199'), ('contact_id', '4155550199'),
+    ('recipient_id', 'jane@icloud.com'), ('client_ip', '73.22.101.5'),
+    ('remote_ip', '73.22.101.5'), ('mobile_ip', '73.22.101.5'),
+    ('status', '4155550199'),
+    ('url', 'https://x.io/call?to=+14155550199'),
+    ('phone_hash', '4155550199'), ('address', '4155550199'),
+    ('home_address', 'Springfield'),
+    ('recovery_token_hash', API_KEY),
+])
+def test_a_person_handle_never_rides_an_identifier_key(key, value):
+    from security.edge_privacy import scrub_for_egress
+    out = scrub_for_egress({key: value})[key]
+    assert out != value, (key, value)
+    for part in ('4155550199', 'jane@icloud.com', '73.22.101.5',
+                 'Springfield', API_KEY):
+        if part in value:
+            assert part not in out, (key, out)
+
+
+def test_hive_signal_events_carry_a_pseudonym_not_the_sender():
+    """The emitter pseudonymises (salted per node); the egress scrub then
+    withholds even that on legs to other nodes."""
+    from integrations.channels.hive_signal_bridge import HiveSignalBridge
+    import types as _t
+    msg = _t.SimpleNamespace(id='m1', sender_id='+14155550199',
+                             sender_name='Jane', is_group=False,
+                             channel='signal', content='hello')
+    seen = []
+    with patch('core.platform.events.emit_event',
+               side_effect=lambda t, d=None, **k: seen.append((t, d))):
+        b = HiveSignalBridge()
+        b._emit_signal_event(msg, ['SENTIMENT'], 'signal')
+        b._emit_spark_event(msg, ['SENTIMENT'], 'signal')
+    assert [t for t, _ in seen] == ['hive.signal.received', 'hive.signal.spark']
+    ids = {d['sender_id'] for _, d in seen}
+    assert len(ids) == 1                       # stable: one sender, one ref
+    (ref,) = ids
+    assert ref and '4155550199' not in ref and '+1' not in ref
+    other = types.SimpleNamespace(**dict(vars(msg), sender_id='+14155550100'))
+    with patch('core.platform.events.emit_event',
+               side_effect=lambda t, d=None, **k: seen.append((t, d))):
+        HiveSignalBridge()._emit_signal_event(other, ['SENTIMENT'], 'signal')
+    assert seen[-1][1]['sender_id'] != ref     # different sender, different ref
+
+
+def test_the_hive_signal_bridge_payload_never_carries_the_phone(legs):
+    legs.ebus.emit('hive.signal.received', {
+        'message_id': 'm1', 'channel': 'signal',
+        'sender_id': '+14155550199', 'signals': ['x'], 'is_group': False,
+        'timestamp': 1.0})
+    _drain(legs.loop)
+    assert '4155550199' not in json.dumps(legs.ebus_session.published)
+
+
+def test_chat_general_is_its_users_own_and_nobody_elses(legs):
+    """One rule, one answer: the template is per-user, so its instance for
+    the message's user is that user's (raw); an undeclared URI with no user
+    named is nobody's (scrubbed)."""
+    from core.peer_link.message_bus import crossbar_topic_is_per_user
+    from security.edge_privacy import crossbar_leg_is_users_own as leg
+    assert crossbar_topic_is_per_user('chat.general') is True
+    assert leg('com.hertzai.hevolve.u1', 'u1') is True
+    assert leg('com.hertzai.hevolve.u1', 'u2') is False
+    assert leg('com.hertzai.hevolve.u1', '') is False
+    assert leg('com.hertzai.hevolve.confirmation', 'confirmation') is False
+    with _no_link_manager():
+        MessageBus().publish('chat.general', {'text': f'mail {EMAIL}'},
+                             user_id='u1', skip_peerlink=True)
+    uri, payload = legs.cb.published[0]
+    assert uri == 'com.hertzai.hevolve.u1'
+    assert json.loads(payload)['text'] == f'mail {EMAIL}'
+
+
+@pytest.mark.parametrize('value, raw', [
+    ('https://wa.me/14155550199', '14155550199'),
+    ('{"phone":"4155550199","n":1}', '4155550199'),
+    ('ip=73.22.101.5;port=6777', '73.22.101.5'),
+    ('my-number-is-4155550199', '4155550199'),
+    ('call_me_at_4155550199_tonight', '4155550199'),
+    ('contact:+14155550199,x', '4155550199'),
+    ('https://example.org/a/b/c/d/e/f/g/h?contact=jo@x.io', 'jo@x.io'),
+])
+def test_a_span_of_personal_data_inside_one_token_is_redacted(value, raw):
+    """M21 / half-coverage: no opaque-token allowance in content -- the
+    matched span is redacted, whatever the rest of the token is."""
+    from security.edge_privacy import scrub_text
+    assert raw not in scrub_text(value), value
+
+
+def test_the_email_pattern_is_linear():
+    import time
+    from security.dlp_engine import get_dlp_engine
+    dlp = get_dlp_engine()
+    for text in ('1.2.' * 25000, 'a' * 100000, 'a.' * 50000 + '@'):
+        t0 = time.perf_counter()
+        dlp.redact(text)
+        assert time.perf_counter() - t0 < 2.0, text[:10]
+
+
+@pytest.mark.parametrize('key, value', [
+    ('tokenizer', 'llama-bpe'), ('token_type', 'Bearer'),
+    ('tokens_used', '512'), ('token_count', '12'),
+    ('credential_type', 'oauth'), ('cookie_policy', 'strict'),
+    ('secret_name', 'HF_TOKEN'), ('private_mode', 'on'),
+    ('max_tokens', '4096'),
+])
+def test_secret_words_match_whole_words_not_substrings(key, value):
+    from security.edge_privacy import scrub_for_egress
+    assert scrub_for_egress({key: value}) == {key: value}
+
+
+def test_the_pseudonym_is_salted_per_node():
+    """Two nodes (two social secret keys) give one sender two references,
+    so no node can correlate another's; one node gives it one."""
+    from security.edge_privacy import pseudonym
+    with patch('core.platform_paths.read_social_secret_key',
+               return_value='A' * 40):
+        a1 = pseudonym('+14155550199', 'hive.signal.sender')
+        a2 = pseudonym('+14155550199', 'hive.signal.sender')
+        other_purpose = pseudonym('+14155550199', 'something.else')
+    with patch('core.platform_paths.read_social_secret_key',
+               return_value='B' * 40):
+        b1 = pseudonym('+14155550199', 'hive.signal.sender')
+    assert a1 == a2 and a1 != b1 and a1 != other_purpose
+    assert pseudonym('', 'hive.signal.sender') == ''
+
+
+def test_a_scrubbed_routing_key_withholds_the_leg_loudly(legs, monkeypatch, caplog):
+    """A URI built from an UNCLASSIFIED routing key whose value the scrub
+    alters would route nowhere; the leg is withheld with a WARNING, never
+    sent silently broken (and never sent raw)."""
+    from core.peer_link import message_bus as mb
+    monkeypatch.setitem(mb.TOPIC_MAP, 'test.room', 'com.hertzai.hevolve.room.{room}')
+    bus = MessageBus()
+    with _no_link_manager(), caplog.at_level(logging.WARNING,
+                                             logger='hevolve_security'):
+        bus.publish('test.room', {'room': '4155550199', 'text': 'hi'},
+                    user_id='u1', skip_peerlink=True)
+        bus.publish('test.room', {'room': 'lobby', 'text': f'mail {EMAIL}'},
+                    user_id='u1', skip_peerlink=True)
+    assert [u for u, _ in legs.cb.published] == ['com.hertzai.hevolve.room.lobby']
+    assert json.loads(legs.cb.published[0][1])['text'] == 'mail [EMAIL_REDACTED]'
+    assert bus.get_stats()['egress_withheld'] == 1
+    assert any('routing key(s) room' in r.getMessage() for r in caplog.records)
+
+
+def test_a_secret_never_rides_an_id_or_a_password_hash():
+    from security.edge_privacy import scrub_for_egress
+    out = scrub_for_egress({'session_id': API_KEY,
+                            'password_hash': 'a1b2c3d4e5f6a7b8c9d0'})
+    assert API_KEY not in json.dumps(out)
+    assert out['password_hash'] == '[SECRET_REDACTED]'

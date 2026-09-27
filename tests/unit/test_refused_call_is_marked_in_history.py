@@ -667,12 +667,24 @@ class QuotedTopLevelKeys(unittest.TestCase):
             {'command'})
 
 
-class WrittenEmptyValues(unittest.TestCase):
-    """The count the empty-value rule compares with: values the model left
-    empty in the outermost object, never a nested one or a written word."""
+class KeysWrittenEmpty(unittest.TestCase):
+    """The keys the empty-value rule credits: outermost keys, quoted or
+    bare, whose value the model left empty -- never a nested one, and never
+    one whose value it wrote (review of e9daad6c5: a count named every
+    empty key, "a" included, when only "cwd" was emptied)."""
 
-    def test_counts_only_outermost_empty_values(self):
-        from hartos.helper import _written_empty_values
-        self.assertEqual(_written_empty_values(
-            '{"a": "", "b": null, "c": , "d": " ", "e": {"f": ""}, '
-            '"g": /tmp, "h": "x", "i":'), 5)
+    def test_only_outermost_keys_left_empty(self):
+        from hartos.helper import _keys_written_empty
+        self.assertEqual(_keys_written_empty(
+            '{"a": "", "b": null, "c": , d: " ", "e": {"f": ""}, '
+            '"g": /tmp, "h": "x", "i":'), {'a', 'b', 'c', 'd', 'i'})
+
+
+class OnlyTheEmptiedKeyIsNamed(KwargsToolsGetNoInventedKeys):
+
+    def test_a_key_written_empty_is_not_named(self):
+        reply = self.call('run_command', '{"a": "", "cwd": /tmp}')
+        self.assertEqual(self.ran, [])
+        tail = reply['content'].split('came out empty:', 1)[1]
+        named = tail.split('.', 1)[0]
+        self.assertEqual(named.strip(), 'cwd')

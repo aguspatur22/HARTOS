@@ -23,14 +23,19 @@ logger = logging.getLogger('hevolve_security')
 
 # PII detection patterns
 PII_PATTERNS = {
+    # Bounded runs (RFC 5321: local part <= 64, domain <= 253): unbounded
+    # '[...]+@' tried every start of a long '1.2.1.2...' run to its end --
+    # 13 s on 100 KB, on every bridged event (egress review, 2026-09-28).
     'email': re.compile(
-        r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        r'(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,253}'
+        r'\.[A-Za-z]{2,24}\b'
     ),
     # An email written so '@' is not literal: URL-encoded (%40) or spelled
     # out ((at) / [at]) -- the same address, the same person.
     'email_obfuscated': re.compile(
-        r'(?<![A-Za-z0-9._%+-])[A-Za-z0-9._+-]+(?:%40|\s*[\(\[]\s*at\s*[\)\]]\s*)'
-        r'[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b',
+        r'(?<![A-Za-z0-9._%+-])[A-Za-z0-9._+-]{1,64}'
+        r'(?:%40|\s{0,3}[\(\[]\s{0,3}at\s{0,3}[\)\]]\s{0,3})'
+        r'[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}\b',
         re.IGNORECASE,
     ),
     # IPv6: a compressed form with '::' and at least three groups, or the
