@@ -1104,21 +1104,51 @@ def parse_tool_arguments(text):
 _NON_FINITE_WORDS = ('Infinity', '-Infinity', 'NaN')
 
 
+def _written_values(original, word):
+    """How many times the model wrote ``word`` (Infinity, -Infinity, NaN) as a
+    WHOLE value in ``original``: bare, or as the whole of a quoted string --
+    never as part of a longer string ("Infinity war")."""
+    pattern = _re_written_value(word)
+    return len(pattern.findall(str(original)))
+
+
+def _re_written_value(word):
+    esc = re.escape(word)
+    # A value boundary before (start, { [ , : or whitespace, or a quote that
+    # opens the string) and after (, } ] or whitespace or the end, or the
+    # quote that closes it).
+    return re.compile(
+        r'(?:(?<=[\{\[,:\s])|^)(?:' + esc + r'(?=\s*(?:[,}\]]|$))'
+        r"|(?P<q>[\"']) *" + esc + r' *(?P=q))')
+
+
 def _invents_a_constant(value, original):
-    """True when ``value`` holds Infinity / NaN (as a number or as the string
-    load_wire_json keeps it as) that ``original`` never contains: repair_json
-    writing Infinity for a number it could not hold.  Such a repair is
-    refused, never sent -- the model did not write that value (review of
-    3ea611862)."""
-    if isinstance(value, dict):
-        return any(_invents_a_constant(k, original)
-                   or _invents_a_constant(v, original) for k, v in value.items())
-    if isinstance(value, list):
-        return any(_invents_a_constant(v, original) for v in value)
-    if isinstance(value, float) and not math.isfinite(value):
+    """True when ``value`` carries Infinity / NaN the model never wrote as a
+    value: a float inf/nan (json.loads of an overflowing number -- the model
+    wrote a number, never inf), or more "Infinity" / "NaN" string values than
+    the model wrote as whole values.  Such a repair is refused, never sent.
+
+    Counted per value, not looked up anywhere in the text: review of
+    3a7abe540 -- with "Infinity war" in the query, the Infinity json_repair
+    invented for 1e999e was let through and search('Infinity war',
+    'Infinity') ran and was banked."""
+    counts = {}
+
+    def walk(v):
+        if isinstance(v, dict):
+            return any(walk(k) or walk(x) for k, x in v.items())
+        if isinstance(v, list):
+            return any(walk(x) for x in v)
+        if isinstance(v, float) and not math.isfinite(v):
+            return True
+        if isinstance(v, str) and v in _NON_FINITE_WORDS:
+            counts[v] = counts.get(v, 0) + 1
+        return False
+
+    if walk(value):
         return True
-    return (isinstance(value, str) and value in _NON_FINITE_WORDS
-            and value not in str(original))
+    return any(n > _written_values(original, word)
+               for word, n in counts.items())
 
 
 def _joins_a_token(ch):

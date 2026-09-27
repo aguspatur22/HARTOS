@@ -122,3 +122,63 @@ class SourceGuardOneArgumentParser(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ReviewOf3a7abe540(ExecutorReadsWhatTheModelWrote):
+    """Review of 3a7abe540 (rv3a7/cases2.py)."""
+
+    def setUp(self):
+        super().setUp()
+
+        @log_tool_execution
+        def search(q: str, id: str = '') -> str:
+            self.calls.append((q, id))
+            return 'found ' + q
+
+        @log_tool_execution
+        def get_two(id: str, n: int = 0) -> str:
+            self.calls.append((id, n))
+            return 'item %s %s' % (id, n)
+
+        self.tools = {'search': search, 'get_two': get_two}
+
+    def run_tool(self, name, arguments):
+        a = ConversableAgent('a', llm_config=False, human_input_mode='NEVER')
+        ex = ConversableAgent('ex', llm_config=False, human_input_mode='NEVER')
+        ex.register_function({name: ex._wrap_function(self.tools[name])})
+        a.send({'role': 'assistant', 'content': None,
+                'tool_calls': [{'id': 'c1', 'type': 'function',
+                                'function': {'name': name,
+                                             'arguments': arguments}}]},
+               ex, request_reply=False, silent=True)
+        _, reply = ex.generate_tool_calls_reply(sender=a)
+        return reply['tool_responses'][0]['content']
+
+    def test_infinity_inside_a_string_is_not_the_model_writing_infinity(self):
+        # "Infinity" appeared in the text (inside "Infinity war"), so the
+        # invented Infinity for 1e999e was let through: search('Infinity
+        # war', 'Infinity') ran and was banked as a success.
+        for text in ('{"q": "Infinity war", "id": 1e999e}',
+                     '{"q": "NaN", "id": +1e999}'):
+            with self.subTest(text=text):
+                self.calls.clear()
+                content = self.run_tool('search', text)
+                self.assertEqual(self.calls, [], content)
+                self.assertTrue(tool_reply_failed(content), content)
+
+    def test_a_value_the_model_wrote_as_infinity_still_runs(self):
+        self.calls.clear()
+        content = self.run_tool('search', '{"q": "Infinity"}')
+        self.assertEqual(self.calls, [('Infinity', '')], content)
+
+    def test_a_line_comment_does_not_swallow_the_rest(self):
+        # The repair read format_json_str's output, which has no newlines,
+        # so '// the id' swallowed '"n": 2' and the call was refused.  The
+        # parent ran it as ('x', 2).
+        nl = chr(10)
+        for text in ('{' + nl + '  "id": "x", // the id' + nl + '  "n": 2' + nl + '}',
+                     '{' + nl + '  "id": "x" // the id' + nl + '  , "n": 2' + nl + '}'):
+            with self.subTest(text=text):
+                self.calls.clear()
+                content = self.run_tool('get_two', text)
+                self.assertEqual(self.calls, [('x', 2)], content)
