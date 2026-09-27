@@ -38,8 +38,9 @@ AUTO_EVOLVE_MAX_PARALLEL_DISPATCH = 4
 
 # PRODUCT_MAP §10: super-majority threshold for VOTE stage — candidates must
 # clear 2/3 of the weighted tally, not a simple majority.  The rule itself
-# (quorum + this ratio) lives in voting_rules.approval_verdict, shared with
-# the evaluation-goal writer; this name is kept for existing importers.
+# (quorum + this ratio as a floor + the decision context's threshold and
+# steward) lives in voting_rules.approval_verdict, shared with the
+# evaluation-goal writer; this name is kept for existing importers only.
 # Callers can still tune per-session via min_approval_score (an absolute-score
 # floor applied in addition to the rule).
 from integrations.social.voting_rules import (  # noqa: E402
@@ -500,8 +501,9 @@ class AutoEvolveOrchestrator:
                             f"score={score} super_ratio={super_ratio:.3f} "
                             f"quorum_met={quorate} "
                             f"distinct_voters={tally.get('distinct_voters')} "
+                            f"verdict={verdict['reason']} "
                             f"(need score>={min_score} and "
-                            f"ratio>={AUTO_EVOLVE_SUPERMAJORITY_RATIO:.3f} "
+                            f"ratio>={verdict['threshold']:.3f} "
                             f"and quorum)"
                         )
         except Exception as e:

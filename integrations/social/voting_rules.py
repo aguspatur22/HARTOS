@@ -84,21 +84,49 @@ def quorum_met(distinct_voters: int, distinct_supporters: int) -> bool:
 SUPERMAJORITY_RATIO = 2.0 / 3.0
 
 
+#: The steward's vote on a thought experiment is cast under this voter id;
+#: decide() has always looked for it there.
+STEWARD_VOTER_ID = 'steward'
+
+
+def steward_must_vote(context: str) -> bool:
+    """True when the decision context requires the steward (VOTER_RULES)."""
+    return bool(get_voter_rules(context)['steward_required'])
+
+
 def approval_verdict(tally: dict) -> dict:
     """The ONE approval rule for a thought experiment, read from a tally.
 
     `tally` is ThoughtExperimentService.tally_votes' result.  Approved
-    requires both:
-      - quorum_met is True (a tally that does not answer it fails closed);
-      - total_for / (total_for + total_against) >= SUPERMAJORITY_RATIO.
+    requires all of:
+      - quorum_met is True: >= MIN_DISTINCT_VOTERS identities, >=
+        MIN_DISTINCT_SUPPORTERS of them FOR, an agent counting as its owner
+        (a tally that does not answer it fails closed);
+      - total_for / (total_for + total_against) >= the threshold, which is
+        max(SUPERMAJORITY_RATIO, the context's approval_threshold): the
+        owner's 2/3 is the floor, and a context may only raise it (0.8 for
+        security_guardrail);
+      - when the context is steward_required, the steward voted FOR
+        (tally['steward_vote'] > 0).
+    The context is the tally's decision_context, and its rules come from
+    VOTER_RULES here, never from the tally, so a tally cannot carry a
+    weaker threshold.  No decision_context means DEFAULT_RULES, as
+    get_voter_rules gives every unknown context.
 
     Every caller that turns a vote into action asks this: auto-evolve's
-    ranking, and the evaluation-goal writer itself, so no caller can start
-    an agent goal for an experiment the vote has not approved.  A caller may
-    ADD a stricter floor (auto-evolve's min_approval_score); none may skip it.
+    ranking, the evaluation-goal writer, and tally_votes'
+    decision_recommendation, so no two of them can disagree.  A caller may
+    ADD a stricter floor (auto-evolve's min_approval_score); none may skip
+    it.  test_one_approval_rule.py fails if a second rule appears.
 
-    Returns {'approved', 'reason', 'quorum_met', 'super_majority'}.
+    Returns {'approved', 'reason', 'quorum_met', 'super_majority',
+    'threshold', 'steward_required', 'steward_approved'}; reason is one of
+    'approved', 'no_quorum', 'below_threshold', 'steward_required'.
     """
+    rules = get_voter_rules(tally.get('decision_context'))
+    threshold = max(SUPERMAJORITY_RATIO, rules['approval_threshold'])
+    steward_required = bool(rules['steward_required'])
+    steward_approved = (tally.get('steward_vote') or 0) > 0
     total_for = tally.get('total_for', 0) or 0
     total_against = tally.get('total_against', 0) or 0
     decisive = total_for + total_against
@@ -106,8 +134,10 @@ def approval_verdict(tally: dict) -> dict:
     quorate = tally.get('quorum_met') is True
     if not quorate:
         reason = 'no_quorum'
-    elif ratio < SUPERMAJORITY_RATIO:
-        reason = 'no_super_majority'
+    elif ratio < threshold:
+        reason = 'below_threshold'
+    elif steward_required and not steward_approved:
+        reason = 'steward_required'
     else:
         reason = 'approved'
     return {
@@ -115,7 +145,27 @@ def approval_verdict(tally: dict) -> dict:
         'reason': reason,
         'quorum_met': quorate,
         'super_majority': round(ratio, 4),
+        'threshold': round(threshold, 4),
+        'steward_required': steward_required,
+        'steward_approved': steward_approved,
     }
+
+
+def recommendation(tally: dict) -> str:
+    """tally_votes' decision_recommendation, read from approval_verdict so
+    the two cannot disagree: 'approve' exactly when it approves;
+    'no_quorum' and 'steward_required' as it says; otherwise 'reject' when
+    the AGAINST share of the decisive weight reaches the threshold, else
+    'inconclusive'."""
+    verdict = approval_verdict(tally)
+    if verdict['approved']:
+        return 'approve'
+    if verdict['reason'] in ('no_quorum', 'steward_required'):
+        return verdict['reason']
+    decisive = (tally.get('total_for', 0) or 0) + \
+        (tally.get('total_against', 0) or 0)
+    against_share = 1.0 - verdict['super_majority'] if decisive > 0 else 0.0
+    return 'reject' if against_share >= verdict['threshold'] else 'inconclusive'
 
 
 # ─── Context Classification ──────────────────────────────────────────

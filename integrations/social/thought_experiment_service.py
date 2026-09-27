@@ -669,7 +669,7 @@ class ThoughtExperimentService:
         # is its owner.  An unregistered voter_id is a string anyone can
         # pass, so it keeps its weight but is no identity.
         from .models import User
-        from .voting_rules import quorum_met
+        from .voting_rules import STEWARD_VOTER_ID, quorum_met, recommendation
         voter_ids = {v.voter_id for v in votes}
         identity_of = {
             u.id: (u.owner_id or u.id)
@@ -686,8 +686,11 @@ class ThoughtExperimentService:
         human_votes = 0
         agent_votes = 0
         suggestions = []
+        steward_vote = None
 
         for v in votes:
+            if v.voter_id == STEWARD_VOTER_ID:
+                steward_vote = v.vote_value
             if v.voter_type == 'human':
                 human_weight = context_rules['human_weight'] if context_rules else 1.0
                 weight = human_weight
@@ -719,10 +722,9 @@ class ThoughtExperimentService:
                 })
 
         weighted_score = weighted_sum / total_weight if total_weight > 0 else 0.0
-        threshold = context_rules['approval_threshold'] if context_rules else 0.5
         quorate = quorum_met(len(voters), len(supporters))
 
-        return {
+        tally = {
             'experiment_id': experiment_id,
             'total_votes': len(votes),
             'human_votes': human_votes,
@@ -733,17 +735,16 @@ class ThoughtExperimentService:
             'total_weight': round(total_weight, 2),
             'suggestions': suggestions,
             'decision_context': decision_context,
-            'approval_threshold': threshold,
             'distinct_voters': len(voters),
             'distinct_supporters': len(supporters),
             'quorum_met': quorate,
-            'decision_recommendation': (
-                'no_quorum' if not quorate
-                else 'approve' if weighted_score > threshold
-                else 'reject' if weighted_score < -threshold
-                else 'inconclusive'
-            ),
+            'steward_vote': steward_vote,
         }
+        # From the ONE approval rule (voting_rules.approval_verdict), never
+        # a threshold of its own: this used to say 'approve' on the context
+        # threshold while the goal writer approved on 2/3 alone.
+        tally['decision_recommendation'] = recommendation(tally)
+        return tally
 
     @staticmethod
     def decide(db: Session, experiment_id: str,
@@ -762,15 +763,15 @@ class ThoughtExperimentService:
 
         # Steward gate: certain contexts require steward vote before decision
         try:
-            from .voting_rules import get_voter_rules, classify_decision_context
+            from .voting_rules import (
+                STEWARD_VOTER_ID, classify_decision_context, steward_must_vote)
             exp_dict = experiment.to_dict()
             context = exp_dict.get('decision_context') or \
                 classify_decision_context(exp_dict)
-            rules = get_voter_rules(context)
-            if rules.get('steward_required'):
+            if steward_must_vote(context):
                 steward_voted = db.query(ExperimentVote).filter_by(
                     experiment_id=experiment_id,
-                    voter_id='steward',
+                    voter_id=STEWARD_VOTER_ID,
                 ).first()
                 if not steward_voted:
                     return {'error': 'steward_vote_required',
