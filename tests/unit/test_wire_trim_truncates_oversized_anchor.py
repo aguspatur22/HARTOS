@@ -201,8 +201,11 @@ class WireTrimTruncatesOversizedAnchor(unittest.TestCase):
             {'role': 'user', 'content': 'HEAD. ' + ('data ' * 4000) + ' TAIL.'},
         ]
         trimmed, *_ = self._trim(messages)
-        self.assertEqual(trimmed['messages'][0]['content'],
-                         'small system prompt')
+        # A cut message carries a pointer, and the pointer explanation is
+        # appended to the system message (test_wire_trim_elided_pointers.py);
+        # the system prompt's own text is untouched.
+        self.assertEqual(trimmed['messages'][0]['content'].split(
+            lol.ELIDED_POINTER_EXPLANATION)[0], 'small system prompt')
 
     def test_anchor_as_last_message_is_not_double_truncated(self):
         """When the anchor IS messages[-1], the existing last-message step

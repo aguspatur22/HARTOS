@@ -231,3 +231,69 @@ def test_a_refused_pause_is_audited_with_the_caller(client, sf):
     ev = audit.log_event.call_args.kwargs
     assert ev['action'] == 'pause_refused'
     assert ev['detail']['caller_user_id'] == 'owner-1'
+
+
+# ── review of c3651a483 (friction) ──────────────────────────────────────
+
+LOCAL_TOKEN = {'Authorization': 'Bearer t'}
+
+
+def test_a_local_request_with_a_token_is_the_tokens_user(app, client, sf):
+    """Finding 1: HEVOLVE_OWNER_USER_ID is set at boot and goes stale when
+    someone signs in afterwards; a signed-in desktop user got 403 on their
+    own goal.  A valid token names the caller, locally too."""
+    me = _user(sf)
+    for verb in _steering_verbs(app):
+        gid, _ = _goal(sf, owner_id=me,
+                       status='paused' if verb == 'resume' else 'active')
+        with _as_token_user(me):
+            r = _post(client, gid, verb, LOCAL_TOKEN)
+        assert r.status_code == 200, (verb, r.get_json())
+
+
+def test_a_local_token_does_not_borrow_the_boot_owners_goals(client, sf):
+    gid, gc = _goal(sf, owner_id='owner-1')
+    with _as_token_user(_user(sf)):
+        assert _post(client, gid, 'inject', LOCAL_TOKEN).status_code == 403
+    assert gc.messages == []
+
+
+def test_a_local_request_with_an_invalid_token_is_the_local_owner(client, sf):
+    gid, gc = _goal(sf, owner_id='owner-1')
+    with patch('integrations.social.auth._get_user_from_token',
+               return_value=(None, MagicMock())):
+        assert _post(client, gid, 'inject', LOCAL_TOKEN).status_code == 200
+    assert len(gc.messages) == 1
+
+
+def test_an_agent_steers_its_owners_goal(client, sf):
+    """Finding 2: an agent counts as its owner (UserService.person_to_notify,
+    the rule thought_experiment_service and the task-assign route apply)."""
+    guest = _user(sf)
+    agent = _user(sf, user_type='agent', owner_id=guest)
+    gid, gc = _goal(sf, owner_id=guest)
+    with _as_token_user(agent):
+        r = _post(client, gid, 'inject', LOCAL_TOKEN, REMOTE)
+    assert r.status_code == 200, r.get_json()
+    assert len(gc.messages) == 1
+
+
+def test_an_agent_cannot_steer_a_goal_its_owner_does_not_own(client, sf):
+    guest, other = _user(sf), _user(sf)
+    agent = _user(sf, user_type='agent', owner_id=guest)
+    gid, gc = _goal(sf, owner_id=other)
+    with _as_token_user(agent):
+        r = _post(client, gid, 'inject', LOCAL_TOKEN, REMOTE)
+    assert r.status_code == 403
+    assert gc.messages == []
+
+
+def test_an_unknown_goal_and_someone_elses_answer_the_same(app, client, sf):
+    """Finding 4: 403 for 'not yours' but 400 for 'no such goal' told a
+    stranger which goal ids exist."""
+    gid, _ = _goal(sf, owner_id=_user(sf))
+    for verb in _steering_verbs(app):
+        theirs = _post(client, gid, verb)
+        missing = _post(client, uuid.uuid4().hex, verb)
+        assert theirs.status_code == missing.status_code == 403, verb
+        assert theirs.get_json() == missing.get_json(), verb

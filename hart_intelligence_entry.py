@@ -11,8 +11,9 @@ if sys.platform == 'win32':
     import asyncio as _asyncio_boot
     _asyncio_boot.set_event_loop_policy(_asyncio_boot.WindowsSelectorEventLoopPolicy())
 from core.subprocess_safe import run_bounded
+from core.platform_paths import under_test as _under_test
 import io
-if sys.platform == 'win32' and 'pytest' not in sys.modules:
+if sys.platform == 'win32' and not _under_test():
     # Force UTF-8 encoding for stdout/stderr to prevent crashes with non-ASCII characters
     # Skip when running under pytest — pytest wraps stdout/stderr for capture,
     # and replacing them here closes pytest's file handles.
@@ -1556,16 +1557,14 @@ try:
         if not key_name or not value:
             return jsonify({'error': 'key_name and value are required'}), 400
         vault = _VaultCls.get_instance()
-        try:
-            resolved = vault.store_credential(
-                key_name=key_name,
-                value=value,
-                channel_type=data.get('channel_type', ''),
-            )
-        except ValueError as e:
-            # A name the process holds that this vault did not store
-            # (PATH, HTTPS_PROXY...) is a setting, not a credential.
-            return jsonify({'error': str(e)}), 400
+        # A name the process holds that this vault did not store (PATH,
+        # HTTPS_PROXY...) is left alone by store_credential and answered as
+        # any other, so this endpoint does not say which variables exist.
+        resolved = vault.store_credential(
+            key_name=key_name,
+            value=value,
+            channel_type=data.get('channel_type', ''),
+        )
         return jsonify({'success': True, 'key_name': resolved})
 
     @app.route('/api/credentials/pending', methods=['GET'])

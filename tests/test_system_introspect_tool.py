@@ -248,14 +248,26 @@ def test_all_public_symbols_listed(tool):
 
 
 def test_boot_decision_handles_missing_log(tool):
-    """If `~/Documents/Nunba/logs/draft_decision.jsonl` doesn't exist,
+    """If `<get_log_dir()>/draft_decision.jsonl` doesn't exist,
     the tool returns available=False with a human-readable reason
     instead of raising."""
     import tempfile
-    from pathlib import Path
-    # Point Home to a temp dir that definitely lacks the log file
+    # Point the log dir at a temp dir that definitely lacks the log file
     with tempfile.TemporaryDirectory() as tmp:
-        with patch.object(Path, 'home', return_value=Path(tmp)):
+        with patch('core.platform_paths.get_log_dir', return_value=tmp):
             result = tool.get_boot_decision()
         assert result['available'] is False
         assert 'not yet written' in result['summary'] or 'empty' in result['summary']
+
+
+def test_boot_decision_reads_the_log_dir_nunba_writes(tool, tmp_path):
+    """Nunba's LlamaConfig._log_draft_decision appends to
+    core.platform_paths.get_log_dir(); the reader must look there."""
+    import json
+    (tmp_path / 'draft_decision.jsonl').write_text(
+        json.dumps({'decision': 'main_only', 'reason': 'vram', 'lang': 'ta'})
+        + '\n', encoding='utf-8')
+    with patch('core.platform_paths.get_log_dir', return_value=str(tmp_path)):
+        result = tool.get_boot_decision()
+    assert result['available'] is True
+    assert result['decision'] == 'main_only'

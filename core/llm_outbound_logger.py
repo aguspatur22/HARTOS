@@ -1242,7 +1242,9 @@ def _trim_to_budget(body: dict, _reserve: int = 0) -> tuple:
         logger.info(
             "wire-trim: seeded one user turn (body had no role='user' — would "
             "trip llama-server's Qwen3 'No user query found in messages' 500).")
-    _entry_body = body  # for the one re-run with a reserve (see below)
+    # For the one re-run with a reserve (see the end): its own copy of the
+    # list, which the drop and the cut below change in place.
+    _entry_body = dict(body, messages=list(messages))
 
     model = body.get('model') or None
     max_tokens = int(body.get('max_tokens') or body.get('max_completion_tokens') or 2048)
@@ -1505,13 +1507,19 @@ def _trim_to_budget(body: dict, _reserve: int = 0) -> tuple:
     listed = dropped_pointers[-_ELIDED_LISTED_DROPS:]
     live = {pid: rec for pid, rec in elided.items()
             if pid in sent or any(pid in lp for lp in listed)}
+    _added = count_tokens_for_text(
+        ELIDED_POINTER_EXPLANATION + ' Removed earlier: '
+        + ' '.join(listed) + '.', model) if live else 0
+    if live and _added * 4 > full_budget:
+        # A budget this small cannot spare the explanation for the text it
+        # needs: plain markers, as before pointers existed.
+        live = {}
     if live and not _reserve:
-        _added = count_tokens_for_text(
-            ELIDED_POINTER_EXPLANATION + ' Removed earlier: '
-            + ' '.join(listed) + '.', model)
         if count_tokens_for_messages(messages, model) + _added > full_budget:
             return _trim_to_budget(_entry_body, _reserve=_added)
-    if live and _save_elided(live):
+    if not live and elided:
+        messages[:] = [_strip_pointers(m) for m in messages]
+    elif live and _save_elided(live):
         explanation = ELIDED_POINTER_EXPLANATION
         if listed:
             explanation += (' Removed earlier: ' + ' '.join(listed) + '.')

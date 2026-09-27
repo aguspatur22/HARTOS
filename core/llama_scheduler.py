@@ -279,9 +279,7 @@ class LlamaScheduler:
         """``with get_scheduler().slot(rid, kind, cancel_fn): resp = call()``.
         Yields the token (``None`` on timeout — caller still proceeds, fail-open).
         Always releases.  A cancelled turn (bind_cancel) raises TurnCancelled
-        instead of proceeding, before and after waiting for its slot."""
-        if self._is_cancelled(rid):
-            raise TurnCancelled(f'turn {rid} was cancelled')
+        instead of proceeding once its slot wait ends."""
         tok = self.acquire(rid, kind, cancel_fn, timeout)
         if self._is_cancelled(rid):
             self.release(tok)

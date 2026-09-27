@@ -174,6 +174,38 @@ class StrictNumbers(unittest.TestCase):
             _call("{“v”: “id 1e999”, 'w': 1e999}")))
         self.assertEqual(_strict_loads(out), {'v': 'id 1e999', 'w': '1e999'})
 
+    def test_repair_keeps_hyphenated_tokens_whole(self):
+        # Review of ed31c7c53, probed (probe_uuid.py): '-' and '+' were read
+        # as number delimiters, so an unquoted UUID became "550e8400" -- its
+        # first group, 550e8400, reads as an overflowing number -- and the
+        # rest was lost.  A number is quoted only between real delimiters.
+        for text, expected in (
+                ("{'id': 550e8400-e29b-41d4-a716-446655440000}",
+                 {'id': '550e8400-e29b-41d4-a716-446655440000'}),
+                ('{id: 123e4567-e89b-12d3-a456-426614174000, n: 2}',
+                 {'id': '123e4567-e89b-12d3-a456-426614174000', 'n': 2}),
+                ("{'v': x-1e999}", {'v': 'x-1e999'}),
+                ("{'v': 1e999-2}", {'v': '1e999-2'})):
+            with self.subTest(text=text):
+                out = _out_args(ensure_tool_call_arguments_json(_call(text)))
+                self.assertEqual(_strict_loads(out), expected)
+
+    def test_repair_still_quotes_an_overflow_between_delimiters(self):
+        for text, expected in (
+                ("{'v':1e999}", {'v': '1e999'}),
+                ("{'a': [ 1e999 ,2]}", {'a': ['1e999', 2]}),
+                ("{'v': -620e51403072992921}", {'v': '-620e51403072992921'})):
+            with self.subTest(text=text):
+                out = _out_args(ensure_tool_call_arguments_json(_call(text)))
+                self.assertEqual(_strict_loads(out), expected)
+
+    def test_repair_leaves_digits_in_a_comment_alone(self):
+        from hartos.helper import _quote_overflowing_numbers
+        self.assertEqual(_quote_overflowing_numbers("{'v': 2 /* 1e999 */}"),
+                         "{'v': 2 /* 1e999 */}")
+        self.assertEqual(_quote_overflowing_numbers("{'v': 2 // 1e999\n}"),
+                         "{'v': 2 // 1e999\n}")
+
     def test_a_coerced_call_keeps_each_finite_number_its_own_type(self):
         # Coercion re-serialises the whole call: the overflow becomes its own
         # string, and every finite number must come back as it was written,

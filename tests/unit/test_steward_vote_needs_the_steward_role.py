@@ -147,6 +147,77 @@ def test_one_steward_against_is_not_outvoted_by_another_steward_for(db):
     assert result['verdict']['reason'] == 'steward_required'
 
 
+def test_a_steward_against_cast_first_is_not_undone_by_a_later_for(db):
+    """Order must not matter: the AGAINST first, then another steward's FOR.
+    A last-vote-wins tally passed the FOR-then-AGAINST case above."""
+    e = _experiment(db)
+    _people_approve(db, e.id)
+    for _ in range(3):
+        _vote(db, e.id, _user(db).id, 2)
+    _vote(db, e.id, _user(db, role='central', is_admin=True).id, -1)
+    _vote(db, e.id, _user(db, role='central', is_admin=True).id, 2)
+    result, goals = _evaluate(db, e)
+    assert result['success'] is False and goals == 0
+    assert result['verdict']['reason'] == 'steward_required'
+
+
+def test_a_steward_abstain_is_no_steward_answer_anywhere(db):
+    """Abstain (0) is not the steward's answer: approval stays blocked and
+    decide() still waits for the steward, from the same rule."""
+    e = _experiment(db)
+    _people_approve(db, e.id)
+    _vote(db, e.id, _user(db, role='central', is_admin=True).id, 0)
+    result, goals = _evaluate(db, e)
+    assert result['verdict']['reason'] == 'steward_required' and goals == 0
+    out = ThoughtExperimentService.decide(db, e.id, 'go')
+    assert out.get('error') == 'steward_vote_required'
+
+
+def test_a_steward_against_still_lets_the_experiment_be_decided(db):
+    """decide() records a decision either way; the steward answering AGAINST
+    is an answer, so it no longer waits."""
+    e = _experiment(db)
+    _vote(db, e.id, _user(db, role='central', is_admin=True).id, -2)
+    out = ThoughtExperimentService.decide(db, e.id, 'rejected')
+    assert out.get('status') == 'decided'
+
+
+@pytest.mark.parametrize('role, is_admin, status', [
+    ('central', False, 200),
+    ('flat', True, 200),
+    ('regional', False, 403),
+    ('flat', False, 403),
+])
+def test_require_admin_asks_the_one_central_check(factory, monkeypatch,
+                                                  role, is_admin, status):
+    """require_admin and require_central admit exactly the accounts
+    auth.holds_central_role does."""
+    from flask import Flask, jsonify
+    from integrations.social import auth
+
+    s = factory()
+    u = _user(s, role=role, is_admin=is_admin)
+    monkeypatch.setattr(auth, '_get_user_from_token',
+                        lambda token: (u, factory()))
+    app = Flask(__name__)
+
+    @app.route('/a')
+    @auth.require_admin
+    def _a():
+        return jsonify({'ok': True})
+
+    @app.route('/c')
+    @auth.require_central
+    def _c():
+        return jsonify({'ok': True})
+
+    client = app.test_client()
+    h = {'Authorization': 'Bearer t'}
+    assert client.get('/a', headers=h).status_code == status
+    assert client.get('/c', headers=h).status_code == status
+    s.close()
+
+
 def test_an_agent_the_steward_owns_is_not_the_steward(db):
     """It counts as its owner for the quorum, never as the steward."""
     e = _experiment(db)

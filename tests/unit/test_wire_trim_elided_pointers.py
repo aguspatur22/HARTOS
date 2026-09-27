@@ -118,9 +118,20 @@ def test_a_pointer_survives_the_process_forgetting(store, monkeypatch):
     pid = _POINTER.search(next(m for m in out if m.get('role') == 'tool')
                           ['content']).group(1)
     assert list(store.glob('elided_agent_data.json'))
-    import importlib
-    importlib.reload(lol)
-    assert lol.read_elided(pid) == page
+    # Read back in a fresh interpreter: nothing held in this process helps.
+    # (Not importlib.reload: that would undo a mutated function for every
+    # later test in the session.)
+    import os
+    import subprocess
+    import sys
+    code = ('import core.cache_loaders as cl, core.llm_outbound_logger as l;'
+            'cl.AGENT_DATA_DIR = %r;'
+            'import sys; sys.stdout.write(l.read_elided(%r) or "")'
+            % (str(store), pid))
+    out = subprocess.run([sys.executable, '-c', code], capture_output=True,
+                         timeout=300, cwd=os.getcwd(),
+                         env=dict(os.environ, PYTHONIOENCODING='utf-8'))
+    assert out.stdout.decode('utf-8') == page, out.stderr.decode()[-500:]
 
 
 def test_the_system_message_explains_a_pointer_only_when_one_is_sent(
@@ -191,3 +202,31 @@ def test_the_user_seed_warns_and_is_counted(caplog):
     assert lol.user_seed_count() == before + 1
     assert any('seed' in r.getMessage().lower() for r in caplog.records
                if r.levelname == 'WARNING')
+
+
+def test_a_rerun_for_the_explanation_starts_from_the_whole_body(
+        store, monkeypatch):
+    """When the explanation pushes a trimmed body over, the trim runs again
+    with that much reserved -- from the body it was given, not from the list
+    the first run already cut down.  The shape that exposed it: a body with
+    no user turn, which the trim seeds, so the body's list IS the one the
+    first run drops from.  Measured: at budget 900 this shape re-runs
+    (reserve 195 tokens); with the shared list the re-run counted 0 drops."""
+    msgs = [{'role': 'system', 'content': 'You are the reuse assistant.'}]
+    for i in range(8):
+        msgs.append({'role': 'assistant', 'content': None,
+                     'tool_calls': [{'id': 'c%d' % i, 'type': 'function',
+                                     'function': {'name': 'crawl',
+                                                  'arguments': '{}'}}]})
+        msgs.append({'role': 'tool', 'tool_call_id': 'c%d' % i,
+                     'content': ('P%d ' % i) + 'row ' * 300})
+    msgs.append({'role': 'assistant', 'content': 'done'})
+    per_slot = 900 + _MAX_TOKENS + WIRE_TRIM_SAFETY_MARGIN_TOKENS
+    monkeypatch.setattr(lol, '_get_budget_per_slot', lambda: per_slot)
+    out, n_dropped, _, _, est_after, budget = lol._trim_to_budget(
+        {'model': 'llama', 'messages': msgs, 'max_tokens': _MAX_TOKENS})
+    kept = out['messages']
+    assert est_after <= budget
+    # +1: the seeded user turn.
+    assert n_dropped == len(msgs) + 1 - len(kept), (n_dropped, len(msgs), len(kept))
+    assert _POINTER.findall(kept[0]['content'])

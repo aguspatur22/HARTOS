@@ -565,18 +565,35 @@ def _steering_caller():
     """Who is calling, for dashboard_service.may_steer.
 
     Runs under require_local_or_auth: a remote caller is the user its token
-    names (g.user); a loopback caller is this desktop's owner,
-    HEVOLVE_OWNER_USER_ID -- the identity the camera, screen, computer-use
-    and credential asks all go to.  Nothing a request body says is identity.
+    names (g.user).  A loopback caller is the user its token names when it
+    sends a valid one, else this desktop's owner, HEVOLVE_OWNER_USER_ID --
+    the identity the camera, screen, computer-use and credential asks all go
+    to.  The token comes first because HEVOLVE_OWNER_USER_ID is set at boot
+    and goes stale when someone signs in afterwards (review of c3651a483: a
+    signed-in desktop user got 403 on their own goal).  Nothing a request
+    body says is identity.
     """
     from flask import g
+    from .auth import _get_user_from_token, holds_central_role
     from .dashboard_service import SteeringCaller
     user = getattr(g, 'user', None)
     if user is not None:
-        from .auth import holds_central_role
         return SteeringCaller(user_id=str(user.id),
                               is_admin=holds_central_role(user),
                               is_local=False)
+    auth = request.headers.get('Authorization', '')
+    if auth.startswith('Bearer ') and auth[7:]:
+        # The same token lookup require_auth uses; an invalid token is
+        # no token, and the local owner below answers.
+        token_user, token_db = _get_user_from_token(auth[7:])
+        try:
+            if token_user is not None and not getattr(token_user, 'is_banned', False):
+                return SteeringCaller(user_id=str(token_user.id),
+                                      is_admin=holds_central_role(token_user),
+                                      is_local=True)
+        finally:
+            if token_db is not None:
+                token_db.close()
     owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
     return SteeringCaller(user_id=owner or None, is_admin=False, is_local=True)
 

@@ -1086,30 +1086,42 @@ def may_steer(db, goal, caller: SteeringCaller) -> Optional[str]:
         it by UserService.person_to_notify (the canonical rule: a person is
         themself, an agent is its human owner, an ownerless agent/system
         account is nobody), so an agent a person owns is that person's.
+
+    The CALLER is resolved by the same rule: an agent acting with its own
+    token counts as the person who owns it (the rule the thought-experiment
+    tally and the task-assign route apply), so it may steer its owner's
+    goals (review of c3651a483: an agent got 403 on its owner's goal).
     """
     if caller.is_admin:
         return None
     from core.event_attribution import goal_owner_user_id
+    from .services import UserService
     owner = goal_owner_user_id(goal)
     if owner is not None:
-        from .services import UserService
         owner = UserService.person_to_notify(db, owner)
     if owner is None:
         return None if caller.is_local else (
             'only an admin may steer a goal with no owner from another machine')
-    if caller.user_id and str(caller.user_id) == owner:
-        return None
+    if caller.user_id:
+        who = UserService.person_to_notify(db, str(caller.user_id))
+        if who is not None and str(who) == str(owner):
+            return None
     return 'this agent belongs to another user'
+
+
+#: What a refused steer answers, whether the goal is someone else's or does
+#: not exist, so the answer never discloses which ids exist.
+STEER_REFUSED = 'agent not found, or not yours to steer'
 
 
 def _goal_to_steer(db, agent_id: str, verb: str, caller: SteeringCaller,
                    actor_id: str):
     """The goal ``caller`` may steer with ``verb``, or why not.
 
-    Returns ``(goal, None)``, or ``(None, fields)`` to merge into the verb's
-    result: ``{'error': 'agent not found'}``, or ``{'error': <reason>,
-    'forbidden': True}`` for a caller may_steer refuses -- logged and
-    audit-logged as ``<verb>_refused`` with the caller's identity.  ONE
+    Returns ``(goal, None)``, or ``(None, {'error': STEER_REFUSED,
+    'forbidden': True})`` for an unknown id or a caller may_steer refuses --
+    the same answer for both, logged and audit-logged as ``<verb>_refused``
+    with the caller's identity and the real reason.  ONE
     lookup (AgentGoal, then CodingGoal: without the fallback the drawer's
     buttons 404 on every coding card) and ONE authorization for every
     steering verb, so no verb can skip either.
@@ -1123,9 +1135,8 @@ def _goal_to_steer(db, agent_id: str, verb: str, caller: SteeringCaller,
                 CodingGoal.id == str(agent_id)).first()
         except Exception:
             logger.debug('CodingGoal lookup unavailable', exc_info=True)
-    if not goal:
-        return None, {'error': 'agent not found'}
-    refusal = may_steer(db, goal, caller)
+    refusal = (may_steer(db, goal, caller) if goal
+               else 'no goal with this id')
     if not refusal:
         return goal, None
     logger.warning('%s refused: caller=%s local=%s agent=%s: %s', verb,
@@ -1145,7 +1156,10 @@ def _goal_to_steer(db, agent_id: str, verb: str, caller: SteeringCaller,
     except Exception:
         logger.exception('%s_refused audit-log write failed for %s', verb,
                          agent_id)
-    return None, {'error': refusal, 'forbidden': True}
+    # ONE answer for "no such goal" and "not yours": a different one told
+    # a stranger which goal ids exist (review of c3651a483).  The real
+    # reason is in the log and the audit line above.
+    return None, {'error': STEER_REFUSED, 'forbidden': True}
 
 
 def inject_instruction(db, agent_id: str, instruction: str,

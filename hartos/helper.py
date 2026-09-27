@@ -1068,6 +1068,9 @@ def load_wire_json(text):
 # constants.STRING_DELIMITERS: " ' and the curly pair), each with its closer.
 _BARE_NUMBER = re.compile(r'-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?')
 _STRING_CLOSER = {'"': '"', "'": "'", '“': '”', '”': '”'}
+# The JSON delimiters a whole value sits between (whitespace too).
+_BEFORE_A_VALUE = '{[,:'
+_AFTER_A_VALUE = ',}]:'
 
 
 def _quote_overflowing_numbers(text):
@@ -1075,13 +1078,26 @@ def _quote_overflowing_numbers(text):
     quotes, for ``repair_json``: it reads such a number as inf and writes
     Infinity, so the token the model wrote (an unquoted id like
     ``620e51403072992921``) would be lost before ``load_wire_json`` sees it.
-    Text inside a string literal, and finite numbers, are left as they are;
-    a string whose delimiter never closes swallows the rest, which is then
-    left as it was."""
+    Text inside a string literal or a comment, and finite numbers, are left
+    as they are; a string or comment that never closes swallows the rest,
+    which is then left as it was.
+
+    Only a WHOLE token is quoted: one with a JSON delimiter (the start,
+    ``{ [ , :`` or whitespace) before it and one (the end, ``, } ] :`` or
+    whitespace) after it.  Review of ed31c7c53, probed: reading '-' and '+'
+    as delimiters turned an unquoted UUID ``550e8400-e29b-...`` into
+    ``"550e8400"`` (its first group reads as an overflowing number) and lost
+    the rest; ``x-1e999`` became ``"x-"``."""
     out, i, closer = [], 0, None
     while i < len(text):
         ch = text[i]
         if closer:
+            if closer in ('*/', '\n'):
+                end = text.find(closer, i)
+                end = len(text) if end < 0 else end + len(closer)
+                out.append(text[i:end])
+                i, closer = end, None
+                continue
             step = 2 if ch == '\\' else 1
             out.append(text[i:i + step])
             if ch == closer:
@@ -1093,13 +1109,31 @@ def _quote_overflowing_numbers(text):
             out.append(ch)
             i += 1
             continue
+        if text.startswith('/*', i) or text.startswith('//', i):
+            closer = '*/' if text[i + 1] == '*' else '\n'
+            out.append(text[i:i + 2])
+            i += 2
+            continue
         match = _BARE_NUMBER.match(text, i)
-        if match and not (i and (text[i - 1].isalnum() or text[i - 1] in '_.')):
+        if match and (i == 0 or text[i - 1] in _BEFORE_A_VALUE
+                      or text[i - 1].isspace()):
             token, end = match.group(), match.end()
-            bounded = end == len(text) or not (text[end].isalnum() or text[end] in '_.')
-            out.append(json.dumps(token)
-                       if bounded and not math.isfinite(float(token)) else token)
-            i = end
+            bounded = (end == len(text) or text[end] in _AFTER_A_VALUE
+                       or text[end].isspace())
+            if bounded:
+                out.append(json.dumps(token)
+                           if not math.isfinite(float(token)) else token)
+                i = end
+                continue
+            # Part of a longer token (a UUID, a word): copy the whole run
+            # so no later position inside it is read as a number.
+            run_end = i
+            while (run_end < len(text) and not text[run_end].isspace()
+                   and text[run_end] not in _AFTER_A_VALUE
+                   and text[run_end] not in _STRING_CLOSER):
+                run_end += 1
+            out.append(text[i:run_end])
+            i = run_end
             continue
         out.append(ch)
         i += 1

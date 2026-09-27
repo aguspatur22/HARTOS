@@ -598,8 +598,7 @@ def require_admin(f):
     @wraps(f)
     @require_auth
     def decorated(*args, **kwargs):
-        user_role = getattr(g.user, 'role', None) or 'flat'
-        if not (g.user.is_admin or user_role in ('central',)):
+        if not holds_central_role(g.user):
             return jsonify({'success': False, 'error': 'Admin access required'}), 403
         return f(*args, **kwargs)
     return decorated

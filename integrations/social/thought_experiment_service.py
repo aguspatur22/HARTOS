@@ -754,25 +754,26 @@ class ThoughtExperimentService:
         """Record final decision for an experiment.
 
         Transitions to 'decided' status. Feeds outcome to WorldModelBridge.
-        Steward-required contexts block decision until steward has voted.
+        Steward-required contexts block decision until the steward has
+        answered FOR or AGAINST (an abstain is no answer).
         """
         from .models import ThoughtExperiment
-        from .voting_rules import steward_must_vote
+        from .voting_rules import approval_verdict
 
         experiment = db.query(ThoughtExperiment).filter_by(
             id=experiment_id).first()
         if not experiment:
             return None
 
-        # Steward gate: certain contexts require the steward's vote before a
-        # decision.  Who the steward is comes from the tally
-        # (voting_rules.is_steward), the same answer approval_verdict reads;
-        # never a voter_id string.
+        # Steward gate, from the ONE rule (voting_rules.approval_verdict):
+        # who the steward is and whether they answered come from the tally
+        # (voting_rules.is_steward), never a voter_id string.  A decision may
+        # record either outcome, so a steward AGAINST lets it be decided;
+        # only no answer (or an abstain) waits.
         tally = ThoughtExperimentService.tally_votes(db, experiment_id)
-        context = tally.get('decision_context')
-        if steward_must_vote(context) and tally.get('steward_vote') is None:
+        if approval_verdict(tally)['steward_missing']:
             return {'error': 'steward_vote_required',
-                    'context': context,
+                    'context': tally.get('decision_context'),
                     'message': 'Steward must vote before decision on security contexts'}
 
         experiment.status = 'decided'

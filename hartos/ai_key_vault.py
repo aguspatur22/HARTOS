@@ -180,9 +180,12 @@ class AIKeyVault:
             ours = (resolved in self._stored
                     or current == self._secrets_manager()._cache.get(resolved))
             if current and not ours:
-                raise ValueError(
-                    f"{resolved} is a setting of this computer, not a "
-                    f"credential; it was not stored")
+                # Answered as any store is (the resolved name): an error
+                # here told a caller the variable exists (secrets review,
+                # the F1 oracle).  Nothing is written; the log says why.
+                logger.warning("credential %s not stored: the process holds "
+                               "it and this vault did not store it", resolved)
+                return resolved
             # Persist to encrypted vault
             try:
                 self._secrets_manager().set_secret(resolved, value)
@@ -622,6 +625,8 @@ def request_credential(resource_description, agent_id=None) -> str:
                 # the credential shows on the privacy page, where "Allow
                 # asking again" (reopen) is the way back.
                 ConsentService.revoke_consent(db, owner, 'credential', scope)
+            if held:
+                _pending()             # as a name nothing holds would be
             if not (held or exhausted):
                 _pending()
                 ConsentService.request_consent(db, owner, 'credential',
@@ -633,11 +638,11 @@ def request_credential(resource_description, agent_id=None) -> str:
                 f"unavailable.")
 
     if held:
+        # Answered exactly as a name nothing holds is (below): a different
+        # answer told the agent the variable exists (secrets review, the F1
+        # oracle).  No card, and the alias never resolves to it.
         logger.warning("credential %s not asked: the process already holds it "
                        "and the owner never entered it", name)
-        return (f"'{label}' was not asked for: {name} is a setting of this "
-                f"computer, not a credential the owner entered, so it cannot "
-                f"be used through {alias}. Use a different key_name.")
     if exhausted:
         logger.info("credential %s: rejected after %d entries, not asked again",
                     name, entries)

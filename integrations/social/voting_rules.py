@@ -101,11 +101,6 @@ def is_steward(user) -> bool:
     return holds_central_role(user)
 
 
-def steward_must_vote(context: str) -> bool:
-    """True when the decision context requires the steward (VOTER_RULES)."""
-    return bool(get_voter_rules(context)['steward_required'])
-
-
 def approval_verdict(tally: dict) -> dict:
     """The ONE approval rule for a thought experiment, read from a tally.
 
@@ -134,13 +129,18 @@ def approval_verdict(tally: dict) -> dict:
     it.  test_one_approval_rule.py fails if a second rule appears.
 
     Returns {'approved', 'reason', 'quorum_met', 'super_majority',
-    'threshold', 'steward_required', 'steward_approved'}; reason is one of
-    'approved', 'no_quorum', 'below_threshold', 'steward_required'.
+    'threshold', 'steward_required', 'steward_approved', 'steward_missing'};
+    reason is one of 'approved', 'no_quorum', 'below_threshold',
+    'steward_required'.  steward_missing is True when the context requires
+    the steward and no steward has answered FOR or AGAINST (an abstain is
+    no answer): decide() asks it, so deciding and approving read the
+    steward from this one rule.
     """
     rules = get_voter_rules(tally.get('decision_context'))
     threshold = max(SUPERMAJORITY_RATIO, rules['approval_threshold'])
     steward_required = bool(rules['steward_required'])
-    steward_approved = (tally.get('steward_vote') or 0) > 0
+    steward_vote = tally.get('steward_vote') or 0
+    steward_approved = steward_vote > 0
     total_for = tally.get('total_for', 0) or 0
     total_against = tally.get('total_against', 0) or 0
     decisive = total_for + total_against
@@ -162,6 +162,7 @@ def approval_verdict(tally: dict) -> dict:
         'threshold': round(threshold, 4),
         'steward_required': steward_required,
         'steward_approved': steward_approved,
+        'steward_missing': steward_required and steward_vote == 0,
     }
 
 

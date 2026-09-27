@@ -434,14 +434,20 @@ def test_a_setting_of_this_computer_is_never_asked_for(world, monkeypatch, name)
     """Review of Nunba 670aed3f: asking for PATH put a card up, the grant made
     PATH an owner credential, and {{secret:PATH}} resolved to the system
     value.  A name the process holds that the owner never entered is refused
-    before any card."""
+    before any card, and the refusal says nothing a name that does not exist
+    would not get (secrets review: "is a setting of this computer" confirmed
+    the variable exists, the F1 oracle again)."""
     from hartos.ai_key_vault import request_credential
+    ask = '{"key_name": "%s", "label": "x"}' % name
     monkeypatch.setenv(name, 'system-value')
-    out = request_credential('{"key_name": "%s", "label": "x"}' % name, agent_id='42')
-    assert 'not asked for' in out
-    assert 'system-value' not in out
+    held = request_credential(ask, agent_id='42')
+    assert 'system-value' not in held
     assert [t for t, _ in world if t == 'consent.request'] == []
     assert [a for a in _asks() if a[1] == 'secret:' + name] == []
+
+    monkeypatch.delenv(name)
+    assert held == request_credential(ask, agent_id='42'), \
+        'a held name is answered exactly as a name nothing holds'
 
 
 def test_a_credential_the_owner_entered_before_is_still_asked_again(world, monkeypatch):
@@ -457,13 +463,20 @@ def test_a_credential_the_owner_entered_before_is_still_asked_again(world, monke
 
 def test_store_credential_never_replaces_a_setting(world, monkeypatch):
     """/api/credentials/submit (store_credential) set os.environ for any
-    name.  It now refuses a name the process holds that it did not store."""
+    name.  It now leaves a name the process holds that it did not store
+    alone, and answers exactly as for any other name, so the endpoint does
+    not tell a caller which variables exist."""
     from hartos.ai_key_vault import get_ai_key_vault
+    vault = get_ai_key_vault()
     monkeypatch.setenv('PATH_TEST_SETTING', 'system-value')
-    with pytest.raises(ValueError):
-        get_ai_key_vault().store_credential('PATH_TEST_SETTING', 'typed')
+    held = vault.store_credential('PATH_TEST_SETTING', 'typed')
     assert os.environ['PATH_TEST_SETTING'] == 'system-value'
-    assert 'PATH_TEST_SETTING' not in get_ai_key_vault().owner_credential_names()
+    assert 'PATH_TEST_SETTING' not in vault.owner_credential_names()
+    assert vault._secrets_manager()._cache.get('PATH_TEST_SETTING') is None
+    monkeypatch.delenv('FRESH_TEST_NAME', raising=False)
+    assert held == 'PATH_TEST_SETTING'
+    assert vault.store_credential('fresh_test_name', 'typed') == 'FRESH_TEST_NAME'
+    os.environ.pop('FRESH_TEST_NAME', None)
 
 
 def test_store_credential_replaces_its_own_value(world):

@@ -588,6 +588,8 @@ def test_protocol_values_survive_and_person_values_do_not():
         'contact_email': EMAIL, 'phone': '4155550199', 'mobile': 'call me',
         'note': PHONE, 'reply': f'my number is 4155550199 {EMAIL}',
         'author': {'name': 'a', 'email': EMAIL, 'voice_profile': 'v1'},
+        # an identifier SUFFIX never exempts a contact or secret key
+        'email_address': EMAIL, 'recovery_token_hash': API_KEY,
     })
     blob = json.dumps(person)
     for raw in (API_KEY, EMAIL, PHONE, '4155550199', 'call me', 'v1'):

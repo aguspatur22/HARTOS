@@ -265,3 +265,18 @@ def test_a_task_cancel_while_the_permit_is_held_means_the_turn_never_starts(
     assert chat == [], 'the cancelled turn ran once the permit came back'
     assert handler.tasks[task['id']].state == TaskState.FAILED
     assert _permit_free()
+
+
+def test_a_turn_that_swallows_the_refusal_still_reports_cancelled(chat,
+                                                                  monkeypatch):
+    """A pipeline that catches the refusal and returns a polite sentence must
+    not have that sentence reported as the cancelled turn's answer."""
+    cancel = threading.Event()
+
+    def turn(**kw):
+        cancel.set()            # the cancel lands mid-turn
+        return {'text': 'Sorry, something went wrong.'}
+    monkeypatch.setattr(dispatch, '_in_process_chat', lambda *a, **k: turn)
+    assert dispatch.local_chat_dispatch('p', 'u', 'pid', daemon_id='a2a_s',
+                                        cancel_event=cancel) == ('cancelled', None)
+    assert _permit_free()
