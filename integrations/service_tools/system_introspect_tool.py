@@ -255,8 +255,10 @@ def get_boot_decision() -> Dict[str, Any]:
     for p in checked:
         try:
             present.append((p.stat().st_mtime, p))
-        except OSError:
-            pass
+        except OSError as exc:
+            # Absent is the common case (a dev run has no logs-dev copy);
+            # named in 'checked' below, and here for the other errnos.
+            logger.debug("boot decision log %s not readable: %s", p, exc)
     if not present:
         return {
             'available': False,

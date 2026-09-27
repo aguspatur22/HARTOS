@@ -1106,22 +1106,38 @@ def parse_tool_arguments(text):
 _NON_FINITE_WORDS = ('Infinity', '-Infinity', 'NaN')
 
 
-def _written_values(original, word):
-    """How many times the model wrote ``word`` (Infinity, -Infinity, NaN) as a
-    WHOLE value in ``original``: bare, or as the whole of a quoted string --
-    never as part of a longer string ("Infinity war")."""
-    pattern = _re_written_value(word)
-    return len(pattern.findall(str(original)))
-
-
-def _re_written_value(word):
-    esc = re.escape(word)
-    # A value boundary before (start, { [ , : or whitespace, or a quote that
-    # opens the string) and after (, } ] or whitespace or the end, or the
-    # quote that closes it).
-    return re.compile(
-        r'(?:(?<=[\{\[,:\s])|^)(?:' + esc + r'(?=\s*(?:[,}\]]|$))'
-        r"|(?P<q>[\"']) *" + esc + r' *(?P=q))')
+def _written_value_counts(original):
+    """How many times the model wrote each of Infinity, -Infinity, NaN as a
+    WHOLE value in ``original``: a bare token, or the whole of a quoted
+    string.  Read with the one scanner (_scan_segments), so a word inside a
+    longer string ("to Infinity, and beyond", "say 'Infinity' now") or a
+    comment is never a value the model wrote (review of dbfef4360: a regex
+    blind to string boundaries let an invented Infinity through)."""
+    segments = [s for s in _scan_segments(str(original))
+                if not (s[0] == "char" and s[1].isspace())
+                and s[0] != "comment"]
+    counts = {}
+    for k, (kind, piece) in enumerate(segments):
+        if kind == "string":
+            word = (piece[1:-1] if len(piece) > 1 else "").strip()
+        elif kind == "run":
+            # A bare word is a whole value only between value delimiters:
+            # in {"q": Infinity war} it is the start of an unquoted string.
+            before = segments[k - 1] if k else None
+            after = segments[k + 1] if k + 1 < len(segments) else None
+            if before is not None and before[0] != "char":
+                continue
+            if before is not None and before[1] not in "{[,:":
+                continue
+            if after is not None and (after[0] != "char"
+                                      or after[1] not in ",}]"):
+                continue
+            word = piece
+        else:
+            continue
+        if word in _NON_FINITE_WORDS:
+            counts[word] = counts.get(word, 0) + 1
+    return counts
 
 
 def _invents_a_constant(value, original):
@@ -1149,13 +1165,54 @@ def _invents_a_constant(value, original):
 
     if walk(value):
         return True
-    return any(n > _written_values(original, word)
-               for word, n in counts.items())
+    written = _written_value_counts(original)
+    return any(n > written.get(word, 0) for word, n in counts.items())
 
 
 def _joins_a_token(ch):
     """True when ``ch`` next to a number makes it part of a longer token."""
     return ch.isalnum() or ch in _TOKEN_CHARS
+
+
+def _scan_segments(text):
+    """Split ``text`` into ``(kind, piece)`` the way the tool-argument reader
+    sees it, so the quoting and the counting of written values read ONE
+    tokenisation: "string" (a quoted string, quotes included; one that never
+    closes runs to the end), "comment" (/* */ or // to the line end, opened
+    only where a comment can start: after whitespace or { [ , -- not inside
+    an unquoted value such as a URL), "number" (a whole run that is a bare
+    number), "run" (any other whole run of letters, digits and
+    _TOKEN_CHARS: a word, a UUID, a path, an expression), or "char"."""
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in _STRING_CLOSER:
+            closer, j = _STRING_CLOSER[ch], i + 1
+            while j < n and text[j] != closer:
+                j += 2 if text[j] == "\\" else 1
+            j = min(n, j + 1)
+            yield "string", text[i:j]
+            i = j
+            continue
+        if ((text.startswith("/*", i) or text.startswith("//", i))
+                and (i == 0 or text[i - 1].isspace()
+                     or text[i - 1] in _BEFORE_A_COMMENT)):
+            closer = "*/" if text[i + 1] == "*" else "\n"
+            end = text.find(closer, i + 2)
+            end = n if end < 0 else end + len(closer)
+            yield "comment", text[i:end]
+            i = end
+            continue
+        if _joins_a_token(ch):
+            j = i + 1
+            while j < n and _joins_a_token(text[j]):
+                j += 1
+            run = text[i:j]
+            yield ("number" if _BARE_NUMBER.fullmatch(run) else "run"), run
+            i = j
+            continue
+        yield "char", ch
+        i += 1
 
 
 def _quote_overflowing_numbers(text):
@@ -1180,54 +1237,14 @@ def _quote_overflowing_numbers(text):
     # written with "'" made json_repair read the next key into the value
     # before it (review of e1a1aa233: {'u': http://h/x, 'id': 620e...} lost
     # the id).
-    out, i, closer, quote = [], 0, None, '"'
-    while i < len(text):
-        ch = text[i]
-        if closer:
-            if closer in ('*/', '\n'):
-                end = text.find(closer, i)
-                end = len(text) if end < 0 else end + len(closer)
-                out.append(text[i:end])
-                i, closer = end, None
-                continue
-            step = 2 if ch == '\\' else 1
-            out.append(text[i:i + step])
-            if ch == closer:
-                closer = None
-            i += step
-            continue
-        if ch in _STRING_CLOSER:
-            closer = _STRING_CLOSER[ch]
-            quote = "'" if ch == "'" else '"'
-            out.append(ch)
-            i += 1
-            continue
-        if ((text.startswith('/*', i) or text.startswith('//', i))
-                and (i == 0 or text[i - 1].isspace()
-                     or text[i - 1] in _BEFORE_A_COMMENT)):
-            closer = '*/' if text[i + 1] == '*' else '\n'
-            out.append(text[i:i + 2])
-            i += 2
-            continue
-        match = _BARE_NUMBER.match(text, i)
-        if match and not (i and _joins_a_token(text[i - 1])):
-            token, end = match.group(), match.end()
-            if end == len(text) or not _joins_a_token(text[end]):
-                out.append(quote + token + quote
-                           if not math.isfinite(float(token)) else token)
-                i = end
-                continue
-            # Part of a longer token (a UUID, a word): copy the whole run
-            # so no later position inside it is read as a number.
-            run_end = end
-            while run_end < len(text) and _joins_a_token(text[run_end]):
-                run_end += 1
-            out.append(text[i:run_end])
-            i = run_end
-            continue
-        out.append(ch)
-        i += 1
-    return ''.join(out)
+    out, quote = [], '"'
+    for kind, piece in _scan_segments(text):
+        if kind == "string":
+            quote = "'" if piece[0] == "'" else '"'
+        elif kind == "number" and not math.isfinite(float(piece)):
+            piece = quote + piece + quote
+        out.append(piece)
+    return "".join(out)
 
 
 # The two keys of a refused call's stand-in arguments (see
