@@ -17,7 +17,7 @@ Usage:
 
 import re
 import logging
-from typing import Any, Iterable, List, Tuple, Optional
+from typing import List, Tuple, Optional
 
 logger = logging.getLogger('hevolve_security')
 
@@ -123,30 +123,6 @@ class DLPEngine:
             if pattern:
                 result = pattern.sub(replacement, result)
         return result
-
-    def redact_fields(self, data: Any, field_names: Iterable[str]) -> Any:
-        """A copy of ``data`` with ``redact`` applied only to strings under a
-        key in ``field_names``, at any depth; every other value is unchanged.
-
-        For structured payloads whose ids and urls must survive: ``redact``
-        over a whole serialised payload rewrites a 10-digit id as a phone
-        number and a peer url's host as an ip address.  Strings inside a list
-        under a named key (``'text': ['...']``) count as that key's; a dict
-        under a named key is walked by its own keys.  ``data`` is never
-        mutated.
-        """
-        names = frozenset(field_names)
-
-        def walk(value, named):
-            if isinstance(value, dict):
-                return {k: walk(v, k in names) for k, v in value.items()}
-            if isinstance(value, list):
-                return [walk(v, named) for v in value]
-            if named and isinstance(value, str):
-                return self.redact(value)
-            return value
-
-        return walk(data, False)
 
     def check_outbound(self, text: str) -> Tuple[bool, str]:
         """

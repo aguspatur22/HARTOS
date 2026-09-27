@@ -33,7 +33,7 @@ from core.peer_link import link_manager as lm_mod  # noqa: E402
 from core.peer_link.link import LinkState, PeerLink, TrustLevel  # noqa: E402
 from core.peer_link.message_bus import (  # noqa: E402
     MessageBus, RELAY_TOPIC, reset_message_bus)
-from security.dlp_engine import DLPEngine  # noqa: E402
+from security.edge_privacy import scrub_for_egress  # noqa: E402
 
 NODE_OWNER = 'owner-1'      # the user this node belongs to (HEVOLVE_USER_ID)
 OTHER_USER = 'u-42'          # a user this node serves who does not own it
@@ -113,20 +113,19 @@ def _add(manager, link):
     return link
 
 
-# ── DLPEngine.redact_fields: the one field-scoped scrub ─────────────────────
+# ── edge_privacy.scrub_for_egress: the one egress scrub ─────────────────────
 
-def test_redact_fields_scrubs_only_named_fields_and_returns_a_copy():
+def test_scrub_for_egress_scrubs_content_keeps_ids_and_returns_a_copy():
     original = _chat_body(OTHER_USER)
     before = json.dumps(original, sort_keys=True)
-    out = DLPEngine().redact_fields(original, ('content', 'text', 'message'))
+    out = scrub_for_egress(original)
     _assert_scrubbed(out)
     _assert_ids_intact(out, OTHER_USER)
     assert json.dumps(original, sort_keys=True) == before   # never mutates
 
 
-def test_redact_fields_leaves_non_strings_under_content_keys():
-    out = DLPEngine().redact_fields(
-        {'content': 5551234567, 'text': [None, 3, EMAIL]}, ('content', 'text'))
+def test_scrub_for_egress_leaves_non_strings_under_content_keys():
+    out = scrub_for_egress({'content': 5551234567, 'text': [None, 3, EMAIL]})
     assert out == {'content': 5551234567, 'text': [None, 3, '[EMAIL_REDACTED]']}
 
 
@@ -290,7 +289,7 @@ def test_local_and_sse_receive_raw_while_third_party_legs_are_scrubbed(bus, mgr)
 # ── a scrub that fails withholds only the third-party legs ─────────────────
 
 class _BrokenDLP:
-    def redact_fields(self, data, fields):
+    def redact(self, text):
         raise RuntimeError('dlp broken')
 
 
@@ -304,7 +303,7 @@ def test_dlp_failure_drops_third_party_legs_and_keeps_own_legs(bus, mgr, caplog)
     body = dict(_chat_body(OTHER_USER), community_id='c-1')
     with patch('security.dlp_engine.get_dlp_engine', return_value=_BrokenDLP()), \
             patch('core.platform.events.broadcast_sse_safe', return_value=False), \
-            caplog.at_level(logging.WARNING, logger='hevolve.peer_link'):
+            caplog.at_level(logging.WARNING, logger='hevolve_security'):
         bus.publish('community.message', body, user_id=OTHER_USER)
 
     assert calls == []                       # third-party Crossbar leg withheld

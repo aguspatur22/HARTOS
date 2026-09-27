@@ -8342,6 +8342,9 @@ function renderAgentOverlay(ev) {{
             # never time out; a short connect timeout lets us fail fast to
             # the static floor while the daemon is still coming up.
             _nunba_proxy = {'client': None}
+            # The one Host value the daemon's allowlist admits on the socket;
+            # core.serve owns it so the proxy and the server cannot drift.
+            from core.serve import UNIX_SOCKET_SERVER_NAME
 
             def _nunba_client():
                 if _nunba_proxy['client'] is None:
@@ -8366,7 +8369,8 @@ function renderAgentOverlay(ev) {{
                 fwd = {k: v for k, v in request.headers
                        if k.lower() not in _HOP}
                 # Host MUST be exactly 'Nunba' (capital N). The daemon's
-                # Hypercorn config sets server_names = ['Nunba'], and
+                # Hypercorn config sets server_names from
+                # core.serve.local_server_names (['Nunba'] on the socket), and
                 # Hypercorn treats that as a CASE-SENSITIVE Host allowlist
                 # that answers 404 to everything else -- before the Flask app
                 # ever sees the request. httpx derives Host from the URL
@@ -8376,7 +8380,7 @@ function renderAgentOverlay(ev) {{
                 # Host: nunba -> 404, Host: Nunba -> 200 (and / -> 302, the
                 # SPA redirect). _HOP already strips the inbound Host; this
                 # sets the one the daemon's allowlist accepts.
-                fwd['Host'] = 'Nunba'
+                fwd['Host'] = UNIX_SOCKET_SERVER_NAME
                 try:
                     client = _nunba_client()
                     upstream = client.build_request(

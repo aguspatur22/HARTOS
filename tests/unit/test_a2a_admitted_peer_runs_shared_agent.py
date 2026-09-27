@@ -32,6 +32,7 @@ real PeerNode rows.  Only the network (pooled_post -> test_client), the
 agent executor (a spy) and the invoker's identity (a fresh key standing for
 another node) are stand-ins.
 """
+import json
 import sys
 import time
 import types
@@ -151,6 +152,7 @@ def node(monkeypatch):
     secrets = {'security.secrets_manager': types.SimpleNamespace(
         get_secret=lambda name: __import__('os').environ.get(name, ''))}
     seen = []
+    bodies = []
 
     # The invoker knows the serving node by url and node_id (its peer store).
     with db_session() as db:
@@ -162,10 +164,12 @@ def node(monkeypatch):
             r = client.post(urlsplit(url).path, json=json,
                             environ_base=REMOTE)
         seen.append((r.status_code, r.get_json(silent=True)))
+        bodies.append(json or {})
         return _Resp(r)
     monkeypatch.setattr(peer_reuse, 'pooled_post', routed_post)
     with patch.dict(sys.modules, secrets):
-        yield types.SimpleNamespace(client=client, ran=ran, seen=seen)
+        yield types.SimpleNamespace(client=client, ran=ran, seen=seen,
+                                    srv=srv, bodies=bodies)
 
 
 def _post(node, body, agent=AGENT, environ=REMOTE):
@@ -175,10 +179,12 @@ def _post(node, body, agent=AGENT, environ=REMOTE):
     return r.status_code, r.get_json()
 
 
-def _signed(method='message/send', agent=AGENT, text='summarise', **over):
+def _signed(method='message/send', agent=AGENT, text='summarise',
+            params=None, **over):
     body = {'jsonrpc': '2.0', 'id': uuid.uuid4().hex, 'method': method,
-            'params': {'message': {'messageId': uuid.uuid4().hex,
-                                   'parts': [{'kind': 'text', 'text': text}]}},
+            'params': params if params is not None else {
+                'message': {'messageId': uuid.uuid4().hex,
+                            'parts': [{'kind': 'text', 'text': text}]}},
             'agent_id': agent}
     body = discovery.signed_peer_request(body, audience=SERVER_ID)
     body.update(over)
@@ -775,3 +781,175 @@ def test_a_verified_peer_that_later_fails_a_challenge_is_refused_again(
     assert _row(invoker.node_id).integrity_status == 'claimed'
     assert peer_reuse.invoke_peer_agent(PEER_URL, AGENT, 'x') is None
     assert node.ran == []
+
+
+# ── M2: a remote turn nobody waits for is cancelled, not orphaned ────────
+#
+# Review finding M2 (2026-09-26): the caller waited min(30, remaining) of a
+# 10 s peer budget while the server waited up to 30 s for its one LLM permit
+# and then ran a whole /chat turn: the caller timed out, fell back to local
+# CREATE, and the server finished a turn nobody read, holding the permit.
+# Now message/send with configuration.blocking=false returns the task at
+# once, the caller polls message/get inside its budget and sends task/cancel
+# when it gives up, and the cancel reaches the executor (which frees the
+# permit before the turn starts: dispatch.local_chat_dispatch below).
+
+SLOW = 'livetest_slow_0'
+
+
+def _register_slow(node, release):
+    seen = {}
+
+    async def slow(text, ctx, cancel_event=None):
+        seen['cancel_event'] = cancel_event
+        import asyncio
+        for _ in range(200):
+            if release.is_set():
+                return {'role': 'model', 'parts': [{'text': f'slow:{text}'}]}
+            if cancel_event is not None and cancel_event.is_set():
+                seen['cancelled_at'] = time.monotonic()
+                raise RuntimeError('cancelled before the turn started')
+            await asyncio.sleep(0.05)
+        raise RuntimeError('never released')
+    node.srv.register_agent(SLOW, 'slow', 'd', [{'id': 's'}], slow)
+    return seen
+
+
+def test_a_non_blocking_send_returns_before_the_turn_finishes(node, invoker):
+    import threading
+    _admit(invoker.node_id, invoker.public_key)
+    release = threading.Event()
+    _register_slow(node, release)
+    started = time.monotonic()
+    code, body = _post(node, _signed(agent=SLOW, params={
+        'message': {'parts': [{'kind': 'text', 'text': 'later'}]},
+        'configuration': {'blocking': False}}), agent=SLOW)
+    assert code == 200, body
+    assert time.monotonic() - started < 2
+    assert body['result']['state'] in ('submitted', 'working'), body
+    release.set()
+    task_id = body['result']['id']
+    for _ in range(100):
+        code, got = _post(node, _signed(method='message/get', agent=SLOW,
+                                        params={'taskId': task_id}), agent=SLOW)
+        if got['result'].get('state') == 'completed':
+            break
+        time.sleep(0.05)
+    assert got['result']['state'] == 'completed', got
+    assert got['result']['content']['parts'][0]['text'] == 'slow:later'
+
+
+def test_a_send_without_configuration_still_blocks(node, invoker):
+    _admit(invoker.node_id, invoker.public_key)
+    code, body = _post(node, _signed())
+    assert code == 200 and body['result']['state'] == 'completed', body
+
+
+def test_the_caller_that_gives_up_cancels_the_remote_turn(node, invoker):
+    """The real invoker against the real server: a budget shorter than the
+    server's wait makes the invoker send task/cancel, and the executor sees
+    it before any turn starts."""
+    import threading
+    _admit(invoker.node_id, invoker.public_key)
+    release = threading.Event()
+    seen = _register_slow(node, release)
+    started = time.monotonic()
+    result = peer_reuse.invoke_peer_agent(PEER_URL, SLOW, 'x', timeout=1.5)
+    waited = time.monotonic() - started
+    assert result is None
+    assert waited < 4, waited
+    methods = [b.get('method') for b in node.bodies]
+    assert methods[0] == 'message/send' and 'task/cancel' in methods, methods
+    for _ in range(100):
+        if 'cancelled_at' in seen:
+            break
+        time.sleep(0.05)
+    assert 'cancelled_at' in seen, seen
+    task_id = node.seen[0][1]['result']['id']
+    code, got = _post(node, _signed(method='message/get', agent=SLOW,
+                                    params={'taskId': task_id}), agent=SLOW)
+    assert got['result']['state'] == 'failed', got
+    assert 'cancel' in got['result'].get('error', ''), got
+
+
+def test_a_cancelled_task_is_not_overwritten_by_a_late_result(node, invoker):
+    """A turn that was already running finishes, but the task keeps the
+    cancelled verdict: nobody asked for that answer any more."""
+    import threading
+    _admit(invoker.node_id, invoker.public_key)
+    release = threading.Event()
+    node.srv.register_agent(
+        SLOW, 'slow', 'd', [{'id': 's'}],
+        _late_executor(release))
+    code, body = _post(node, _signed(agent=SLOW, params={
+        'message': {'parts': [{'kind': 'text', 'text': 'x'}]},
+        'configuration': {'blocking': False}}), agent=SLOW)
+    task_id = body['result']['id']
+    code, out = _post(node, _signed(method='task/cancel', agent=SLOW,
+                                    params={'taskId': task_id}), agent=SLOW)
+    assert code == 200 and out['result'].get('success'), out
+    release.set()
+    time.sleep(0.5)
+    code, got = _post(node, _signed(method='message/get', agent=SLOW,
+                                    params={'taskId': task_id}), agent=SLOW)
+    assert got['result']['state'] == 'failed', got
+
+
+def _late_executor(release):
+    async def run(text, ctx):
+        import asyncio
+        while not release.is_set():
+            await asyncio.sleep(0.02)
+        return {'role': 'model', 'parts': [{'text': 'late'}]}
+    return run
+
+
+# ── M4: `hart a2a send` speaks the server's contract ─────────────────────
+#
+# Review finding M4: the command read result['artifacts'] (the server
+# returns 'content') and sent no signature, so against a bundled, central
+# or keyed node it printed "Task state: ?" and nothing else.  It now signs
+# with this node's gossip key (the peer invoke's path), prints the reply's
+# text, and says plainly why a 401 happened.
+
+def _cli(monkeypatch, *args):
+    from click.testing import CliRunner
+    from hartos import hart_cli
+    monkeypatch.setattr(hart_cli, 'pooled_post', peer_reuse.pooled_post)
+    return CliRunner().invoke(hart_cli.hart, list(args), catch_exceptions=False)
+
+
+def test_hart_a2a_send_prints_the_agents_reply(node, invoker, monkeypatch):
+    _admit(invoker.node_id, invoker.public_key)
+    out = _cli(monkeypatch, 'a2a', 'send', f'{PEER_URL}/a2a/{AGENT}',
+               'collect metrics')
+    assert out.exit_code == 0, out.output
+    assert 'Task state: completed' in out.output
+    assert 'ran:collect metrics' in out.output
+    assert node.ran == ['collect metrics']
+    body = node.bodies[-1]
+    assert body['sender']['node_id'] == invoker.node_id
+    assert body['audience'] == SERVER_ID and body['agent_id'] == AGENT
+
+
+def test_hart_a2a_send_explains_a_refusal(node, invoker, monkeypatch):
+    _admit(invoker.node_id, invoker.public_key, integrity_status='unverified')
+    out = _cli(monkeypatch, 'a2a', 'send', f'{PEER_URL}/a2a/{AGENT}', 'x')
+    assert out.exit_code != 0
+    assert '401' in out.output and 'not verified' in out.output, out.output
+    assert 'integrity challenge' in out.output, out.output
+    assert node.ran == []
+
+
+def test_hart_a2a_send_json_is_the_raw_reply(node, invoker, monkeypatch):
+    _admit(invoker.node_id, invoker.public_key)
+    out = _cli(monkeypatch, '--json', 'a2a', 'send',
+               f'{PEER_URL}/a2a/{AGENT}', 'collect metrics')
+    assert out.exit_code == 0, out.output
+    assert json.loads(out.output)['result']['state'] == 'completed'
+
+
+def test_hart_a2a_send_refuses_a_url_that_names_no_agent(monkeypatch):
+    out = _cli(monkeypatch, 'a2a', 'send', 'http://node-b:5000', 'x')
+    assert out.exit_code != 0
+    assert '/a2a/<agent_id>' in out.output, out.output

@@ -690,7 +690,8 @@ class ConsentService:
             return None
         if granted:
             if ConsentService.active_grant(db, user_id, consent_type) is None:
-                # grant_consent applies the feed and emits consent.granted.
+                # grant_consent applies the feed and emits consent.granted,
+                # both once the caller commits.
                 ConsentService.grant_consent(db, user_id, consent_type)
             else:
                 # Already allowed, so no second row (the UNIQUE constraint
@@ -698,7 +699,12 @@ class ConsentService:
                 # feed may have been stopped from admin settings while the
                 # grant stood, so re-assert it.  Exclusive with the branch
                 # above, so the feed is never applied twice for one answer.
-                _embodied_feed_from_consent(consent_type, True)
+                # After the commit, as grant_consent's own feed start: the
+                # admin toggle's 'all' answers camera then screen in one
+                # session, so a camera grant flushed just before holds
+                # SQLite's write lock, and a feed started here held it too.
+                after_commit(db, lambda: _embodied_feed_from_consent(
+                    consent_type, True))
         elif ConsentService.revoke_consent(db, user_id, consent_type,
                                            agent_id=agent_id) is None:
             # Nothing on file to revoke -- a client that answers without
@@ -708,6 +714,36 @@ class ConsentService:
             ConsentService.announce_revocation(user_id, consent_type,
                                                agent_id=agent_id)
         return consent_type
+
+    @staticmethod
+    def reopen(db, user_id: str, consent_type: str, scope: str = '*'):
+        """Take back a "no": every revoked row for (user, type, scope), for
+        any agent, becomes undecided again, so declined() is False and the
+        next request_consent shows the card.  Returns how many rows.
+
+        The way back for an ask with no on/off card to grant from (a
+        credential: the privacy page's "Allow asking again").  It is not a
+        yes: each row is left ungranted (granted=False), so check_consent,
+        active_grant and the owner-credential list do not count it.  The
+        grant history stays (granted_at is never touched) and the audit log
+        records the reopen.
+        """
+        _validate_consent_type(consent_type)
+        rows = db.query(UserConsent).filter(
+            UserConsent.user_id == user_id,
+            UserConsent.consent_type == consent_type,
+            UserConsent.scope == scope,
+            UserConsent.revoked_at.isnot(None),
+        ).all()
+        for row in rows:
+            row.granted = False
+            row.revoked_at = None
+        if rows:
+            db.flush()
+            _audit('consent', actor_id=user_id,
+                   action=f'consent.reopened:{consent_type}',
+                   detail={'scope': scope, 'rows': len(rows)})
+        return len(rows)
 
     @staticmethod
     def declined(db, user_id: str, consent_type: str, scope: str = '*',

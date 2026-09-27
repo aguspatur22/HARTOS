@@ -237,13 +237,22 @@ def _in_process_chat(native_fallback=True, model_config=None):
 
 
 def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
-                        native_fallback=True, model_config=None):
+                        native_fallback=True, model_config=None,
+                        cancel_event=None):
     """The ONE in-process call to this node's own /chat.  Returns
     ``(status, text)`` where status is ``'ok'`` (text is the reply),
     ``'deferred'`` (a human has the LLM, or it is saturated — retry later,
     NOT a failure) or ``'unavailable'`` (no in-process route; the caller may
     fall back to its HTTP tier).  ``model_config`` runs the turn on that
     model; _in_process_chat says which path carries it.
+
+    ``cancel_event`` (a threading.Event): set by whoever stopped waiting for
+    this turn (the A2A task/cancel of a peer that gave up).  Honoured while
+    the turn waits for the LLM permit and once more right after it is
+    taken, returning ``('cancelled', None)`` with the permit given back.  A
+    turn already running is not stopped: the only mid-flight abort
+    (core.foreground's cancel registry) closes the shared background LLM
+    client and would drop every other background call too.
 
     ``native_fallback=False`` says "only use this if the Nunba adapter is
     present".  On native HARTOS (central) the loopback POST already reaches
@@ -323,11 +332,20 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
                     f"deferring local /chat for {daemon_id or prompt_id}")
         return 'deferred', None
 
-    if not _local_llm_semaphore.acquire(timeout=_LOCAL_LLM_WAIT_S):
+    if not _acquire_llm_permit(cancel_event):
+        if cancel_event is not None and cancel_event.is_set():
+            logger.info(f"Local /chat for {daemon_id or prompt_id} cancelled "
+                        f"while waiting for the LLM permit")
+            return 'cancelled', None
         logger.info(f"LLM busy ({_LOCAL_LLM_MAX_CONCURRENT} in flight) for "
                     f"{_LOCAL_LLM_WAIT_S:.0f}s, deferring local /chat for "
                     f"{daemon_id or prompt_id}")
         return 'deferred', None
+    if cancel_event is not None and cancel_event.is_set():
+        _local_llm_semaphore.release()
+        logger.info(f"Local /chat for {daemon_id or prompt_id} cancelled "
+                    f"before its turn; permit given back")
+        return 'cancelled', None
 
     # The permit is held from here, so enter the try IMMEDIATELY: everything
     # below must be inside it, because whatever raises, the finally is the
@@ -371,6 +389,21 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
                     daemon_id or prompt_id)
         return 'deferred', None
     return 'ok', (result.get('text') or result.get('response', ''))
+
+
+def _acquire_llm_permit(cancel_event=None) -> bool:
+    """Take the local LLM permit within _LOCAL_LLM_WAIT_S.  With a
+    cancel_event, wait in short slices and stop as soon as it is set."""
+    if cancel_event is None:
+        return _local_llm_semaphore.acquire(timeout=_LOCAL_LLM_WAIT_S)
+    deadline = _time.monotonic() + _LOCAL_LLM_WAIT_S
+    while not cancel_event.is_set():
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            return False
+        if _local_llm_semaphore.acquire(timeout=min(0.25, remaining)):
+            return True
+    return False
 
 
 def _note_yield_reason(reason) -> None:

@@ -84,10 +84,16 @@ def _authorize_topic_for_user_id(topic: str, user_id: str) -> bool:
     """
     if not topic:
         return False
-    # Public / aggregate — every authenticated user may receive.
-    for pref in _PUBLIC_TOPIC_PREFIXES:
-        if topic == pref or topic.startswith(pref):
-            return True
+    from core.platform.events import AUDIENCE_ONE_PERSON, topic_audience
+    from security.edge_privacy import crossbar_uri_is_per_user
+    # Public / aggregate — every authenticated user may receive.  Not a
+    # topic the one "who is this for" table (core.platform.events
+    # .topic_audience) says is ONE person's: 'agent.' below is agent
+    # lifecycle, while 'agent.ui.' carries one person's card.
+    if topic_audience(topic) != AUDIENCE_ONE_PERSON:
+        for pref in _PUBLIC_TOPIC_PREFIXES:
+            if topic == pref or topic.startswith(pref):
+                return True
     # Tenant-scoped topics — split by shape:
     #   tenant.<tid>.conv.<cid>.{typing|read|message}  → service-layer
     #     membership check is the gate (ConversationService.emit_typing /
@@ -110,21 +116,19 @@ def _authorize_topic_for_user_id(topic: str, user_id: str) -> bool:
             return True
         # User-scoped: enforce suffix match.
         if scope == 'user' and user_id:
-            if topic.endswith(f'.{user_id}') or topic.endswith(f'/{user_id}'):
+            if crossbar_uri_is_per_user(topic, user_id):
                 return True
             # Allow .user.<uid>.<event> shape — strip event suffix and
             # check.
             head, _, _ = topic.rpartition('.')
-            if head.endswith(f'.{user_id}'):
+            if crossbar_uri_is_per_user(head, user_id):
                 return True
             return False
         # Unknown tenant shape — refuse.
         return False
-    # Per-user topic must end with the publisher's user_id.
-    if user_id:
-        if topic.endswith(f'.{user_id}') or topic.endswith(f'/{user_id}'):
-            return True
-    return False
+    # Per-user topic must end with the publisher's user_id (the one
+    # ownership rule, security.edge_privacy.crossbar_uri_is_per_user).
+    return bool(user_id) and crossbar_uri_is_per_user(topic, user_id)
 
 
 _PUBLISH_COUNTERS = {

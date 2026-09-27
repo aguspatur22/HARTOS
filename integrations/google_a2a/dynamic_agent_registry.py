@@ -353,7 +353,8 @@ class DynamicAgentExecutor:
         self.discovery = DynamicAgentDiscovery()
         self.discovery.discover_all_agents()
 
-    async def execute_agent_task(self, agent_id: str, message: str, context_id: str) -> Dict[str, Any]:
+    async def execute_agent_task(self, agent_id: str, message: str, context_id: str,
+                                 cancel_event=None) -> Dict[str, Any]:
         """
         Execute a task for a dynamically discovered agent
 
@@ -361,6 +362,8 @@ class DynamicAgentExecutor:
             agent_id: Agent identifier (e.g., "71_0_1")
             message: Task message
             context_id: A2A context ID
+            cancel_event: the A2A task's cancel (task/cancel); a turn still
+                waiting for the LLM permit gives it back and never starts
 
         Returns:
             A2A response format
@@ -413,7 +416,11 @@ class DynamicAgentExecutor:
                 agent.prompt_id,
                 # A peer's request is not this node's human: it is background
                 # work, and the id says so to dispatch.is_genuine_user_request.
-                daemon_id=f"a2a_{context_id}"))
+                daemon_id=f"a2a_{context_id}",
+                cancel_event=cancel_event))
+        if status == 'cancelled':
+            raise RuntimeError(f"agent {agent_id} not run: cancelled by the "
+                               f"caller before its turn started")
         if status != 'ok':
             raise RuntimeError(
                 f"agent {agent_id} not run: local /chat {status} "

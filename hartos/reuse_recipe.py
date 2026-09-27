@@ -1453,8 +1453,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     user_tasks[user_prompt].set_ledger(ledger)
 
     # Set first action to IN_PROGRESS so ledger tracks it
-    safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "reuse: first action assigned")
-    safe_set_state(user_prompt, 1, ActionState.IN_PROGRESS, "reuse: first action starting")
+    _start_reuse_action(user_prompt, 1, "reuse: first action")
 
     individual_recipe = []
     for i in range(1, (len(recipes[user_prompt]['actions']) + 1)):
@@ -6588,6 +6587,32 @@ creation_signals = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_creation
 # REUSE ACTION ADVANCEMENT HELPER
 # =============================================================================
 
+def _start_reuse_action(user_prompt, action_id, reason):
+    """Put the action a REUSE run is about to execute into IN_PROGRESS.
+
+    The ONE place a REUSE action starts: the first action of a cold run
+    (create_agents_for_user), the current action of a warm run (chat_agent),
+    and every next action on advance (_advance_reuse_action).  It walks the
+    FSM's own edges, ASSIGNED -> IN_PROGRESS, through safe_set_state, so the
+    transition guard stays the judge; nothing here skips a state.
+
+    Why the warm run needs it: chat_agent clears the session's ActionStates
+    at every run boundary (lifecycle_hooks.clear_action_states), which leaves
+    the current action at ASSIGNED.  On a cache miss create_agents_for_user
+    then started action 1; on a cache hit nothing did, so the completion
+    boundary's ASSIGNED -> STATUS_VERIFICATION_REQUESTED write was refused
+    ("Invalid transition: Action 1 cannot go from assigned to
+    status_verification_requested") and a warm run could never finish an
+    action (tests/unit/test_reuse_role_handoff.py, the `cached` case).
+
+    Returns True when the action is IN_PROGRESS afterwards.
+    """
+    safe_set_state(user_prompt, action_id, ActionState.ASSIGNED,
+                   f"{reason}: assigned")
+    return safe_set_state(user_prompt, action_id, ActionState.IN_PROGRESS,
+                          f"{reason}: starting")
+
+
 def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt_id=None):
     """
     Mark action COMPLETED → TERMINATED, advance to next action, set ASSIGNED → IN_PROGRESS.
@@ -6798,8 +6823,7 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
                     f'[REUSE] completed-work spark charge skipped: {_spark_err}')
         return None, False
 
-    safe_set_state(user_prompt, next_id, ActionState.ASSIGNED, f"{reason}: next assigned")
-    safe_set_state(user_prompt, next_id, ActionState.IN_PROGRESS, f"{reason}: starting")
+    _start_reuse_action(user_prompt, next_id, f"{reason}: next")
     return next_id, True
 
 
@@ -7457,6 +7481,17 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
         # but only when the previous run went past the end of the recipe.  Both
         # stores, one authority; see its docstring for why that is safe here.
         clear_action_states(user_prompt, user_tasks)
+
+        # The clear above leaves the current action at ASSIGNED.  A cache MISS
+        # starts it inside create_agents_for_user; a cache HIT (warm agents)
+        # never reaches that call, so start it here through the same helper.
+        # Without this the completion boundary's ASSIGNED ->
+        # STATUS_VERIFICATION_REQUESTED write is refused and no warm run can
+        # finish an action.  See _start_reuse_action.
+        if user_prompt in user_agents and user_prompt in user_tasks:
+            _start_reuse_action(user_prompt,
+                                user_tasks[user_prompt].current_action,
+                                "reuse: warm run")
 
         # Get or create agents for this user
         if user_prompt not in user_agents:

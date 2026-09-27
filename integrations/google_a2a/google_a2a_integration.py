@@ -8,7 +8,9 @@ Official Spec: https://a2a-protocol.org/latest/
 SDK: https://github.com/a2aproject/a2a-python
 """
 
+import inspect
 import json
+import threading
 import uuid
 import logging
 from typing import Dict, List, Any, Optional
@@ -86,6 +88,9 @@ class A2ATask:
         self.updated_at = datetime.now()
         self.result = None
         self.error = None
+        # Set by task/cancel.  The executor reads it (when it takes a
+        # cancel_event) to give the LLM permit back before its turn starts.
+        self.cancel_event = threading.Event()
         self.metadata = {
             "prompt_token_count": 0,
             "candidates_token_count": 0,
@@ -163,24 +168,55 @@ class A2AMessageHandler:
         task = A2ATask(task_id=message_id, message=message, context_id=context_id)
         self.tasks[message_id] = task
 
+        # configuration.blocking (A2A MessageSendParams): false returns the
+        # task now and runs it on a thread of its own; the caller polls
+        # message/get and sends task/cancel when it stops waiting.  Absent or
+        # true keeps the old contract (the reply carries the finished task).
+        # Review finding M2: a blocking send let a caller that timed out
+        # leave a whole /chat turn running here, holding the one LLM permit.
+        config = params.get("configuration") or {}
+        if isinstance(config, dict) and config.get("blocking") is False:
+            threading.Thread(
+                target=lambda: run_async(self._run(task, message_text)),
+                name=f"a2a-task-{message_id[:8]}", daemon=True).start()
+            return task.to_dict()
+        await self._run(task, message_text)
+        return task.to_dict()
+
+    def _takes_cancel_event(self) -> bool:
         try:
-            # Update to working state
+            return 'cancel_event' in inspect.signature(
+                self.agent_executor).parameters
+        except (TypeError, ValueError):
+            return False
+
+    async def _run(self, task: A2ATask, message_text: str) -> None:
+        """Run the executor for ``task`` and record the verdict, unless the
+        task was cancelled meanwhile: a cancelled task keeps its verdict,
+        nobody is waiting for the answer any more."""
+        message_id = task.task_id
+        try:
+            if task.cancel_event.is_set():
+                return
             task.update_state(TaskState.WORKING)
-
-            # Execute agent
             logger.info(f"Executing A2A task {message_id}: {message_text[:100]}")
-            result = await self.agent_executor(message_text, context_id)
-
-            # Update to completed state
+            if self._takes_cancel_event():
+                result = await self.agent_executor(
+                    message_text, task.context_id,
+                    cancel_event=task.cancel_event)
+            else:
+                result = await self.agent_executor(message_text, task.context_id)
+            if task.cancel_event.is_set():
+                logger.info(f"A2A task {message_id} finished after its "
+                            f"cancel; result dropped")
+                return
             task.update_state(TaskState.COMPLETED, result=result)
-
             logger.info(f"A2A task {message_id} completed successfully")
-
         except Exception as e:
+            if task.cancel_event.is_set():
+                return
             logger.error(f"A2A task {message_id} failed: {e}")
             task.update_state(TaskState.FAILED, error=str(e))
-
-        return task.to_dict()
 
     async def handle_message_get(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -229,6 +265,11 @@ class A2AMessageHandler:
 
         # Only cancel if not already completed/failed
         if task.state in [TaskState.SUBMITTED, TaskState.WORKING]:
+            # Set BEFORE the verdict, so _run (which checks the event after
+            # its executor returns) can never overwrite it.  Reaches the
+            # executor too: a turn still waiting for the LLM permit gives it
+            # back and never starts (dispatch.local_chat_dispatch).
+            task.cancel_event.set()
             task.update_state(TaskState.FAILED, error="Task cancelled by client")
             return {"success": True, "taskId": task_id}
         else:

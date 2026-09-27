@@ -2580,6 +2580,30 @@ def publish_async(topic, message, timeout=2.0):
 
     raw_message = message if isinstance(message, str) else json.dumps(message, default=str)
 
+    # Egress (owner ruling 2026-09-26): a topic that is not the message
+    # user's own reaches other people's subscribers, so it carries the
+    # scrubbed copy, or nothing when the scrub failed.  Asked of the one rule
+    # (security.edge_privacy.crossbar_egress_copy) the MessageBus Crossbar
+    # leg asks; the user's own topic still goes byte-identical.
+    _wire, _wire_is_json = message, not isinstance(message, str)
+    if isinstance(message, str):
+        try:
+            _wire, _wire_is_json = json.loads(message), True
+        except (json.JSONDecodeError, TypeError):
+            pass
+    _owner = data.get('user_id', '') if isinstance(data, dict) else ''
+    try:
+        from security.edge_privacy import crossbar_egress_copy
+        _out = crossbar_egress_copy(topic, _wire, _owner)
+    except ImportError as _ep_err:
+        app.logger.warning(f"Egress rule unavailable ({_ep_err}); not "
+                           f"publishing {topic} to Crossbar")
+        return
+    if _out is None:
+        return
+    if _out is not _wire:
+        raw_message = json.dumps(_out, default=str) if _wire_is_json else _out
+
     def _publish():
         import socket
         try:

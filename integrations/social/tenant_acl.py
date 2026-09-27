@@ -117,11 +117,12 @@ def authorize_subscribe(topic: str,
         return False
 
     # Per-user topic without `tenant.` prefix (legacy):
-    # `com.hertzai.hevolve.social.<user_id>`
+    # `com.hertzai.hevolve.social.<user_id>` -- the one ownership rule the
+    # egress legs ask too (security.edge_privacy.crossbar_uri_is_per_user).
     user_id = payload.get('user_id')
-    if user_id and (
-            topic.endswith(f'.{user_id}') or topic.endswith(f'/{user_id}')):
-        return True
+    if user_id:
+        from security.edge_privacy import crossbar_uri_is_per_user
+        return crossbar_uri_is_per_user(topic, user_id)
 
     # Anything else: refuse.
     return False

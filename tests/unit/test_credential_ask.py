@@ -227,6 +227,84 @@ def test_a_no_after_a_rejected_login_ends_the_asking_end_to_end(world, card):
     assert [t for t, _ in world if t == 'consent.request'] == []
 
 
+@pytest.mark.parametrize('agent', ['42', None])
+def test_allow_asking_again_undoes_a_no_end_to_end(world, card, agent):
+    """Owner rule: a credential "no" must be undoable, with no friction.  The
+    privacy page's "Allow asking again" posts /consent/reopen for the
+    credential; the next time the agent needs it, the card comes back."""
+    from hartos.ai_key_vault import request_credential
+    request_credential(ASK, agent_id=agent)
+    assert card('/decline', {'consent_type': 'credential',
+                             'scope': 'secret:SITE_PASSWORD',
+                             'agent_id': agent}).status_code == 200
+    assert 'said no' in request_credential(ASK, agent_id=agent)
+
+    resp = card('/reopen', {'consent_type': 'credential',
+                            'scope': 'secret:SITE_PASSWORD'})
+    assert resp.status_code == 200, resp.get_json()
+    world.clear()
+
+    assert 'Asked the owner' in request_credential(ASK, agent_id=agent)
+    assert len([t for t, _ in world if t == 'consent.request']) == 1
+
+
+def test_allow_asking_again_after_a_no_on_a_re_ask(world, card):
+    """The no given on the card that came back after a rejected login
+    revoked the earlier grant; reopening makes it askable again without
+    turning that grant back on."""
+    from hartos.ai_key_vault import get_ai_key_vault, request_credential
+    from integrations.social.consent_service import ConsentService
+    request_credential(ASK, agent_id=None)
+    get_ai_key_vault().store_credential('site_password', SECRET)
+    card('', {'consent_type': 'credential', 'scope': 'secret:SITE_PASSWORD'})
+    request_credential(REJECTED, agent_id=None)
+    card('/decline', {'consent_type': 'credential',
+                      'scope': 'secret:SITE_PASSWORD', 'agent_id': None})
+
+    assert card('/reopen', {'consent_type': 'credential',
+                            'scope': 'secret:SITE_PASSWORD'}).status_code == 200
+    world.clear()
+    assert 'Asked the owner' in request_credential(REJECTED, agent_id=None)
+    with db_session() as db:
+        assert ConsentService.active_grant(
+            db, OWNER, 'credential', 'secret:SITE_PASSWORD') is None
+
+
+def test_allow_asking_again_is_not_a_yes(world, card):
+    """Reopening only takes the no back: nothing is granted, and the
+    credential is not an owner-entered one until the owner types it."""
+    from hartos.ai_key_vault import get_ai_key_vault, request_credential
+    from integrations.social.consent_service import ConsentService
+    request_credential(ASK, agent_id='42')
+    card('/decline', {'consent_type': 'credential',
+                      'scope': 'secret:SITE_PASSWORD', 'agent_id': '42'})
+    card('/reopen', {'consent_type': 'credential', 'scope': 'secret:SITE_PASSWORD'})
+    with db_session() as db:
+        assert not ConsentService.check_consent(
+            db, OWNER, 'credential', 'secret:SITE_PASSWORD', '42')
+        assert not ConsentService.declined(
+            db, OWNER, 'credential', 'secret:SITE_PASSWORD', '42')
+    assert 'SITE_PASSWORD' not in get_ai_key_vault().owner_credential_names()
+
+
+def test_reopen_leaves_other_credentials_declined(world, card):
+    from hartos.ai_key_vault import request_credential
+    other = ASK.replace('site_password', 'other_key')
+    request_credential(ASK, agent_id='42')
+    request_credential(other, agent_id='42')
+    for scope in ('secret:SITE_PASSWORD', 'secret:OTHER_KEY'):
+        card('/decline', {'consent_type': 'credential', 'scope': scope, 'agent_id': '42'})
+    card('/reopen', {'consent_type': 'credential', 'scope': 'secret:SITE_PASSWORD'})
+    assert 'said no' in request_credential(other, agent_id='42')
+
+
+def test_reopen_with_nothing_declined_is_404_and_needs_a_type(world, card):
+    assert card('/reopen', {'consent_type': 'credential',
+                            'scope': 'secret:NEVER_ASKED'}).status_code == 404
+    assert card('/reopen', {'scope': 'secret:X'}).status_code == 400
+    assert card('/reopen', {'consent_type': 'bogus', 'scope': 'x'}).status_code == 400
+
+
 def _grant_times(n, when=None):
     """n Accepts on the card: each one appends a granted row (agent None),
     the same row consent_api.grant_consent writes."""

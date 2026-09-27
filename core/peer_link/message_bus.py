@@ -133,45 +133,21 @@ _REVERSE_MAP = dict(sorted(_REVERSE_MAP_UNSORTED.items(), key=lambda x: -len(x[0
 # Owner ruling 2026-09-26: the outgoing messages that count as going to
 # third parties are "the ones which actually go to regional nodes ... hive
 # nodes ... that's not their node".  A publish is therefore scrubbed only on
-# a leg that reaches a node or subscriber its user does NOT own, and only in
-# the fields that carry what a person wrote or was told.  Ids, urls, numbers
-# and signatures travel byte-identical: the DLP phone pattern matches a
-# 10-digit prompt_id and the ip pattern a peer url's host.  LOCAL, SSE, the
-# user's own devices and own node get the record raw (local records raw,
-# scrub only egress).
-#
-# Every key below is read from a payload this bus carries: 'text' (chat
-# bubbles, crossbar_publish.py; tts_stream fleet commands), 'content'
-# (chat.new rows, chat_messages.publish_new; posts and comments,
-# realtime._publish_post_event), 'message' (notifications), 'title' /
-# 'description' / 'body' (posts, community events), 'inp' (the agent
-# message, crossbar_publish.publish_agent_message), 'prompt' (task events).
-EGRESS_CONTENT_FIELDS = frozenset({
-    'text', 'content', 'message', 'body', 'title', 'description',
-    'inp', 'prompt',
-})
+# a leg that reaches a node or subscriber its user does NOT own.  LOCAL, SSE,
+# the user's own devices and own node get the record raw (local records raw,
+# scrub only egress).  What the scrubbed copy is, and whether a Crossbar URI
+# is the user's own, are answered once, in security.edge_privacy
+# (scrub_for_egress, crossbar_leg_is_users_own); this module only asks.
 
 
 def crossbar_topic_is_per_user(topic: str) -> bool:
-    """Is this bus topic's Crossbar topic scoped to the message's user?
+    """Is this bus topic's Crossbar URI template scoped to the message's user?
 
-    A ``{user_id}`` topic reaches that user's own subscribers (the router
-    gates it per user, #246), and the id substituted is the message's own.
-    Any other Crossbar topic -- a community, a game session, a global task or
-    feed topic -- reaches whoever subscribes, which is other people.
+    Asks the one ownership rule (security.edge_privacy
+    .crossbar_uri_is_per_user) about the TOPIC_MAP template.
     """
+    from security.edge_privacy import crossbar_uri_is_per_user
     return crossbar_uri_is_per_user(TOPIC_MAP.get(topic, ''))
-
-
-def crossbar_uri_is_per_user(uri_template: str) -> bool:
-    """The one ownership rule, over the Crossbar URI a leg actually publishes.
-
-    Only a URI carrying ``{user_id}`` is the user's own; any other URI
-    reaches whoever subscribes on whichever router the publisher joined.
-    ``crossbar_topic_is_per_user`` asks it for the MessageBus legacy URI; the
-    EventBus WAMP bridge asks it for ``com.hartos.event.<topic>``.
-    """
-    return '{user_id}' in (uri_template or '')
 
 
 class _ThirdPartyCopy:
@@ -196,14 +172,15 @@ class _ThirdPartyCopy:
     def get(self) -> Optional[dict]:
         if self._copy is None:
             try:
-                from security.dlp_engine import get_dlp_engine
-                self._copy = get_dlp_engine().redact_fields(
-                    self._data, EGRESS_CONTENT_FIELDS)
+                from security.edge_privacy import scrubbed_or_none
             except Exception as e:
                 logger.warning(
-                    "Egress scrub failed for %s (%s); not sending it to "
+                    "Egress rule unavailable for %s (%s); not sending it to "
                     "nodes its user does not own", self._topic, e)
-                self._copy = self._FAILED
+                scrubbed = None
+            else:
+                scrubbed = scrubbed_or_none(self._data, self._topic)
+            self._copy = self._FAILED if scrubbed is None else scrubbed
         return None if self._copy is self._FAILED else self._copy
 
 
@@ -320,9 +297,10 @@ class MessageBus:
 
         SSE is treated like LOCAL trust-wise (same-machine, loopback
         only, MCP-token gated) so payloads pass through unredacted.
-        The outbound legs (PEERLINK + CROSSBAR) scrub EGRESS_CONTENT_FIELDS
-        only where a recipient is not owned by the message's user
-        (``PeerLink.owned_by``, ``crossbar_topic_is_per_user``); the
+        The outbound legs (PEERLINK + CROSSBAR) carry
+        ``security.edge_privacy.scrub_for_egress`` only where a recipient is
+        not owned by the message's user (``PeerLink.owned_by``,
+        ``edge_privacy.crossbar_leg_is_users_own``); the
         user's own devices and node get the payload raw, and the signed
         ``fleet.command`` relay is never altered.
 
@@ -672,7 +650,10 @@ class MessageBus:
         # Direct subscribers
         self._deliver_to_subscribers(topic, data)
 
-        # Also emit to EventBus (for cross-subsystem communication)
+        # Also emit to EventBus (for cross-subsystem communication).  In-process
+        # only: core.platform.events.topic_audience classes 'bus.' as
+        # node-internal, so neither SSE nor the WAMP bridge carries this raw
+        # echo; the publish's own SSE and Crossbar legs above/below do.
         try:
             from core.platform.events import emit_event
             emit_event(f'bus.{topic}', data)
@@ -794,8 +775,9 @@ class MessageBus:
                         third_party: Optional[_ThirdPartyCopy] = None):
         """Publish to Crossbar for legacy mobile app + central telemetry.
 
-        A topic that is not the message user's own
-        (``crossbar_topic_is_per_user``) reaches other people's subscribers,
+        A URI that is not the message user's own
+        (``security.edge_privacy.crossbar_leg_is_users_own``, asked about the
+        concrete URI this leg publishes) reaches other people's subscribers,
         so with ``third_party`` set it carries the scrubbed copy, or is
         withheld when the scrub failed.  The signed relay topic is exempt.
         """
@@ -818,8 +800,18 @@ class MessageBus:
                 return  # Can't route without required variable
             legacy_topic = legacy_topic.replace(f'{{{key}}}', str(val))
 
-        if (third_party is not None and topic != RELAY_TOPIC
-                and not crossbar_topic_is_per_user(topic)):
+        if third_party is not None and topic != RELAY_TOPIC:
+            owner = user_id or (data.get('user_id', '') if isinstance(data, dict) else '')
+            try:
+                from security.edge_privacy import crossbar_leg_is_users_own
+                own = crossbar_leg_is_users_own(legacy_topic, owner)
+            except Exception as e:
+                logger.warning("Egress rule unavailable for %s (%s); treating "
+                               "the Crossbar leg as other people's", topic, e)
+                own = False
+        else:
+            own = True
+        if not own:
             scrubbed = third_party.get()
             if scrubbed is None:
                 self._stats['egress_withheld'] += 1

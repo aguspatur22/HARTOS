@@ -30,14 +30,16 @@ def create_dynamic_executor_function(agent: TrainedAgent):
     Returns:
         Async executor function compatible with A2A protocol
     """
-    async def executor(message: str, context_id: str) -> Dict[str, Any]:
+    async def executor(message: str, context_id: str,
+                       cancel_event=None) -> Dict[str, Any]:
         """Execute task for dynamically discovered agent.  A failure
         propagates: handle_message_send turns it into a FAILED task.  Turning
         it into model text here made every failure a COMPLETED task (review
         of 3a32d8e4b)."""
         try:
             executor = get_dynamic_executor()
-            return await executor.execute_agent_task(agent.agent_id, message, context_id)
+            return await executor.execute_agent_task(
+                agent.agent_id, message, context_id, cancel_event=cancel_event)
         except Exception as e:
             logger.error(f"Dynamic agent {agent.agent_id} execution error: {e}")
             raise

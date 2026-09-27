@@ -298,6 +298,51 @@ def test_a_savepoint_rolled_back_after_the_grant_keeps_the_grant_effects(
     assert [(t, g) for t, g, _ in effects['feed']] == [('screen_capture', True)]
 
 
+def test_a_savepoint_committed_after_the_grant_starts_nothing(dbfile, effects):
+    """A savepoint commit is not the grant committing: SQLAlchemy fires
+    after_commit for it too, but the outer transaction still holds the
+    write lock and can still roll back.  Nothing may start until the outer
+    commit, and a rolled-back outer transaction starts nothing."""
+    from sqlalchemy import text
+    from integrations.social.consent_service import ConsentService
+
+    path, factory = dbfile
+    db = factory()
+    try:
+        ConsentService.grant_consent(db, UID, 'screen_capture')
+        with db.begin_nested():
+            db.execute(text("INSERT INTO other_writer VALUES ('nested')"))
+        assert effects['order'] == [], 'started on a savepoint commit'
+        db.rollback()
+        db.commit()
+    finally:
+        db.close()
+
+    assert effects['order'] == []
+    assert _other_writer(path)[1] == 0
+
+
+def test_a_savepoint_then_the_grant_commit_starts_the_feed_once(dbfile, effects):
+    from sqlalchemy import text
+    from integrations.social.consent_service import ConsentService
+
+    _, factory = dbfile
+    db = factory()
+    try:
+        ConsentService.grant_consent(db, UID, 'screen_capture')
+        with db.begin_nested():
+            db.execute(text("INSERT INTO other_writer VALUES ('nested')"))
+        assert effects['order'] == []
+        db.commit()
+    finally:
+        db.close()
+
+    assert effects['order'] == ['emit', 'copilot', 'feed']
+    _, _, (wrote, visible) = effects['feed'][0]
+    assert wrote == 'ok', f'another writer was locked out: {wrote}'
+    assert visible == 1
+
+
 def test_a_grant_closed_without_a_commit_turns_nothing_on(dbfile, effects):
     """close() discards the transaction without a rollback event; the queue
     must go with it, even when the session object is used again."""

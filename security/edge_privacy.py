@@ -27,9 +27,172 @@ Secrets never leave the edge — this is structurally enforced.
 
 import logging
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger('hevolve_security')
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Egress: what of a payload may leave, and on which leg
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Owner ruling 2026-09-26: egress is a message that goes to OTHER people's
+# nodes; it is scrubbed (and metered) only there.  Local records stay raw.
+# Security must not partition the hive, so the protocol's own fields --
+# ids, urls, routing, signatures, timestamps -- travel byte-identical, and
+# EVERY other string leaf is treated as what a person wrote or was told.
+#
+# The scrub is structural, not a list of content fields: a payload key this
+# module has never seen ('reply', 'caption', a nested 'body_text', a tuple,
+# publish_async's {'raw': ...} wrapper) is content by default.  Only the
+# identifier vocabulary below is exempt.  Why each exemption exists: the DLP
+# phone pattern matches a 10-digit prompt_id / request id, and the ip pattern
+# matches a peer url's or endpoint's host; rewriting either breaks routing
+# for the recipient (a partition, not a privacy gain).
+#
+# One home for the three questions every egress site asks:
+#   * which leaves are content          -> is_identifier_key / map_content
+#   * what the scrubbed copy is         -> scrub_for_egress
+#   * whether a Crossbar leg is only the message user's own
+#                                       -> crossbar_uri_is_per_user (fact)
+#                                          crossbar_leg_is_users_own (policy)
+# MessageBus (PeerLink + Crossbar legs), the EventBus WAMP bridge,
+# hart_intelligence_entry.publish_async, ScopeGuard.redact_for_scope and
+# secret_redactor.redact_experience all ask here; tests/unit/
+# test_egress_one_rule.py fails if a second copy appears.
+
+_IDENTIFIER_KEYS = frozenset({
+    # identity + correlation
+    'id', 'uid', 'msg_id', 'issued_by', 'origin', 'relay_path', 'hop_ttl',
+    # routing
+    'topic', 'topic_name', 'channel', 'url', 'uri', 'href', 'endpoint',
+    'host', 'port', 'node_tier', 'tier', 'served_by',
+    # protocol discriminators
+    'type', 'event', 'action', 'kind', 'status', 'state', 'role',
+    'cmd_type', 'version', 'lang', 'language',
+    # integrity + time
+    'signature', 'timestamp', 'ts',
+})
+_IDENTIFIER_KEY_SUFFIXES = (
+    '_id', '_ids', '_url', '_urls', '_uri', '_type', '_at', '_hash', '_ts',
+)
+
+
+def is_identifier_key(key: Any) -> bool:
+    """Does the value under ``key`` belong to the protocol, not a person?
+
+    Strings under such a key (and inside a list/tuple under it) travel
+    byte-identical; a dict under it is walked by its own keys.
+    """
+    if not isinstance(key, str):
+        return False
+    key = key.lower()
+    return key in _IDENTIFIER_KEYS or key.endswith(_IDENTIFIER_KEY_SUFFIXES)
+
+
+def map_content(data: Any, fn: Callable[[str], str]) -> Any:
+    """A copy of ``data`` with ``fn`` applied to every content string leaf.
+
+    Content is every string not under an identifier key, at any depth,
+    inside dicts, lists and tuples (a tuple stays a tuple).  A bare string
+    is content.  Numbers, booleans and None are unchanged.  ``data`` is
+    never mutated.
+    """
+    def walk(value, exempt):
+        if isinstance(value, dict):
+            return {k: walk(v, is_identifier_key(k)) for k, v in value.items()}
+        if isinstance(value, list):
+            return [walk(v, exempt) for v in value]
+        if isinstance(value, tuple):
+            return tuple(walk(v, exempt) for v in value)
+        if isinstance(value, str) and not exempt:
+            return fn(value)
+        return value
+
+    return walk(data, False)
+
+
+def scrub_text(text: str) -> str:
+    """One content string, safe for another person's node: structured
+    secrets (secret_redactor) and PII patterns (dlp_engine) replaced."""
+    from security.dlp_engine import get_dlp_engine
+    from security.secret_redactor import redact_secrets
+    text, _ = redact_secrets(text)
+    return get_dlp_engine().redact(text)
+
+
+def scrub_for_egress(data: Any) -> Any:
+    """The copy of ``data`` that may go to a node its user does not own.
+
+    Raises if a scrubber is unavailable; callers withhold that leg rather
+    than send what could not be scrubbed.
+    """
+    return map_content(data, scrub_text)
+
+
+def crossbar_uri_is_per_user(uri: str, user_id: Any = '') -> bool:
+    """Does a Crossbar URI reach only ``user_id``'s own subscribers?
+
+    The one ownership rule, over templates and concrete URIs alike:
+      * asked about a template (no ``user_id``): a template carrying
+        ``{user_id}`` is per-user by construction (the id substituted is
+        the message's own);
+      * asked about a concrete URI for ``user_id``: it is that user's own
+        when its last segment is that id (``.<user_id>`` or
+        ``/<user_id>``) -- exactly the shape the router's subscribe gate
+        (integrations.social.tenant_acl.authorize_subscribe, which asks
+        this) admits only that user to.
+    Any other URI (a community, a game session, a global task or feed
+    topic, ``com.hartos.event.<topic>``) reaches whoever subscribes, which
+    is other people.
+    """
+    uri = uri or ''
+    user_id = str(user_id or '')
+    if not user_id:
+        return '{user_id}' in uri
+    return uri.endswith('.' + user_id) or uri.endswith('/' + user_id)
+
+
+def crossbar_leg_is_users_own(uri: str, user_id: Any = '') -> bool:
+    """Is a publish on this Crossbar URI delivered only to the message
+    user's own subscribers, so it is NOT egress and goes raw?
+
+    Owner delegation 2026-09-27 ("use sensible defaults without creating
+    more friction"), decided: a per-user URI whose recipients are only that
+    user's own devices is NOT egress, even when it transits a central or
+    regional router.  The router is transport, not a third-party
+    recipient; scrubbing it would show the user's own phone
+    [EMAIL_REDACTED] live and the raw text after a reload.  Any URI that
+    does not belong to one user is egress.  Every Crossbar leg --
+    MessageBus._route_crossbar, the EventBus WAMP bridge, and
+    hart_intelligence_entry.publish_async -- asks only this, so the policy
+    changes here or nowhere.
+    """
+    return crossbar_uri_is_per_user(uri, user_id)
+
+
+def crossbar_egress_copy(uri: str, data: Any, user_id: Any = '') -> Any:
+    """What of ``data`` may be published on Crossbar ``uri``.
+
+    ``data`` itself (the same object) on a leg that is the user's own; the
+    scrubbed copy on any other; None when the scrub failed, and the caller
+    withholds that leg (only a third party misses it, and a leak cannot be
+    recalled).
+    """
+    if crossbar_leg_is_users_own(uri, user_id):
+        return data
+    return scrubbed_or_none(data, uri)
+
+
+def scrubbed_or_none(data: Any, where: str) -> Any:
+    """``scrub_for_egress(data)``, or None (with a warning) when it failed:
+    the caller then withholds only the leg to other people's nodes."""
+    try:
+        return scrub_for_egress(data)
+    except Exception as e:
+        logger.warning("Egress scrub failed for %s (%s); not sending it to "
+                       "nodes its user does not own", where, e)
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -188,14 +351,11 @@ class ScopeGuard:
             else:
                 result[key] = f'[SCOPE_REDACTED:{field_scope.value}]'
 
-        # Run DLP on remaining text for federated/public
+        # Scrub the remaining content for federated/public: the one egress
+        # scrub (every content leaf at any depth; ids and urls intact).
         if destination in (PrivacyScope.FEDERATED, PrivacyScope.PUBLIC):
             try:
-                from security.dlp_engine import get_dlp_engine
-                dlp = get_dlp_engine()
-                for key, value in result.items():
-                    if isinstance(value, str) and len(value) > 5:
-                        result[key] = dlp.redact(value)
+                result = scrub_for_egress(result)
             except ImportError:
                 pass
 

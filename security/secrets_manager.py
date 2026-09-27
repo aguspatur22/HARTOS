@@ -82,10 +82,23 @@ class SecretsManager:
         """Initialize Fernet cipher from master key."""
         master_key = os.environ.get('HEVOLVE_MASTER_KEY')
         if not master_key:
-            logger.warning(
-                "HEVOLVE_MASTER_KEY not set. Secrets vault unavailable. "
-                "Falling back to environment variables only."
-            )
+            # A WARNING only when something is actually locked away: an
+            # encrypted vault on disk that this process cannot open.  With
+            # no vault there is nothing to decrypt -- _load_vault returns
+            # before reading anything -- and env-vars-only is the documented
+            # default, so warning there put noise on every fresh node's happy
+            # path (first node-key mint on a CI runner, 2026-09-26) and
+            # buried the one case that matters.
+            if os.path.exists(os.path.abspath(_VAULT_PATH)):
+                logger.warning(
+                    "HEVOLVE_MASTER_KEY not set, but an encrypted secrets "
+                    "vault exists at %s: its secrets are UNAVAILABLE to this "
+                    "process. Falling back to environment variables only.",
+                    os.path.abspath(_VAULT_PATH))
+            else:
+                logger.info(
+                    "HEVOLVE_MASTER_KEY not set and no secrets vault exists; "
+                    "secrets come from environment variables only.")
             return
 
         salt_path = os.path.abspath(_SALT_PATH)

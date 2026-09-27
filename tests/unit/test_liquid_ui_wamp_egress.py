@@ -3,8 +3,8 @@
 Review of a0ecafe09: once the backend owns a LiquidUIService, every card it
 accepts is emitted as ``agent.ui.update``, and the EventBus WAMP bridge
 publishes every emit to ``com.hartos.event.<topic>``.  That URI carries no
-user, so by the canonical Crossbar rule (core.peer_link.message_bus
-.crossbar_topic_is_per_user: a topic that is not the user's own reaches
+user, so by the canonical Crossbar rule (security.edge_privacy
+.crossbar_leg_is_users_own: a URI that is not the user's own reaches
 whoever subscribes, which is other people) it is not the user's.  Nunba
 points that bridge at central in Hybrid/Hive mode, and a WhatsApp pair_code
 card carries the live linking code in ``code`` / ``clipboard_payload`` /
@@ -141,30 +141,33 @@ def test_an_agent_ui_event_from_the_wamp_side_is_not_echoed(wamp_bus):
 
 def test_the_withhold_is_decided_by_the_canonical_ownership_rule(wamp_bus):
     """The bridge holds no ownership rule of its own: it asks
-    crossbar_uri_is_per_user about the URI it would publish.  Were that URI
-    the user's own, the card would bridge; the rule is asked about exactly
-    com.hartos.event.agent.ui.update."""
+    crossbar_leg_is_users_own about the URI it would publish, for the card's
+    user.  Were that URI the user's own, the card would bridge (proved
+    unpatched in test_egress_one_rule.py); the rule is asked about exactly
+    com.hartos.event.agent.ui.update and u-1."""
     bus, session, loop = wamp_bus
     asked = []
 
-    def _rule(uri):
-        asked.append(uri)
+    def _rule(uri, user_id=''):
+        asked.append((uri, user_id))
         return True
 
-    with patch('core.peer_link.message_bus.crossbar_uri_is_per_user',
+    with patch('security.edge_privacy.crossbar_leg_is_users_own',
                side_effect=_rule), \
             patch('core.platform.events.broadcast_sse_safe'):
         bus.emit('agent.ui.update', {'agent_id': 'a', 'user_id': 'u-1',
                                      'component': {'type': 'card'}})
     _drain(loop)
-    assert asked == ['com.hartos.event.agent.ui.update']
+    assert asked == [('com.hartos.event.agent.ui.update', 'u-1')]
     assert [u for u, _ in session.published] == [
         'com.hartos.event.agent.ui.update']
 
 
 def test_the_real_rule_says_the_bridge_uri_is_not_the_users():
-    from core.peer_link.message_bus import (
-        crossbar_uri_is_per_user, crossbar_topic_is_per_user)
+    from core.peer_link.message_bus import crossbar_topic_is_per_user
+    from security.edge_privacy import crossbar_uri_is_per_user
+    assert crossbar_uri_is_per_user('com.hartos.event.agent.ui.update',
+                                    'u-1') is False
     assert crossbar_uri_is_per_user('com.hartos.event.agent.ui.update') is False
     assert crossbar_uri_is_per_user('com.hertzai.hevolve.chat.{user_id}') is True
     # the MessageBus question still answers through the same rule
@@ -178,7 +181,7 @@ def test_a_one_person_topic_is_withheld_when_the_rule_cannot_be_asked(wamp_bus):
     real_import = builtins.__import__
 
     def _no_bus(name, *a, **k):
-        if name == 'core.peer_link.message_bus':
+        if name == 'security.edge_privacy':
             raise ImportError('simulated')
         return real_import(name, *a, **k)
 

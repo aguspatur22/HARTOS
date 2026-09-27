@@ -470,9 +470,18 @@ def _peer_node_id_for(peer_url: str) -> str:
 def invoke_peer_agent(peer_url: str, agent_id: str, prompt: str,
                       timeout: float = _INVOKE_TIMEOUT_S,
                       peer_node_id: Optional[str] = None) -> Optional[dict]:
-    """POST the existing /a2a/<id>/jsonrpc message/send contract.
+    """Run ``agent_id`` on the peer through the existing /a2a/<id>/jsonrpc
+    contract, within ``timeout`` seconds in all.
 
-    The body is signed with this node's gossip identity
+    message/send goes out with configuration.blocking=false, so the peer
+    answers with the task at once; this polls message/get until the task
+    ends or the budget runs out, and then sends task/cancel, so the peer
+    gives its LLM permit back instead of finishing a turn nobody reads
+    (review finding M2: the caller used to time out and fall back to local
+    CREATE while the peer ran the orphaned turn).  A peer that ignores the
+    flag answers with the finished task, which is returned as before.
+
+    Every request is signed with this node's gossip identity
     (discovery.signed_peer_request: sender {node_id, public_key},
     timestamp, Ed25519 signature) and names the agent it is for, so a
     peer that admitted this node runs a shared agent without any other
@@ -484,51 +493,85 @@ def invoke_peer_agent(peer_url: str, agent_id: str, prompt: str,
     LAN-trusted peer admits.
 
     Returns the A2A task envelope (id/contextId/state/content) or None
-    on any transport / JSON-RPC failure (logged). NOTE: an envelope
-    with state == 'failed' is returned as-is; callers decide."""
+    on any transport / JSON-RPC failure or when the budget ran out
+    (logged). NOTE: an envelope with state == 'failed' is returned as-is;
+    callers decide."""
+    deadline = time.monotonic() + max(float(timeout), 0.5)
     url = f"{peer_url.rstrip('/')}/a2a/{agent_id}/jsonrpc"
-    rpc = {
-        'jsonrpc': '2.0',
-        'id': uuid.uuid4().hex,
-        'method': 'message/send',
-        'params': {
-            'message': {
-                'messageId': uuid.uuid4().hex,
-                'contextId': uuid.uuid4().hex,
-                'parts': [{'type': 'text', 'text': prompt}],
-            }
+    audience = peer_node_id or _peer_node_id_for(peer_url)
+
+    def _call(method, params):
+        rpc = {'jsonrpc': '2.0', 'id': uuid.uuid4().hex, 'method': method,
+               'params': params, 'agent_id': agent_id}
+        try:
+            from integrations.social.discovery import signed_peer_request
+            rpc = signed_peer_request(rpc, audience=audience)
+        except Exception as e:
+            logger.warning(f'peer_reuse: could not sign {method} for '
+                           f'{agent_id} ({e}); sending unsigned, which a peer '
+                           f'that is not LAN-trusted refuses with 401')
+        left = max(deadline - time.monotonic(), 0.5)
+        try:
+            resp = pooled_post(url, json=rpc, timeout=left)
+        except Exception as e:
+            logger.info(f'peer_reuse: {method} {agent_id} on {peer_url} '
+                        f'failed: {e}')
+            return None
+        if resp.status_code != 200:
+            logger.info(f'peer_reuse: {method} {agent_id} on {peer_url} '
+                        f'returned {resp.status_code}')
+            return None
+        try:
+            body = resp.json()
+        except ValueError as e:
+            logger.info(f'peer_reuse: {method} {agent_id} returned '
+                        f'non-JSON: {e}')
+            return None
+        if body.get('error'):
+            logger.info(f"peer_reuse: {method} {agent_id} JSON-RPC error: "
+                        f"{body['error']}")
+            return None
+        return body.get('result')
+
+    task = _call('message/send', {
+        'message': {
+            'messageId': uuid.uuid4().hex,
+            'contextId': uuid.uuid4().hex,
+            'parts': [{'type': 'text', 'text': prompt}],
         },
-        'agent_id': agent_id,
-    }
+        'configuration': {'blocking': False},
+    })
+    if not task or task.get('state') not in _OPEN_TASK_STATES:
+        return task
+    task_id = task.get('id')
+    while time.monotonic() < deadline - _POLL_INTERVAL_S:
+        time.sleep(_POLL_INTERVAL_S)
+        got = _call('message/get', {'taskId': task_id})
+        if got is None:
+            continue
+        if got.get('error'):
+            logger.info(f"peer_reuse: message/get {agent_id}: {got['error']}")
+            break
+        if got.get('state') not in _OPEN_TASK_STATES:
+            return got
+    logger.info(f'peer_reuse: {agent_id} on {peer_url} still running at the '
+                f'end of the {timeout:.1f}s budget; cancelling it there')
+    _cancel_remote(_call, task_id)
+    return None
+
+
+#: Task states in which a remote turn has not ended (A2A TaskState values).
+_OPEN_TASK_STATES = ('submitted', 'working')
+_POLL_INTERVAL_S = 0.25
+
+
+def _cancel_remote(call, task_id) -> None:
+    """Best-effort task/cancel; the budget is spent, so it gets a short
+    timeout of its own through ``call``'s floor."""
     try:
-        from integrations.social.discovery import signed_peer_request
-        rpc = signed_peer_request(
-            rpc, audience=peer_node_id or _peer_node_id_for(peer_url))
+        call('task/cancel', {'taskId': task_id})
     except Exception as e:
-        logger.warning(f'peer_reuse: could not sign the invoke of {agent_id} '
-                       f'({e}); sending unsigned, which a peer that is not '
-                       f'LAN-trusted refuses with 401')
-    try:
-        resp = pooled_post(url, json=rpc, timeout=timeout)
-    except Exception as e:
-        logger.info(f'peer_reuse: invoke {agent_id} on {peer_url} '
-                    f'failed: {e}')
-        return None
-    if resp.status_code != 200:
-        logger.info(f'peer_reuse: invoke {agent_id} on {peer_url} '
-                    f'returned {resp.status_code}')
-        return None
-    try:
-        body = resp.json()
-    except ValueError as e:
-        logger.info(f'peer_reuse: invoke {agent_id} returned '
-                    f'non-JSON: {e}')
-        return None
-    if body.get('error'):
-        logger.info(f"peer_reuse: invoke {agent_id} JSON-RPC error: "
-                    f"{body['error']}")
-        return None
-    return body.get('result')
+        logger.info(f'peer_reuse: task/cancel {task_id} failed: {e}')
 
 
 def _result_text(result: Optional[dict]) -> str:

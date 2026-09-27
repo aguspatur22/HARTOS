@@ -3397,6 +3397,7 @@ def build_core_tool_closures(ctx):
             )
             return json.dumps(result, indent=2)
         except Exception as e:
+            tool_logger.exception("execute_coding_task failed: %s", e)
             return f"Coding task execution error: {e}"
 
     tools.append((

@@ -58,15 +58,45 @@ def _wamp_to_local(uri: str) -> Optional[str]:
     return None
 
 
-# Topic prefixes EXCLUDED from SSE fan-out.  Default empty: every emit
-# reaches local + WAMP + SSE.  Add a prefix here ONLY when a topic
-# proves too noisy / internal for end-clients (high-frequency tick
-# events, per-token streaming, debug probes).  Most platform topics
-# (theme.*, resonance.*, federation.*, inference.*, memory.*,
-# action_state.*) are valid SSE traffic for admin dashboards / telemetry
-# views, so they stay on by default.
+# ─── Who an event is for: ONE table, asked by every transport ─────────
 #
-# 'bus.': MessageBus.publish auto-emits a `bus.<topic>` echo of every
+# topic_audience(topic) is the single answer to "who is this event for?".
+# SSE (P3a guard), the WAMP bridge and the realtime publish authorizer
+# (integrations.social.realtime) all ask it; the three prefix tuples below
+# are its only data, and a prefix may sit in one class only
+# (tests/unit/test_egress_one_rule.py).  Classes, checked in this order:
+#   AUDIENCE_NODE       -- never leaves the process: no SSE, no WAMP bridge.
+#   AUDIENCE_ONE_PERSON -- one person's; travels only on a URI that is
+#                          theirs (security.edge_privacy
+#                          .crossbar_leg_is_users_own), never public.
+#   AUDIENCE_EVERYONE   -- public: SSE may broadcast it without a user_id.
+#   AUDIENCE_ADDRESSED  -- everything else: SSE routes it by its user_id
+#                          (refused without one); the bridge carries it as
+#                          before.
+AUDIENCE_NODE = 'node'
+AUDIENCE_ONE_PERSON = 'one_person'
+AUDIENCE_EVERYONE = 'everyone'
+AUDIENCE_ADDRESSED = 'addressed'
+
+# AUDIENCE_NODE.  Default empty apart from the echoes below: every emit
+# reaches local + WAMP + SSE.  Add a prefix here ONLY when a topic is
+# internal to this process (an echo of a message with its own transports,
+# a control signal).  Most platform topics (theme.*, resonance.*,
+# federation.*, inference.*, memory.*, action_state.*) are valid SSE
+# traffic for admin dashboards / telemetry views, so they stay on.
+#
+# 'bus.' on the WAMP bridge: the same raw echo was published verbatim to
+# com.hartos.event.bus.<topic>, a URI that names no user, whenever the
+# bridge was connected (CBURL / WAMP_URL set) -- a second, unscrubbed
+# Crossbar leg beside MessageBus._route_crossbar, which asks the egress
+# rule.  Measured 2026-09-26: no subscriber of com.hartos.event.bus.* or
+# com.hartos.event.channel.* in HARTOS, Nunba (landing-page, routes,
+# main.py, wamp_router.py), Hevolve_React_Native (src, android, ios),
+# Nunba-Companion-iOS or the compositor, and no in-process EventBus
+# listener on a 'bus.' topic; so keeping them off the bridge withholds
+# nothing anyone received.
+#
+# 'bus.' on SSE: MessageBus.publish auto-emits a `bus.<topic>` echo of every
 # publish (core/peer_link/message_bus.py:367) for HARTOS-internal
 # cross-subsystem subscribers.  These are NOT meant for the SPA — the
 # canonical SSE delivery is the SEPARATE `_route_sse` leg in the same
@@ -80,7 +110,7 @@ def _wamp_to_local(uri: str) -> Optional[str]:
 # this dual-bridge race (bus.chat.pupit + chat.pupit + message all
 # fired in 10ms).  Adding the denylist entry keeps `bus.*` events
 # HARTOS-internal while preserving the canonical SSE leg.
-_SSE_DENYLIST_PREFIXES: tuple = (
+_NODE_INTERNAL_TOPIC_PREFIXES: tuple = (
     'bus.',
     # Internal control signals, never a UI feed.  'channel.registered'
     # exists so Nunba can re-evaluate whether the WAMP router should be
@@ -138,15 +168,17 @@ _SSE_GLOBAL_PREFIXES: tuple = (
 )
 
 
-# Topic prefixes whose events are addressed to ONE person.  Such an event is
-# bridged to WAMP only when the URI the bridge publishes it on is that
-# person's own, and that question has ONE answer:
-# core.peer_link.message_bus.crossbar_uri_is_per_user (19d4c5b02: a URI that
-# does not carry {user_id} reaches whoever subscribes, which is other people).
-# This tuple says WHO an event is for; it never decides ownership itself.
-# The bridge publishes on ``com.hartos.event.<topic>``, which names no user,
-# so today these are always withheld -- whichever router the bridge joined,
-# and Nunba joins central's in Hybrid/Hive mode.
+# AUDIENCE_ONE_PERSON.  Such an event is bridged to WAMP only when the URI
+# the bridge publishes it on is that person's own, and that question has ONE
+# answer: security.edge_privacy.crossbar_leg_is_users_own (a URI whose last
+# segment is not the event's user_id reaches whoever subscribes, which is
+# other people).  This tuple says WHO an event is for; it never decides
+# ownership itself.  The bridge publishes on ``com.hartos.event.<topic>``,
+# which for 'agent.ui.update' names no user, so today the card is withheld
+# -- whichever router the bridge joined, and Nunba joins central's in
+# Hybrid/Hive mode.  (Measured subscribers of com.hartos.event.agent.ui
+# .update: Hevolve_React_Native AutobahnConnectionManager.java and the
+# Nunba-Companion-iOS overlay bridge; neither is the card's owner by URI.)
 #
 # 'agent.ui.': an agent card is addressed to ONE person and can carry what
 # only they may see: the WhatsApp pair_code card holds the live linking code
@@ -163,35 +195,56 @@ _ONE_PERSON_TOPIC_PREFIXES: tuple = (
 )
 
 
-def _topic_bridges_to_wamp(topic: str) -> bool:
-    """May the WAMP bridge publish this topic?
+def topic_audience(topic: str) -> str:
+    """Who an event on ``topic`` is for: one of the AUDIENCE_* classes.
 
-    Everyone's events: yes, as before.  An event addressed to one person:
-    only if the bridged URI is theirs under the canonical Crossbar rule.
-    If that rule cannot be consulted the one-person event is withheld: the
-    owner still has SSE and in-process listeners, and a leak cannot be
-    recalled.
+    The one answer SSE, the WAMP bridge and the realtime publish
+    authorizer ask.  Classes are checked NODE, ONE_PERSON, EVERYONE, so a
+    narrower one-person prefix is never shadowed by a broader public one.
     """
-    if not topic.startswith(_ONE_PERSON_TOPIC_PREFIXES):
+    topic = topic or ''
+    if topic.startswith(_NODE_INTERNAL_TOPIC_PREFIXES):
+        return AUDIENCE_NODE
+    if topic.startswith(_ONE_PERSON_TOPIC_PREFIXES):
+        return AUDIENCE_ONE_PERSON
+    if topic.startswith(_SSE_GLOBAL_PREFIXES):
+        return AUDIENCE_EVERYONE
+    return AUDIENCE_ADDRESSED
+
+
+def _topic_bridges_to_wamp(topic: str, data: Any = None) -> bool:
+    """May the WAMP bridge publish this event?
+
+    Node-internal: never.  Addressed and everyone's events: yes, as before.
+    One person's: only if the bridged URI is theirs under the canonical
+    Crossbar rule, asked with the event's user_id.  If that rule cannot be
+    consulted the one-person event is withheld: the owner still has SSE and
+    in-process listeners, and a leak cannot be recalled.
+    """
+    audience = topic_audience(topic)
+    if audience == AUDIENCE_NODE:
+        return False
+    if audience != AUDIENCE_ONE_PERSON:
         return True
     try:
-        from core.peer_link.message_bus import crossbar_uri_is_per_user
+        from security.edge_privacy import crossbar_leg_is_users_own
     except Exception as e:
         logger.warning("WAMP bridge: ownership rule unavailable (%s); "
                        "withholding one-person topic %s", e, topic)
         return False
-    return crossbar_uri_is_per_user(_local_to_wamp(topic))
+    user_id = data.get('user_id', '') if isinstance(data, dict) else ''
+    return crossbar_leg_is_users_own(_local_to_wamp(topic), user_id)
 
 
 def _topic_targets_sse(topic: str) -> bool:
-    """True unless the topic is on the SSE denylist."""
-    return not any(topic.startswith(prefix) for prefix in _SSE_DENYLIST_PREFIXES)
+    """True unless the topic never leaves the process."""
+    return topic_audience(topic) != AUDIENCE_NODE
 
 
 def _is_sse_global(topic: str) -> bool:
-    """True if the topic is in the SSE global allowlist — safe to
-    broadcast without a user_id."""
-    return any(topic.startswith(prefix) for prefix in _SSE_GLOBAL_PREFIXES)
+    """True if the topic is everyone's — safe to broadcast without a
+    user_id."""
+    return topic_audience(topic) == AUDIENCE_EVERYONE
 
 
 class EventBus:
@@ -324,15 +377,14 @@ class EventBus:
         # a topic addressed to one person only onto a URI that is theirs:
         # _topic_bridges_to_wamp)
         if (not _from_wamp and self._wamp_connected and self._wamp_session
-                and _topic_bridges_to_wamp(topic)):
+                and _topic_bridges_to_wamp(topic, data)):
             self._publish_to_wamp(topic, data)
 
         # Bridge to SSE (Nunba desktop / Android web view).  This grew the
         # SSE transport adapter the broadcast_sse_safe docstring asked for
-        # (line 393 of this file).  Topic policy is a DENYLIST (see
-        # _SSE_DENYLIST_PREFIXES at module top, default empty) — every
-        # topic fans out to SSE by default; add a prefix to the denylist
-        # only when a topic proves too noisy / internal for end-clients.
+        # (line 393 of this file).  Topic policy is topic_audience: every
+        # topic fans out to SSE except AUDIENCE_NODE ones
+        # (_NODE_INTERNAL_TOPIC_PREFIXES at module top).
         # Per-event dedup happens client-side via msg_id (auto-injected
         # below for dict payloads), so the same event arriving via WAMP
         # and SSE renders once.  Echo guard: skip when the event came
