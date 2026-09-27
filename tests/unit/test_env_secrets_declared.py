@@ -39,6 +39,10 @@ EXEMPT = {
         'structurally immutable guardrail module (CLAUDE.md): never edited here',
     os.path.join('security', 'hsm_provider.py'):
         'master-key provider: AI exclusion zone, never read or edited',
+    os.path.join('security', 'master_key.py'):
+        'trust anchor (CLAUDE.md): never edited here',
+    os.path.join('security', 'key_delegation.py'):
+        'master-key certificate chain: AI exclusion zone, never edited here',
 }
 
 SECRETY = re.compile(r'(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|_HASH|AUTH|'

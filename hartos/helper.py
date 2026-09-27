@@ -1070,7 +1070,9 @@ _BARE_NUMBER = re.compile(r'-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?')
 _STRING_CLOSER = {'"': '"', "'": "'", '“': '”', '”': '”'}
 # What a bare token is made of: a number with one of these next to it is
 # part of a longer token (a UUID, a word, a path), never a number of its own.
-_TOKEN_CHARS = '_.-+'
+# '/ * $ % !' too: 1e999/2 is an expression, not a number followed by text
+# (review of e1a1aa233: the /2 was dropped).
+_TOKEN_CHARS = '_.-+/*$%!'
 # Where a comment may open: after whitespace or ``{ [ ,`` -- not inside an
 # unquoted value, and not after ':', which the '//' of a URL follows.
 _BEFORE_A_COMMENT = '{[,'
@@ -1173,7 +1175,12 @@ def _quote_overflowing_numbers(text):
     ``;`` unquoted, and repair_json then wrote Infinity; and a comment is
     opened only where one can start (_BEFORE_A_COMMENT), since the ``//``
     of an unquoted URL is not one."""
-    out, i, closer = [], 0, None
+    # A number is quoted with the quote character the document itself uses
+    # (the one its last string opened with): a '"' put into a document
+    # written with "'" made json_repair read the next key into the value
+    # before it (review of e1a1aa233: {'u': http://h/x, 'id': 620e...} lost
+    # the id).
+    out, i, closer, quote = [], 0, None, '"'
     while i < len(text):
         ch = text[i]
         if closer:
@@ -1191,6 +1198,7 @@ def _quote_overflowing_numbers(text):
             continue
         if ch in _STRING_CLOSER:
             closer = _STRING_CLOSER[ch]
+            quote = "'" if ch == "'" else '"'
             out.append(ch)
             i += 1
             continue
@@ -1205,7 +1213,7 @@ def _quote_overflowing_numbers(text):
         if match and not (i and _joins_a_token(text[i - 1])):
             token, end = match.group(), match.end()
             if end == len(text) or not _joins_a_token(text[end]):
-                out.append(json.dumps(token)
+                out.append(quote + token + quote
                            if not math.isfinite(float(token)) else token)
                 i = end
                 continue
@@ -1533,6 +1541,16 @@ def _context_limiter_classes():
 
     class TokenLimiter(transforms.MessageTokenLimiter):
         def apply_transform(self, messages):
+            # autogen's per-message cut (_truncate_tokens below) is handed
+            # the text alone, never the role.  The texts of user turns --
+            # the only turns that keep their head (must_keep_head) -- are
+            # noted here so the cut can tell them apart.  Review of
+            # e1a1aa233: an assistant or tool message holding the separator
+            # kept its head too (~6,000 tokens against 2,500).
+            self._user_texts = {
+                m['content'] for m in messages
+                if isinstance(m, dict) and m.get('role') == 'user'
+                and isinstance(m.get('content'), str)}
             kept = super().apply_transform(messages)
             if dropped_newest(messages, kept):
                 # autogen cuts the newest message first, with nothing yet
@@ -1554,7 +1572,9 @@ def _context_limiter_classes():
             # here first, the "follow these steps:" boundary with them.
             from core.llm_outbound_logger import keep_head_cut, must_keep_head
             from core.constants import WIRE_TRIM_MARKER
-            keep = must_keep_head(text)
+            role = ('user' if text in getattr(self, '_user_texts', ())
+                    else None)
+            keep = must_keep_head(text, role)
             if not keep:
                 return super()._truncate_tokens(text, n_tokens)
             util = transforms.transforms_util

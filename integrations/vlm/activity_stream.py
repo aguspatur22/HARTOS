@@ -293,7 +293,10 @@ def _run_is_closed(user_id: str, prompt_id: str, run_id: str) -> bool:
     step 2 s after the run closed -- ribbon up again, the finished task's
     context rewritten to phase=failed, run_done=False fanned out, so the
     companion showed a finished run as live.  Unknown (no ledger, no task,
-    a lookup error) reads as open, so a step is never lost on ignorance.
+    a lookup error, or a task with no status or a status of None) reads as
+    open, so a step is never lost on ignorance.  A task finish_run closed
+    always has a real TaskStatus (it sets one), so a None status is never a
+    closed run.
     """
     try:
         from agent_ledger import TaskStatus

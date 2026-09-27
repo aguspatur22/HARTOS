@@ -1090,3 +1090,14 @@ def auto_register_local_mcp():
             logger.info(f"Auto-registered local MCP server at {local_url}")
     except Exception as e:
         logger.debug(f"Auto-register local MCP failed (non-critical): {e}")
+
+
+# Read from the environment as this node's own configuration or key
+# material: a vault or consent-card value must never set these.
+# tests/unit/test_env_secrets_declared.py fails on a secret read not
+# declared here or in ENV_SECRETS.
+ENV_NOT_FROM_VAULT = (
+    'HARTOS_MCP_DISABLE_AUTH',
+    'HARTOS_MCP_TOKEN',
+    'HARTOS_MCP_TOKEN_FILE',
+)

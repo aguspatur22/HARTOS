@@ -877,6 +877,7 @@ ELIDED_NAMESPACE = 'elided'
 ELIDED_KEY_PREFIX = 'elided:'
 _ELIDED_POINTER_RE = None  # compiled on first use
 _ELIDED_MAX_ITEMS = 5000        # items kept on disk; the oldest go first
+_ELIDED_MAX_BYTES = 64 * 1024 * 1024  # and bytes kept; the oldest go first
 _ELIDED_TTL_S = 24 * 3600       # a REUSE replay reads it within the day
 _ELIDED_EVICT_EVERY = 50        # writes between eviction sweeps
 _elided_writes = 0
@@ -971,7 +972,8 @@ def _elided_item(scope: str, pointer_id: str) -> str:
 
 def _evict_elided() -> None:
     """Remove elided items older than _ELIDED_TTL_S and, past
-    _ELIDED_MAX_ITEMS, the oldest.  One sweep at a time; never raises."""
+    _ELIDED_MAX_ITEMS items or _ELIDED_MAX_BYTES on disk, the oldest.  One
+    sweep at a time; never raises."""
     if not _elided_evict_lock.acquire(blocking=False):
         return
     try:
@@ -981,16 +983,20 @@ def _evict_elided() -> None:
         for entry in os.scandir(AGENT_DATA_DIR):
             if entry.name.startswith(prefix) and entry.name.endswith(suffix):
                 try:
-                    items.append((entry.stat().st_mtime, entry.path))
+                    st = entry.stat()
+                    items.append((st.st_mtime, st.st_size, entry.path))
                 except OSError:
                     pass
         items.sort()
         now = time.time()
         excess = max(0, len(items) - _ELIDED_MAX_ITEMS)
-        for n, (mtime, path) in enumerate(items):
-            if n < excess or now - mtime > _ELIDED_TTL_S:
+        total = sum(size for _, size, _ in items)
+        for n, (mtime, size, path) in enumerate(items):
+            if (n < excess or total > _ELIDED_MAX_BYTES
+                    or now - mtime > _ELIDED_TTL_S):
                 try:
                     os.remove(path)
+                    total -= size
                 except OSError:
                     pass
     except Exception as e:

@@ -13603,3 +13603,15 @@ if __name__ == '__main__':
     # # Run the WAMP client
     # run([component])
 
+
+
+# Read from the environment as this node's own configuration or key
+# material: a vault or consent-card value must never set these.
+# tests/unit/test_env_secrets_declared.py fails on a secret read not
+# declared here or in ENV_SECRETS.
+ENV_NOT_FROM_VAULT = (
+    'FLASK_SECRET_KEY',
+    'HEVOLVE_LLM_API_KEY',
+    'HEVOLVE_REQUIRE_AUTH',
+    'SECRET_KEY',
+)

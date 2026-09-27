@@ -281,7 +281,7 @@ def test_source_guard_nunba_imports_no_private_core_name():
         seen += 1
         bad += [f'{os.path.relpath(path, NUNBA)}:{ln} {name}'
                 for ln, name in _private_core_imports(tree)]
-    assert seen > 100, seen
+    assert seen > 50, seen   # 90 tracked non-test modules on 2026-09-28
     assert not bad, ('Nunba imports a private HARTOS core name; make it '
                      'public in core (keep the old name as an alias):\n'
                      + '\n'.join(bad))

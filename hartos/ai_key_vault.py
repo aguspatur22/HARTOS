@@ -98,6 +98,9 @@ class AIKeyVault:
         # HEVOLVE_MASTER_KEY the value lives only in this process's vault
         # cache, which cannot say which of its names the owner entered.
         self._stored: set = set()
+        # Values another store keeps (Nunba's desktop vault), handed over by
+        # hold_credential: memory only, never persisted, never os.environ.
+        self._held: Dict[str, str] = {}
         # Every credential value this process has known -> its name: each
         # value resolve_aliases handed a tool and each value mask_secrets
         # masked.  Keyed by VALUE and never pruned, so masking never shrinks:
@@ -151,8 +154,10 @@ class AIKeyVault:
     # ── Retrieval ──────────────────────────────────────────────────
 
     def get_tool_key(self, key_name: str) -> str:
-        """Get a tool/API key. Delegates to SecretsManager."""
-        return self._secrets_manager().get_secret(key_name)
+        """Get a tool/API key: SecretsManager (environment, then its vault),
+        then what another store handed over (hold_credential)."""
+        return (self._secrets_manager().get_secret(key_name)
+                or self._held.get(key_name, ''))
 
     def get_channel_secret(self, channel_type: str, key_name: str) -> str:
         """Get a channel-specific secret.
@@ -234,7 +239,10 @@ class AIKeyVault:
         if not key_name or not value:
             return
         with self._lock:
-            self._secrets_manager()._cache[str(key_name)] = value
+            # Beside the SecretsManager cache, not in it: set_secret writes
+            # the whole cache to secrets.enc, and Nunba's vault already keeps
+            # this value.
+            self._held[str(key_name)] = value
 
     # ── Alias (the only form the model sees) ───────────────────────
 
@@ -494,22 +502,65 @@ class AIKeyVault:
             return resolved in self._pending
 
 
-def reads_from_env(name) -> bool:
-    """True when this process legitimately reads ``name`` from its
-    environment: an API key in security.secrets_manager.SECRET_KEYS, or a
-    channel token/credential (FlaskChannelIntegration.env_names, the
-    adapters' env fallbacks).  Only those vault values are ever put in
-    os.environ; anything else the owner entered stays in the vault."""
+#: Modules (not channel adapters) that declare ENV_SECRETS: the credentials
+#: they read from the environment.  Channel adapters are found through
+#: FlaskChannelIntegration._ADAPTER_FACTORIES.  tests/unit/
+#: test_env_secrets_declared.py fails when a module declares ENV_SECRETS and
+#: is not listed here, and when a secret env read is declared nowhere.
+_ENV_SECRET_MODULES = (
+    'hartos.hartos_bootstrap',
+    'integrations.agent_engine.erxes_client',
+    'integrations.agent_engine.private_repo_access',
+    'integrations.ap2.ap2_protocol',
+    'integrations.audio.diarization_server',
+    'integrations.audio.diarization_service',
+    'integrations.channels.agent_tools',
+    'integrations.channels.memory.simplemem_store',
+    'integrations.channels.oauth_api',
+    'integrations.service_tools.gh_pr_tool',
+    'integrations.social.api_channels',
+    'integrations.social.livekit_service',
+    'integrations.social.livekit_supervisor',
+)
+
+_DECLARED_ENV_NAMES = None
+
+
+def _declared_env_names() -> frozenset:
+    """SECRET_KEYS, every channel's env names, and each _ENV_SECRET_MODULES
+    module's ENV_SECRETS, computed once.  A module that cannot be imported
+    is logged and adds nothing."""
+    global _DECLARED_ENV_NAMES
+    if _DECLARED_ENV_NAMES is not None:
+        return _DECLARED_ENV_NAMES
+    import importlib
     from security.secrets_manager import SECRET_KEYS
-    if name in SECRET_KEYS:
-        return True
+    names = set(SECRET_KEYS)
     try:
         from integrations.channels.flask_integration import FlaskChannelIntegration
-        return name in FlaskChannelIntegration.env_names()
+        names.update(FlaskChannelIntegration.env_names())
     except Exception:
-        logger.warning("channel env names unavailable; %s stays in the vault",
-                       name, exc_info=True)
-        return False
+        logger.warning("channel env names unavailable; channel credentials "
+                       "stay in the vault", exc_info=True)
+    for module in _ENV_SECRET_MODULES:
+        try:
+            names.update(getattr(importlib.import_module(module), 'ENV_SECRETS', ()))
+        except Exception:
+            logger.warning("%s not importable; its declared credentials stay "
+                           "in the vault", module, exc_info=True)
+    _DECLARED_ENV_NAMES = frozenset(names)
+    return _DECLARED_ENV_NAMES
+
+
+def reads_from_env(name) -> bool:
+    """True when this process legitimately reads ``name`` from its
+    environment as a credential an owner may enter: an API key in
+    security.secrets_manager.SECRET_KEYS, or a name some module declares in
+    ENV_SECRETS (channel adapters, gh_pr_tool, ap2, livekit...).  Only those
+    vault values are ever put in os.environ; anything else the owner entered
+    stays in the vault, and a name declared ENV_NOT_FROM_VAULT (node
+    configuration, key material) never comes from it."""
+    return name in _declared_env_names()
 
 
 # ── Module-level singleton (HARTOS convention) ─────────────────────
