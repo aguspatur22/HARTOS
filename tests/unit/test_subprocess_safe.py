@@ -699,3 +699,56 @@ class TestTheOtherBoundedWaitsDelegate:
             time.sleep(0.3)
             return 'v'
         assert subprocess_safe.call_bounded(_slow, 1e12) == (True, 'v', None)
+
+
+class TestCallBoundedValidatesBeforeItStarts:
+    """Review F5 (2026-09-27, probe vlm_exit.py): a bad wait raised AFTER fn
+    had started, leaving a worker running that nobody would ever wait for."""
+
+    @pytest.mark.parametrize('bad, exc', [(None, TypeError),
+                                          ('soon', ValueError),
+                                          (float('nan'), ValueError)])
+    def test_a_bad_wait_raises_and_fn_never_runs(self, bad, exc):
+        import threading
+        ran = threading.Event()
+        with pytest.raises(exc):
+            subprocess_safe.call_bounded(ran.set, bad)
+        time.sleep(0.2)
+        assert not ran.is_set()
+
+    def test_infinity_is_clamped(self):
+        def _slow():
+            time.sleep(0.2)
+            return 7
+        assert subprocess_safe.call_bounded(_slow, float('inf')) == (True, 7, None)
+
+
+class TestCallBoundedCancel:
+    """Review F4: the VLM loop's Stop must end the wait, not the budget."""
+
+    def test_setting_cancel_releases_the_caller(self):
+        import threading
+        cancel, release = threading.Event(), threading.Event()
+        timer = threading.Timer(0.3, cancel.set)
+        timer.daemon = True
+        timer.start()
+        t0 = time.monotonic()
+        finished, value, error = subprocess_safe.call_bounded(
+            lambda: release.wait(10), 8, cancel=cancel)
+        elapsed = time.monotonic() - t0
+        release.set()
+        assert (finished, value, error) == (False, None, None)
+        assert elapsed < 1.5
+
+    def test_cancel_already_set_does_not_start_fn(self):
+        import threading
+        cancel, ran = threading.Event(), threading.Event()
+        cancel.set()
+        assert subprocess_safe.call_bounded(ran.set, 5, cancel=cancel) == (False, None, None)
+        time.sleep(0.2)
+        assert not ran.is_set()
+
+    def test_an_unset_cancel_changes_nothing(self):
+        import threading
+        assert subprocess_safe.call_bounded(
+            lambda: 'v', 2, cancel=threading.Event()) == (True, 'v', None)

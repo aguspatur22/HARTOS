@@ -188,3 +188,56 @@ def test_the_owner_is_not_told_twice_about_their_own_run(
     msg = wired.call_args_list[0].args[1]
     assert msg['agent_id'] == 'goal-42'
     assert msg['disclosure_only'] is False
+
+
+# ── A closed run takes no more steps (review F1, 2026-09-27) ─────────────
+# An action abandoned at the loop's time budget keeps running on its worker,
+# and the shell tool inside it announces its own steps.  Probe vlm_probe.py
+# q2b: 2 s after the loop returned, that late step raised the ribbon again,
+# rewrote the finished task's context to phase=failed and fanned out
+# run_done=False, so the companion showed the run live again.
+
+@pytest.mark.parametrize('exit_reason', ['done', 'timeout', 'stopped'])
+def test_a_step_after_the_run_closed_is_ignored(ledger, wired, exit_reason):
+    _step('executing', 1)
+    activity_stream.finish_run(
+        user_id='guest', prompt_id='42', run_id='run1', exit_reason=exit_reason)
+    task = ledger.get_task('computer_use_run1')
+    status, context = task.status, dict(task.context)
+    wired.reset_mock()
+    with patch.object(activity_stream, '_ribbon') as ribbon:
+        assert _step('failed', 2, error='late') is None
+    ribbon.assert_not_called()
+    wired.assert_not_called()
+    task = ledger.get_task('computer_use_run1')
+    assert task.status == status
+    assert task.context == context
+
+
+def test_a_step_of_an_open_run_still_raises_the_ribbon(ledger, wired):
+    _step('executing', 1)
+    with patch.object(activity_stream, '_ribbon') as ribbon:
+        assert _step('failed', 1, error='rc 1') is not None
+    ribbon.assert_called_once()
+
+
+def test_a_joined_run_whose_stamp_is_closed_takes_no_steps(ledger, wired):
+    """The loop marks the stamp its abandoned worker adopted; a step of a
+    run joined BEFORE that mark is refused too, not only after finish_run."""
+    from hartos.threadlocal import thread_local_data as tld
+    tld.set_activity_run('run1', user_id='guest', prompt_id='42')
+    try:
+        joined = activity_stream.current_run(user_id='guest', prompt_id='42')
+        assert joined.step(iteration=1, action='shell', phase='executing') is not None
+        activity_stream.close_run_stamp(tld.get_activity_run())
+        wired.reset_mock()
+        with patch.object(activity_stream, '_ribbon') as ribbon:
+            assert joined.step(iteration=1, action='shell', phase='failed') is None
+            again = activity_stream.current_run(user_id='guest', prompt_id='42')
+            assert again.step(iteration=2, action='shell', phase='executing') is None
+            assert again.finish(exit_reason='action_error') is None
+        ribbon.assert_not_called()
+        wired.assert_not_called()
+        assert ledger.get_task('computer_use_run1').status == TaskStatus.IN_PROGRESS
+    finally:
+        tld.clear_activity_run()

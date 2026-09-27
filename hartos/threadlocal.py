@@ -1,4 +1,7 @@
+import logging
 import threading
+
+_log = logging.getLogger(__name__)
 
 
 class ThreadLocalData:
@@ -72,11 +75,36 @@ class ThreadLocalData:
     # can bound it) and uses this pair to keep that action inside its run.
 
     def snapshot(self):
-        """This thread's per-request state, as a dict to hand to a worker."""
-        return dict(vars(self._local))
+        """This thread's per-request state, as a dict to hand to a worker.
+
+        A DEEP copy, per value: a worker that appends to an adopted list or
+        dict changes its own copy, never the caller's (review F6,
+        2026-09-27 -- the shallow copy let a worker's append land in the
+        caller's recognize_intent list).  A value that cannot be copied is
+        passed by reference and said so in the log, rather than dropped.
+        """
+        import copy
+        out = {}
+        for key, value in vars(self._local).items():
+            try:
+                out[key] = copy.deepcopy(value)
+            except Exception as e:
+                _log.warning("threadlocal snapshot: %r shared by reference, "
+                             "not copied (%s: %s)", key, type(e).__name__, e)
+                out[key] = value
+        return out
 
     def adopt(self, snapshot):
-        """Take on a snapshot() from the thread this one is acting for."""
+        """Take on a snapshot() from the thread this one is acting for.
+
+        MERGE, not replace: each key in ``snapshot`` is set on this thread;
+        keys this thread already has and the snapshot lacks are kept.
+        Values are NOT copied again, so whoever holds ``snapshot`` shares
+        those objects with this thread.  That is deliberate: the VLM loop
+        keeps the snapshot it handed an action's worker and marks the
+        worker's ``activity_run`` closed when it abandons the action.
+        Nothing flows back: the caller never sees what the worker sets.
+        """
         for key, value in (snapshot or {}).items():
             setattr(self._local, key, value)
 
@@ -95,7 +123,12 @@ class ThreadLocalData:
         } if run_id else None
 
     def get_activity_run(self):
-        """The enclosing run's {run_id, user_id, prompt_id}, or None."""
+        """The enclosing run's {run_id, user_id, prompt_id}, or None.
+
+        May also carry ``closed: True``: the run ended while work adopted
+        from it was still running (integrations.vlm.activity_stream.
+        close_run_stamp), so that work must not announce steps into it.
+        """
         return getattr(self._local, 'activity_run', None)
 
     def clear_activity_run(self):

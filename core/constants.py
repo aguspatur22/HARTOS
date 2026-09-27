@@ -1300,6 +1300,13 @@ TOOL_FAILURE_RESULTS: tuple = (
 # envelope's writer and tool_reply_failed below read one spelling.
 TOOL_EXECUTION_FAILED_PREFIX: str = "Tool execution failed:"
 
+# How long one Shell_Command may run before it is killed
+# (hart_intelligence_entry._handle_shell_command_tool, via run_bounded).
+# The VLM loop reads the same number: a shell step still running when the
+# loop's own budget ends gets exactly this long as grace, because it is
+# bounded by it anyway and its real result beats "result unknown".
+SHELL_COMMAND_TIMEOUT_S: int = 30
+
 # How a tool reply opens when the call did not run or raised.  "Error:" is
 # the executor's answer (hartos/helper.py enhanced_execute_function and
 # tool_argument_error: unknown function, arguments that do not bind, a raise).
