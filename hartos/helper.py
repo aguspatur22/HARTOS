@@ -1076,6 +1076,31 @@ _TOKEN_CHARS = '_.-+'
 _BEFORE_A_COMMENT = '{[,'
 
 
+def parse_tool_arguments(text):
+    """``(value, repaired)`` for a tool call's arguments text: THE one reader,
+    for both the history guard (ensure_tool_call_arguments_json) and the
+    executor (bind_tool_call_arguments).  Raises ValueError when the text
+    cannot be read without inventing a value.
+
+    The text as written first, with load_wire_json (an overflowing number
+    comes back as the token the model wrote, never inf); else its
+    repair_json repair, with each overflowing number quoted first because
+    repair_json itself would write Infinity for it.  A repair that still
+    yields Infinity / NaN the model never wrote is refused.
+
+    Review of c21b5e6e2 / 7d07c0a2d: the executor parsed with plain
+    json.loads and retrieve_json, so ``{"id": 620e51403072992921}`` ran the
+    tool with id=inf while the guard showed the model the id it wrote."""
+    try:
+        return load_wire_json(text), False
+    except ValueError:
+        pass
+    value = load_wire_json(repair_json(_quote_overflowing_numbers(text)))
+    if _invents_a_constant(value, text):
+        raise ValueError('repair would send a value the model never wrote')
+    return value, True
+
+
 _NON_FINITE_WORDS = ('Infinity', '-Infinity', 'NaN')
 
 
@@ -1294,18 +1319,12 @@ def ensure_tool_call_arguments_json(messages):
                 # parameters at all (measured on :8080, review of b0fa4989e).
                 continue
             fixed = None
-            # The original text first; before repair, each overflowing
-            # number is quoted, since repair_json itself would turn it into
-            # Infinity and lose the token.
-            for candidate in (lambda: args, lambda: repair_json(
-                    _quote_overflowing_numbers(args))):
-                try:
-                    obj = load_wire_json(candidate())
-                except Exception:
-                    continue
-                if isinstance(obj, dict) and not _invents_a_constant(obj, args):
+            try:
+                obj, _ = parse_tool_arguments(args)
+                if isinstance(obj, dict):
                     fixed = json.dumps(obj)
-                    break
+            except ValueError:
+                pass
             if fixed is None:
                 fixed = refused_arguments_json(args)
             fn['arguments'] = fixed
@@ -4261,10 +4280,17 @@ def bind_tool_call_arguments(func, func_name, input_string, format_json_str,
     Refused well-formed JSON (a wrong name) stays as the model wrote it:
     that is what the reply names.
     """
+    # ONE reader for tool arguments (parse_tool_arguments), the one the
+    # history guard uses, so the tool gets what the model is shown -- never
+    # json.loads here: it read an overflowing number as inf and ran the tool
+    # with it (review of c21b5e6e2 / 7d07c0a2d).  retrieve_json stays the
+    # last resort for shapes the reader cannot repair (an "@user" prefix,
+    # Python-literal syntax), and what it returns is refused if it carries
+    # Infinity / NaN the model never wrote.
     try:
-        arguments = json.loads(format_json_str(input_string))
-        print(f" ORIGINAL AUTOGEN{where}: Successfully parsed arguments for {func_name}")
-        repaired = False
+        arguments, repaired = parse_tool_arguments(format_json_str(input_string))
+        print(f" ORIGINAL AUTOGEN{where}: parsed arguments for {func_name}"
+              f"{' (repaired)' if repaired else ''}")
     except Exception as e:
         print(f" ORIGINAL AUTOGEN{where} FAILED: {e} - falling back to enhanced parsing for {func_name}")
         try:
@@ -4272,13 +4298,21 @@ def bind_tool_call_arguments(func, func_name, input_string, format_json_str,
             if arguments is None:
                 arguments = {}
             elif isinstance(arguments, str):
-                arguments = json.loads(arguments)
+                arguments, _ = parse_tool_arguments(arguments)
         except Exception as fallback_error:
             print(f" FALLBACK{where} FAILED: {fallback_error}")
             mark_call_refused(call, input_string)
             return None, f"Error: {e}\n The argument must be in JSON format."
         print(f" FALLBACK{where} PARSED: arguments for {func_name}: {arguments}")
         repaired = True
+    if _invents_a_constant(arguments, input_string):
+        print(f" ARGUMENTS REFUSED{where}: {func_name} not run: a value the "
+              f"model never wrote (Infinity/NaN)")
+        mark_call_refused(call, input_string)
+        return None, (f"Error: {func_name} was not run: its arguments could "
+                      f"not be read without turning a number into Infinity. "
+                      f"Write a long number or id as a string in double "
+                      f"quotes.")
     error = tool_argument_error(func, func_name, arguments, repaired)
     if error is not None:
         print(f" ARGUMENTS REFUSED{where}: {func_name} not run: {error}")

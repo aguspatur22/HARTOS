@@ -297,3 +297,26 @@ def test_a_budget_too_small_for_the_explanation_sends_plain_markers(
     out2, _, _ = _trim([sys_m, task, call, result], big, monkeypatch)
     assert _POINTER.search(next(m for m in out2 if m.get('role') == 'tool')
                            ['content'])
+
+
+def test_the_scope_is_the_user_the_entry_point_acts_for():
+    """with_llm_context binds the decorated entry point's user_id (recipe /
+    chat_agent), and the elided store scopes by it -- the same user id the
+    get_data_by_key closure is built with -- also on a worker thread the
+    call hands off to with the context copied, as autogen does."""
+    import contextvars
+    import threading
+
+    @lol.with_llm_context('autogen.test')
+    def entry(user_id, text, prompt_id, file_id, request_id):
+        seen = {}
+        ctx = contextvars.copy_context()
+        t = threading.Thread(
+            target=lambda: seen.update(scope=ctx.run(lol.elision_scope)))
+        t.start()
+        t.join()
+        return lol.elision_scope(), seen['scope']
+
+    here, worker = entry('u42', 'hi', 'p1', None, 'r9')
+    assert here == worker == lol.elision_scope(user_id='u42')
+    assert here != lol.elision_scope(request_id='r9')
