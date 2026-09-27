@@ -238,6 +238,45 @@ def _step_caption(action_json: dict, limit: int = 160) -> str:
     return line if len(line) <= limit else line[:limit - 1].rstrip() + '…'
 
 
+def _execute_within_budget(execute_action, action_payload, tier, *,
+                           safety, verify, remaining_s):
+    """Run one action, but never past the loop's remaining time budget.
+
+    Returns the action's result dict, or None when the budget ran out first:
+    either nothing was left (the action is NOT started), or the action was
+    still running at the deadline (the caller is released; the action is
+    left to finish on its worker -- an in-process call such as os.startfile
+    cannot be stopped from outside).  An exception the action raised within
+    the budget is re-raised here, so the iteration's own error handling sees
+    it exactly as before.
+
+    Measured live 2026-09-27 (daemon goal b18bba6f): one open_file_gui --
+    os.startfile on a .py associated with pycharm64.exe -- returned after
+    ~6974 s, because the 1800 s ETA was only checked between iterations.
+
+    The action runs on a worker that adopts this thread's hartos.threadlocal
+    state: the shell tool inside it checks consent against prompt_id and
+    announces itself as a step of the run stamped there.
+    """
+    if remaining_s <= 0:
+        return None
+    from core.subprocess_safe import call_bounded
+    from hartos.threadlocal import thread_local_data
+    context = thread_local_data.snapshot()
+
+    def _act():
+        thread_local_data.adopt(context)
+        return execute_action(action_payload, tier, safety=safety, verify=verify)
+
+    finished, result, error = call_bounded(
+        _act, remaining_s, name='hart-vlm-action')
+    if not finished:
+        return None
+    if error is not None:
+        raise error
+    return result
+
+
 def run_local_agentic_loop(
     message: dict,
     tier: str,
@@ -859,9 +898,24 @@ def _drive_local_agentic_loop(
                 )
                 break
 
-            result = execute_action(
-                action_payload, tier,
-                safety=_safety_on, verify=_verify_on)
+            # The ETA bounds the action in flight, not only the gap between
+            # iterations -- see _execute_within_budget.
+            _remaining = max_eta - (time.time() - start_time)
+            result = _execute_within_budget(
+                execute_action, action_payload, tier,
+                safety=_safety_on, verify=_verify_on, remaining_s=_remaining)
+            _out_of_budget = result is None
+            if _out_of_budget:
+                _why = (f"{next_action} did not finish within the {max_eta}s "
+                        f"budget; abandoned after "
+                        f"{time.time() - start_time:.0f}s"
+                        if _remaining > 0 else
+                        f"{next_action} not started: the {max_eta}s budget "
+                        f"was spent before it")
+                logger.warning(
+                    f"VLM loop: {_why} (iteration {iteration + 1}, "
+                    f"user={user_id}, prompt={prompt_id})")
+                result = {'output': '', 'status': 'error', 'error': _why}
             # A result carrying an error did not happen on the machine: the
             # safety guard refused it (status 'safety_blocked') or the
             # executor failed ({'error': ...}, often with no status).  Both
@@ -910,6 +964,10 @@ def _drive_local_agentic_loop(
                 },
                 "iteration": iteration + 1,
             })
+
+            if _out_of_budget:
+                exit_reason = 'timeout'
+                break
 
             # Bail after 3 consecutive action errors — something is structurally
             # broken (bad coordinates, action type mismatch, subprocess dead)

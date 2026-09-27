@@ -5195,7 +5195,8 @@ def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
         return True
 
     next_action_id, advanced = _advance_reuse_action(
-        user_prompt, action_id, reason, prompt_id)
+        user_prompt, action_id, reason, prompt_id,
+        claimed_action_id=claimed_action_id)
 
     # Both branches below post a command into the SAME group chat the
     # assistant is already in, so its cached system prompt must name the
@@ -5420,21 +5421,12 @@ def _reuse_call_id_to_tool_name(msg_lists):
     """call_id -> function name, read off the PROPOSING assistant message.
 
     A tool result's own `name` is the EXECUTING AGENT, never the function, so
-    this join is the only way to say which tool a result belongs to.  Lifted
-    out of _reuse_fabricated_tools for the vacuity stamp; one rule, no second
-    vocabulary.
+    this join is the only way to say which tool a result belongs to.  The rule
+    lives in lifecycle_hooks.tool_call_names, which the completion gate reads
+    too, so the gate and these readers name a receipt's tool the same way.
     """
-    out = {}
-    for _ml in (msg_lists or []):
-        for m in (_ml or []):
-            if not isinstance(m, dict):
-                continue
-            for tc in (m.get('tool_calls') or []):
-                _cid = (tc or {}).get('id')
-                _fn = ((tc or {}).get('function') or {}).get('name')
-                if _cid and _fn:
-                    out[_cid] = _fn
-    return out
+    from hartos.lifecycle_hooks import tool_call_names
+    return tool_call_names(msg_lists)
 
 
 def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
@@ -5874,6 +5866,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                             user_prompt, _reuse_current_action,
                             "reuse-w1-completed", prompt_id,
                             manager, chat_instructor,
+                            claimed_action_id=_term_vj.get('action_id'),
                             advanced_latch=_reuse_advanced_actions):
                         break  # finished recipe -> post-loop extractor (#798)
                     continue
@@ -6613,10 +6606,14 @@ def _start_reuse_action(user_prompt, action_id, reason):
                           f"{reason}: starting")
 
 
-def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt_id=None):
+def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt_id=None,
+                          claimed_action_id=None):
     """
     Mark action COMPLETED → TERMINATED, advance to next action, set ASSIGNED → IN_PROGRESS.
     Returns (next_action_id, True) if advanced, or (None, False) if all actions done or state error.
+
+    ``claimed_action_id`` is the action_id the verdict names; the completion
+    gate refuses a verdict that names another action.
     """
     # FABRICATION GATE (canonical single point — EVERY advance path calls this):
     # refuse to mark a tool-naming action COMPLETED when its specific tool never
@@ -6781,7 +6778,8 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             return None, False
     ok1 = commit_verified_action_completion(
         user_prompt, current_action_id, evidence,
-        f"{reason}: evidence-backed completion")
+        f"{reason}: evidence-backed completion",
+        claimed_action_id=claimed_action_id)
     ok2 = ok1 and safe_set_state(
         user_prompt, current_action_id, ActionState.TERMINATED,
         f"{reason}: done")

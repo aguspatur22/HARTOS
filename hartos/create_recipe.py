@@ -4658,6 +4658,24 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                 hook_result = lifecycle_hook_process_verifier_response(user_prompt, json_obj,
                                                                        user_tasks)  # 4-6. Process verifier response
 
+                if hook_result['action'] == 'gave_up':
+                    # The gate refused this action's completion claims to its
+                    # bound and recorded GAVE_UP (an honest, retryable failure).
+                    # Move on the way [RECIPE-GIVEUP] does; posting nothing,
+                    # because the old verdict + TERMINATE still at the tail are
+                    # then stale for the next action and route it to
+                    # [EXECUTE-PENDING].  Re-reading them here instead would
+                    # spin: the COMPLETION-GATE below `continue`s without
+                    # posting for any action that is not COMPLETED.
+                    current_app.logger.warning(
+                        f"[GAVE-UP] action {current_action_id}: "
+                        f"{hook_result['message']}")
+                    if current_action_id < len(user_tasks[user_prompt].actions):
+                        user_tasks[user_prompt].current_action = current_action_id + 1
+                        user_tasks[user_prompt].recipe = False
+                        user_tasks[user_prompt].fallback = False
+                        continue
+                    break
                 if hook_result['action'] != 'allow':
                     if hook_result['action'] == 'force_fallback':
                         # The lifecycle hook is the sole owner of the verified
@@ -5991,6 +6009,26 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
         # the flow from action 1.
         if not isinstance(action_obj, dict):
             action_obj = {'action': str(action_obj)}
+        # Bookkeeping is not the work (core.constants.BOOKKEEPING_TOOLS).  A
+        # window whose every step is a note-to-self the action does not name
+        # did nothing a replay should repeat: live 2026-09-27 (CREATE
+        # daemon_255bd83f) two execute_coding_task actions banked as recipes
+        # 28345960934_0_1/_0_2 made of request_tools, get_saved_metadata,
+        # search_long_term_memory and save_data_in_memory writes of
+        # {"status": "completed"}, with no coding run.  Nothing is banked, so
+        # the caller asks for the recipe or gives up instead of REUSE replaying
+        # the notes.  A step with generalized_functions (code that ran) is work.
+        from core.constants import BOOKKEEPING_TOOLS
+        _action_text = str(action_obj.get('action', '')).lower()
+        if steps and all(
+                s['tool_name'] in BOOKKEEPING_TOOLS
+                and s['tool_name'].lower() not in _action_text
+                for s in steps):
+            current_app.logger.warning(
+                f"[TRACE-BANK] action {action_id} ran only bookkeeping tools "
+                f"({', '.join(sorted({s['tool_name'] for s in steps}))}); "
+                f"not banking that as its recipe")
+            return False
         if not steps:
             steps = [{
                 'steps': 'no-op: action completed without tool execution',

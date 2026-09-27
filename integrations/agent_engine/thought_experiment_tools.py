@@ -53,12 +53,26 @@ def cast_experiment_vote(experiment_id: str, voter_id: str,
                           suggestion: str = '',
                           voter_type: str = 'agent',
                           confidence: float = 0.8) -> str:
-    """Cast a vote on a thought experiment (as agent or human)."""
+    """Cast a vote on a thought experiment (as agent or human).
+
+    Never as the steward: this tool is called by agents and takes voter_id
+    as given, so it is no signed-in human.  A voter_id that is the steward
+    (voting_rules.is_steward) is refused and nothing is written; the steward
+    votes through the signed-in route (POST /api/social/experiments/<id>/
+    vote, voter_id from the JWT).  The literal 'steward' needs no refusal:
+    it is no one, so tally_votes gives it no steward weight."""
     try:
-        from integrations.social.models import db_session
+        from integrations.social.models import User, db_session
         from integrations.social.thought_experiment_service import ThoughtExperimentService
+        from integrations.social.voting_rules import is_steward
 
         with db_session() as db:
+            if is_steward(db.query(User).filter(
+                    User.id == str(voter_id)).first()):
+                return json.dumps({
+                    'success': False,
+                    'reason': 'steward_votes_need_the_signed_in_steward',
+                })
             result = ThoughtExperimentService.cast_vote(
                 db, experiment_id, voter_id,
                 vote_value=int(vote_value),

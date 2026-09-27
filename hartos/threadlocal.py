@@ -64,6 +64,22 @@ class ThreadLocalData:
     def get_prompt_id(self):
         return getattr(self._local, 'prompt_id', None)
 
+    # --- Handing this thread's request state to a worker acting for it ---
+    # A worker thread starts with an EMPTY threading.local, so work moved
+    # onto one stops seeing the request's prompt_id, user_id, request_id and
+    # activity run -- and the shell tool's consent check reads prompt_id.
+    # local_loop runs one computer-use action on a worker (so its time budget
+    # can bound it) and uses this pair to keep that action inside its run.
+
+    def snapshot(self):
+        """This thread's per-request state, as a dict to hand to a worker."""
+        return dict(vars(self._local))
+
+    def adopt(self, snapshot):
+        """Take on a snapshot() from the thread this one is acting for."""
+        for key, value in (snapshot or {}).items():
+            setattr(self._local, key, value)
+
     # --- Computer-use run context (set by integrations.vlm.local_loop) ---
     # The run a desktop action belongs to, so a tool that executes DURING a
     # run can announce itself as a step of that run instead of inventing its

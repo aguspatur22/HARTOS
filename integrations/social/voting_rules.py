@@ -84,9 +84,21 @@ def quorum_met(distinct_voters: int, distinct_supporters: int) -> bool:
 SUPERMAJORITY_RATIO = 2.0 / 3.0
 
 
-#: The steward's vote on a thought experiment is cast under this voter id;
-#: decide() has always looked for it there.
-STEWARD_VOTER_ID = 'steward'
+def is_steward(user) -> bool:
+    """True when a vote by ``user`` (a users row, or None) is the steward's.
+
+    The steward is a registered HUMAN account holding the central role,
+    the one auth.require_central admits (auth.holds_central_role); no other
+    role store.  An agent is never the steward, whoever owns it and
+    whatever its own row says: an agent counts as its owner for the quorum
+    (tally_votes), never as the steward.  A voter id with no users row --
+    the literal 'steward' included -- is no one.  Only a signed-in human
+    may cast this vote: the agent tool refuses a steward's voter id
+    (thought_experiment_tools.cast_experiment_vote)."""
+    if user is None or getattr(user, 'user_type', None) != 'human':
+        return False
+    from .auth import holds_central_role
+    return holds_central_role(user)
 
 
 def steward_must_vote(context: str) -> bool:
@@ -107,7 +119,9 @@ def approval_verdict(tally: dict) -> dict:
         owner's 2/3 is the floor, and a context may only raise it (0.8 for
         security_guardrail);
       - when the context is steward_required, the steward voted FOR
-        (tally['steward_vote'] > 0).
+        (tally['steward_vote'] > 0; tally_votes fills it only from votes
+        whose voter is_steward, the most negative when several did, so a
+        steward's AGAINST is never outvoted by another's FOR).
     The context is the tally's decision_context, and its rules come from
     VOTER_RULES here, never from the tally, so a tally cannot carry a
     weaker threshold.  No decision_context means DEFAULT_RULES, as

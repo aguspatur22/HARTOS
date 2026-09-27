@@ -60,6 +60,20 @@ def _strict_loads(text):
         parse_int=lambda t: (finite(t), int(t))[1]))
 
 
+def _assert_refused(case, out, original, reason):
+    """The refused call's stand-in: strict JSON, one object, carrying what
+    the model wrote (lone surrogates shown as U+FFFD) and why it was
+    refused -- never '{}'."""
+    from hartos.helper import REFUSED_ARGUMENTS_KEY, REFUSED_BECAUSE_KEY
+    parsed = _strict_loads(out)
+    case.assertEqual(set(parsed), {REFUSED_ARGUMENTS_KEY, REFUSED_BECAUSE_KEY})
+    if original is not None:
+        case.assertEqual(parsed[REFUSED_ARGUMENTS_KEY], original)
+    case.assertIn('not run', parsed[REFUSED_BECAUSE_KEY])
+    case.assertIn(reason, parsed[REFUSED_BECAUSE_KEY])
+    return parsed
+
+
 def _call(args):
     return [{
         'role': 'assistant', 'content': '',
@@ -133,6 +147,19 @@ class StrictNumbers(unittest.TestCase):
         self.assertEqual(parsed, {'note': "id 1e999, see 'x'", 'n': 3, 'v': '1e999'})
         self.assertIs(type(parsed['n']), int)
 
+    def test_repair_quotes_only_whole_overflowing_tokens(self):
+        # Unquoted keys and words: a number that is part of a word stays in
+        # the word, and one in a list is quoted like one in an object.
+        out = _out_args(ensure_tool_call_arguments_json(
+            _call('{v: 1e999, k: a1e999, w: 1e999abc, a: [1e999, 2]}')))
+        self.assertEqual(_strict_loads(out), {'v': '1e999', 'k': 'a1e999',
+                                              'w': '1e999abc', 'a': ['1e999', 2]})
+
+    def test_repair_leaves_an_overflow_inside_curly_quotes_alone(self):
+        out = _out_args(ensure_tool_call_arguments_json(
+            _call("{“v”: “id 1e999”, 'w': 1e999}")))
+        self.assertEqual(_strict_loads(out), {'v': 'id 1e999', 'w': '1e999'})
+
     def test_a_coerced_call_keeps_each_finite_number_its_own_type(self):
         # Coercion re-serialises the whole call: the overflow becomes its own
         # string, and every finite number must come back as it was written,
@@ -146,11 +173,13 @@ class StrictNumbers(unittest.TestCase):
         self.assertIs(type(parsed['ratio']), float)
         self.assertIn('"count": 3,', out)
 
-    def test_refused_non_object_falls_back_to_empty_object(self):
+    def test_refused_non_object_is_kept_visible_marked_refused(self):
         # arguments must be an object; a list carrying NaN is neither
-        # sendable as is nor a call, so it becomes a well-formed empty call.
+        # sendable as is nor a call.  It goes out as a strict object keeping
+        # what the model wrote, marked refused ('{}' erased it: review of
+        # 86e580b99).
         out = _out_args(ensure_tool_call_arguments_json(_call('[NaN, 1]')))
-        self.assertEqual(out, '{}')
+        _assert_refused(self, out, '[NaN, 1]', 'not one JSON object')
 
     def test_finite_numbers_are_left_byte_identical(self):
         text = '{"a": 1.5e10, "b": -3, "c": 0.25, "d": 12345678901234567890}'
@@ -210,23 +239,23 @@ class LoneSurrogates(unittest.TestCase):
         # a call that can be repaired: refused like unrecoverable arguments.
         out = _out_args(ensure_tool_call_arguments_json(
             _call('{"\\ud800": 1, "\\udc00": 2}')))
-        self.assertEqual(out, '{}')
+        _assert_refused(self, out, None, 'would become one key')
 
     def test_a_lone_surrogate_key_colliding_with_a_real_key_is_refused(self):
         # U+FFFD is also a character a key may really hold.
         out = _out_args(ensure_tool_call_arguments_json(
             _call('{"\\ud800": 1, "\\ufffd": 2}')))
-        self.assertEqual(out, '{}')
+        _assert_refused(self, out, None, 'would become one key')
 
     def test_colliding_keys_in_a_dict_argument_are_refused(self):
         out = _out_args(ensure_tool_call_arguments_json(
             _call({'\ud800': 1, '\udc00': 2})))
-        self.assertEqual(out, '{}')
+        _assert_refused(self, out, None, 'would become one key')
 
     def test_colliding_keys_in_a_nested_object_are_refused(self):
         out = _out_args(ensure_tool_call_arguments_json(
             _call('{"a": {"x\\ud800": 1, "x\\udbff": 2}}')))
-        self.assertEqual(out, '{}')
+        _assert_refused(self, out, None, 'would become one key')
 
     def test_escaped_surrogate_pair_is_left_byte_identical(self):
         text = '{"e": "\\ud83d\\ude00"}'  # a valid pair: one emoji

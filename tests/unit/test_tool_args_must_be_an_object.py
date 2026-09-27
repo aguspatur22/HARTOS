@@ -20,6 +20,7 @@ live tools are (core.tool_logging.log_tool_execution); the credential vault
 is the only boundary mocked.
 """
 import asyncio
+import json
 import unittest
 from unittest import mock
 
@@ -41,17 +42,45 @@ def _guarded(args):
 
 class GuardSendsOnlyObjects(unittest.TestCase):
 
+    def assert_refused(self, out, original):
+        # A strict JSON object that keeps what the model wrote, marked
+        # refused with the reason -- not '{}', which erased it (review of
+        # 86e580b99): the model's next turn must see its own call.
+        from hartos.helper import REFUSED_ARGUMENTS_KEY, REFUSED_BECAUSE_KEY
+        parsed = json.loads(out)
+        self.assertEqual(parsed[REFUSED_ARGUMENTS_KEY], original)
+        self.assertIn('not one JSON object', parsed[REFUSED_BECAUSE_KEY])
+        self.assertIn('not run', parsed[REFUSED_BECAUSE_KEY])
+
+    def test_prose_is_kept_visible_not_erased(self):
+        text = 'Based on the research focus, list three models.'
+        parsed = json.loads(_guarded(text))
+        from hartos.helper import REFUSED_ARGUMENTS_KEY, REFUSED_BECAUSE_KEY
+        self.assertEqual(parsed[REFUSED_ARGUMENTS_KEY], text)
+        self.assertIn('not valid JSON', parsed[REFUSED_BECAUSE_KEY])
+
+    def test_a_raw_lone_surrogate_in_refused_text_is_made_sendable(self):
+        # Kept verbatim, the stand-in would carry the lone surrogate llama.cpp
+        # 500s on ("invalid string: surrogate", review of bb809af28).
+        out = _guarded('open file \ud800 now')
+        out.encode('utf-8')  # raises on a lone surrogate
+        from hartos.helper import REFUSED_ARGUMENTS_KEY
+        self.assertEqual(json.loads(out)[REFUSED_ARGUMENTS_KEY],
+                         'open file ' + chr(0xFFFD) + ' now')
+
+
     def test_a_valid_array_is_not_sent_as_arguments(self):
-        self.assertEqual(_guarded('[1,2]'), '{}')
+        self.assert_refused(_guarded('[1,2]'), '[1,2]')
 
     def test_a_valid_string_is_not_sent_as_arguments(self):
-        self.assertEqual(_guarded('"hello"'), '{}')
+        self.assert_refused(_guarded('"hello"'), '"hello"')
 
     def test_an_array_wrapping_an_object_is_not_sent_as_arguments(self):
-        self.assertEqual(_guarded('[{"url": "https://x.test"}]'), '{}')
+        self.assert_refused(_guarded('[{"url": "https://x.test"}]'),
+                            '[{"url": "https://x.test"}]')
 
     def test_a_python_list_is_not_sent_as_arguments(self):
-        self.assertEqual(_guarded([1, 2]), '{}')
+        self.assert_refused(_guarded([1, 2]), '[1, 2]')
 
     def test_an_object_is_left_byte_identical(self):
         text = '{"url": "https://x.test", "n": 2}'
@@ -165,6 +194,16 @@ class PositionalListsAreBoundToo(_Executor):
         ok, reply = self.run_sync('send_message_to_user',
                                   '["hi", "a1", ["truncated"]]')
         self.assert_refused_by_name(ok, reply, 'not one JSON object')
+
+
+class RefusedStandInNeverRuns(_Executor):
+
+    def test_a_stand_in_repeated_as_a_call_is_refused_by_name(self):
+        # If a model copies the stand-in into a new call, the tool is not run
+        # with it: the stand-in's keys are names no tool takes.
+        stand_in = _guarded('[1,2]')
+        ok, reply = self.run_sync('send_message_to_user', stand_in)
+        self.assert_refused_by_name(ok, reply, 'refused_arguments')
 
 
 class SafeFunctionCallUsesTheSameShape(unittest.TestCase):

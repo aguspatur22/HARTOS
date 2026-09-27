@@ -1334,6 +1334,33 @@ def tool_reply_failed(content) -> bool:
         return True
     return any(failure in body for failure in TOOL_FAILURE_RESULTS)
 
+
+# Tools that record, recall or look up the agent's OWN state -- the scratchpad
+# around an action, never the action's work.  A call to one proves only that
+# the agent kept notes.
+#
+# Measured on the installed build 2026-09-27 (CREATE daemon_255bd83f, agent
+# 28345960934): actions 1 and 2, both "execute_coding_task: ...", were
+# COMPLETED and trace-banked with ZERO execute_coding_task runs.  Their
+# "receipts" were save_data_in_memory calls whose value the model wrote
+# itself -- {"status": "completed", "message": "... successfully implemented"}
+# -- and the banked recipes 28345960934_0_1/_0_2 held only request_tools,
+# get_saved_metadata, search_long_term_memory, save_data_in_memory and
+# save_to_long_term_memory.
+#
+# Read by the completion gate (lifecycle_hooks
+# ._verifier_completion_has_conversation_evidence) and the CREATE trace banker
+# (create_recipe._bank_action_recipe_from_trace): neither takes one of these as
+# evidence UNLESS the action's own text names it -- "save the user's colour in
+# memory" is done by save_data_in_memory.  The REUSE fabrication gate already
+# credits only tools the action names, so it follows the same rule by
+# construction.  Guarded by tests/unit/test_completion_needs_real_work.py.
+BOOKKEEPING_TOOLS: frozenset = frozenset({
+    'save_data_in_memory', 'get_saved_metadata', 'get_data_by_key',
+    'save_to_long_term_memory', 'search_long_term_memory',
+    'get_user_id', 'get_prompt_id', 'get_chat_history', 'request_tools',
+})
+
 # How much of what a tool OBSERVED may ride back in its return string.
 #
 # Same family as the failure strings above, hence the same home: both decide

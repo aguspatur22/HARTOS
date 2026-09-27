@@ -669,13 +669,14 @@ class ThoughtExperimentService:
         # is its owner.  An unregistered voter_id is a string anyone can
         # pass, so it keeps its weight but is no identity.
         from .models import User
-        from .voting_rules import STEWARD_VOTER_ID, quorum_met, recommendation
+        from .voting_rules import is_steward, quorum_met, recommendation
         voter_ids = {v.voter_id for v in votes}
-        identity_of = {
-            u.id: (u.owner_id or u.id)
-            for u in (db.query(User).filter(User.id.in_(voter_ids)).all()
-                      if voter_ids else [])
-        }
+        users = (db.query(User).filter(User.id.in_(voter_ids)).all()
+                 if voter_ids else [])
+        identity_of = {u.id: (u.owner_id or u.id) for u in users}
+        # Whose vote is the steward's: voting_rules.is_steward, never a
+        # voter_id string.
+        stewards = {u.id for u in users if is_steward(u)}
         voters = set()
         supporters = set()
 
@@ -689,8 +690,9 @@ class ThoughtExperimentService:
         steward_vote = None
 
         for v in votes:
-            if v.voter_id == STEWARD_VOTER_ID:
-                steward_vote = v.vote_value
+            if v.voter_id in stewards:
+                steward_vote = (v.vote_value if steward_vote is None
+                                else min(steward_vote, v.vote_value))
             if v.voter_type == 'human':
                 human_weight = context_rules['human_weight'] if context_rules else 1.0
                 weight = human_weight
@@ -754,33 +756,25 @@ class ThoughtExperimentService:
         Transitions to 'decided' status. Feeds outcome to WorldModelBridge.
         Steward-required contexts block decision until steward has voted.
         """
-        from .models import ThoughtExperiment, ExperimentVote
+        from .models import ThoughtExperiment
+        from .voting_rules import steward_must_vote
 
         experiment = db.query(ThoughtExperiment).filter_by(
             id=experiment_id).first()
         if not experiment:
             return None
 
-        # Steward gate: certain contexts require steward vote before decision
-        try:
-            from .voting_rules import (
-                STEWARD_VOTER_ID, classify_decision_context, steward_must_vote)
-            exp_dict = experiment.to_dict()
-            context = exp_dict.get('decision_context') or \
-                classify_decision_context(exp_dict)
-            if steward_must_vote(context):
-                steward_voted = db.query(ExperimentVote).filter_by(
-                    experiment_id=experiment_id,
-                    voter_id=STEWARD_VOTER_ID,
-                ).first()
-                if not steward_voted:
-                    return {'error': 'steward_vote_required',
-                            'context': context,
-                            'message': 'Steward must vote before decision on security contexts'}
-        except ImportError:
-            pass
-
+        # Steward gate: certain contexts require the steward's vote before a
+        # decision.  Who the steward is comes from the tally
+        # (voting_rules.is_steward), the same answer approval_verdict reads;
+        # never a voter_id string.
         tally = ThoughtExperimentService.tally_votes(db, experiment_id)
+        context = tally.get('decision_context')
+        if steward_must_vote(context) and tally.get('steward_vote') is None:
+            return {'error': 'steward_vote_required',
+                    'context': context,
+                    'message': 'Steward must vote before decision on security contexts'}
+
         experiment.status = 'decided'
         experiment.decision_outcome = decision_text
         experiment.decision_rationale = {

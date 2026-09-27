@@ -39,11 +39,7 @@ from integrations.social.models import (  # noqa: E402
     AgentGoal, Base, ExperimentVote, ThoughtExperiment, User)
 from integrations.social.thought_experiment_service import (  # noqa: E402
     ThoughtExperimentService)
-from integrations.social import voting_rules  # noqa: E402
 from integrations.social.voting_rules import approval_verdict  # noqa: E402
-
-# The steward's vote is the one decide() has always looked for.
-STEWARD_VOTER_ID = getattr(voting_rules, 'STEWARD_VOTER_ID', 'steward')
 
 _ROOT = Path(__file__).resolve().parents[2]
 
@@ -85,8 +81,14 @@ def _votes(db, exp_id, values, steward=None):
             experiment_id=exp_id, voter_id=_user(db).id, voter_type='human',
             vote_value=v, confidence=1.0))
     if steward is not None:
+        # The steward is a human account holding the central role
+        # (voting_rules.is_steward; test_steward_vote_needs_the_steward_role).
+        s = User(username=f'livetest_f6s_{uuid.uuid4().hex[:8]}',
+                 user_type='human', role='central', is_admin=True)
+        db.add(s)
+        db.flush()
         db.add(ExperimentVote(
-            experiment_id=exp_id, voter_id=STEWARD_VOTER_ID,
+            experiment_id=exp_id, voter_id=s.id,
             voter_type='human', vote_value=steward, confidence=1.0))
     db.commit()
 

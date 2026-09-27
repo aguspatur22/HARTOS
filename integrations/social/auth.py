@@ -627,13 +627,23 @@ def require_moderator(f):
     return decorated
 
 
+def holds_central_role(user) -> bool:
+    """True when ``user`` holds the central (steward) account role: role
+    'central', or the is_admin flag UserService.set_user_role keeps in step
+    with it.  The ONE check require_central applies, and the one
+    voting_rules.is_steward builds on; None is never central."""
+    if user is None:
+        return False
+    return ((getattr(user, 'role', None) or 'flat') == 'central'
+            or bool(getattr(user, 'is_admin', False)))
+
+
 def require_central(f):
     """Decorator: requires central (cloud admin) role."""
     @wraps(f)
     @require_auth
     def decorated(*args, **kwargs):
-        user_role = getattr(g.user, 'role', None) or 'flat'
-        if user_role != 'central' and not g.user.is_admin:
+        if not holds_central_role(g.user):
             return jsonify({'success': False, 'error': 'Central access required'}), 403
         return f(*args, **kwargs)
     return decorated

@@ -57,6 +57,10 @@ For new callers: use `run_bounded()` from this module for any
 external-tool probe where the child can block on init.  Do NOT add
 fresh `subprocess.run(..., capture_output=True, text=True, timeout=N)`
 sites — they reintroduce the reader-thread orphan.
+
+For a blocking call INSIDE this process (no child to kill), use
+`call_bounded()`: it frees the caller after the wait and leaves the call
+to finish on a daemon worker.
 """
 from __future__ import annotations
 
@@ -194,6 +198,49 @@ def run_bounded(
         return BoundedResult(
             returncode=-1, stdout="", stderr="", timed_out=True,
         )
+
+
+def call_bounded(fn, wait: float, *, name: str = "hart-bounded-call"):
+    """Run ``fn()`` on a daemon worker; wait at most ``wait`` seconds for it.
+
+    THE ONE bounded wait for a blocking IN-PROCESS call -- the case
+    ``run_bounded`` cannot reach because there is no child process to kill:
+    ``os.startfile`` (ShellExecute), a D-Bus round trip, a library call that
+    never returns.  Nothing can stop such a call from outside, so this frees
+    the CALLER instead: the worker is left to finish on its own (it is a
+    daemon, so it never holds the process open).
+
+    Returns ``(finished, value, error)``:
+      * ``(True, value, None)``  -- ``fn`` returned ``value`` within ``wait``;
+      * ``(True, None, exc)``    -- ``fn`` raised ``exc`` within ``wait``.  It
+        is handed back, never swallowed: the caller decides what it means;
+      * ``(False, None, None)``  -- still running after ``wait``.
+
+    A ``wait`` of 0 or less waits not at all.  Callers that must not START
+    work once the budget is gone check that before calling (starting a call
+    and then abandoning it is still starting it).
+
+    Callers: integrations/vlm/local_loop.py (one computer-use action),
+    integrations/agent_engine/os_bridge/logind.py (native D-Bus call),
+    integrations/agent_engine/shell_system_apis.py (_run_async_bounded).
+    Those last two each carried a private copy of this worker+Event shape
+    until 2026-09-27.
+    """
+    holder = {}
+    done = threading.Event()
+
+    def _worker():
+        try:
+            holder["value"] = fn()
+        except Exception as e:  # handed back to the caller, not swallowed
+            holder["error"] = e
+        finally:
+            done.set()
+
+    threading.Thread(target=_worker, name=name, daemon=True).start()
+    if not done.wait(max(0.0, float(wait))):
+        return False, None, None
+    return True, holder.get("value"), holder.get("error")
 
 
 # Where a NixOS node keeps the tools a login shell can see. A systemd unit's
@@ -429,5 +476,5 @@ def _safe_kill_and_close(
         pass
 
 
-__all__ = ["BoundedResult", "run_bounded", "run_probe",
+__all__ = ["BoundedResult", "run_bounded", "run_probe", "call_bounded",
            "no_window_kwargs", "hidden_popen_kwargs"]

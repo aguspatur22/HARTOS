@@ -1110,6 +1110,47 @@ def _quote_overflowing_numbers(text):
     return ''.join(out)
 
 
+# The two keys of a refused call's stand-in arguments (see
+# refused_arguments_json).  Names no tool takes, so a stand-in that is ever
+# executed is refused by the signature check as unknown arguments.
+REFUSED_ARGUMENTS_KEY = 'refused_arguments'
+REFUSED_BECAUSE_KEY = 'refused_because'
+
+
+def refused_arguments_reason(text):
+    """Why ``text`` cannot be sent as a call's arguments, in one sentence."""
+    try:
+        value = load_wire_json(text)
+    except ValueError as e:
+        if 'keys collide' in str(e):
+            return ('two of its keys differ only in an invalid character and '
+                    'would become one key')
+        return 'it is not valid JSON'
+    except Exception:
+        return 'it is not valid JSON'
+    if not isinstance(value, dict):
+        return 'it is not one JSON object of named values'
+    return 'it holds a value a strict JSON parser refuses'
+
+
+def refused_arguments_json(text):
+    """A strict JSON object standing in for arguments that cannot be sent:
+    the text the model wrote, marked refused, and why.
+
+    The wire needs an object (llama.cpp 500s on anything else), but ``{}``
+    erased what the model sent, so its next turn could neither see nor fix
+    its own call (review of 86e580b99).  A lone surrogate in the text becomes
+    U+FFFD, the one change needed for llama.cpp to accept it."""
+    shown = _LONE_SURROGATE.sub(chr(0xFFFD), text)
+    return json.dumps({
+        REFUSED_ARGUMENTS_KEY: shown,
+        REFUSED_BECAUSE_KEY: ('these arguments were refused and the call was '
+                              'not run: ' + refused_arguments_reason(text)
+                              + '. Call it again with one JSON object of '
+                              'named values.'),
+    })
+
+
 def ensure_tool_call_arguments_json(messages):
     """Coerce every tool_call / function_call ``arguments`` field to a valid
     JSON-object string, in place, and return the same list.
@@ -1138,10 +1179,12 @@ def ensure_tool_call_arguments_json(messages):
     parse it, or its ``repair_json`` repair, with ``load_wire_json``, which
     keeps each refused number as its own string and turns a lone surrogate
     into U+FFFD (refusing, rather than merging, two keys that replacement
-    would make one), and keep the result only if it is a dict; else fall back to
-    ``"{}"`` — a well-formed empty-args call.  The executor then reports a
-    missing argument and the model re-steers, which is strictly better than
-    a 500 that aborts the entire turn.
+    would make one), and keep the result only if it is a dict; else replace
+    it with :func:`refused_arguments_json` -- a well-formed object that keeps
+    what the model wrote, marked refused, with the reason, so its next turn
+    can see and correct its own call (it used to be ``"{}"``, which erased
+    it: review of 86e580b99).  ``None`` arguments, where nothing was written,
+    still become ``"{}"``.
     """
     if not messages:
         return messages
@@ -1184,7 +1227,7 @@ def ensure_tool_call_arguments_json(messages):
                 # so a prior call with '[{"url": ...}]' rendered with no
                 # parameters at all (measured on :8080, review of b0fa4989e).
                 continue
-            fixed = '{}'
+            fixed = refused_arguments_json(args)
             # The original text first; before repair, each overflowing
             # number is quoted, since repair_json itself would turn it into
             # Infinity and lose the token.
