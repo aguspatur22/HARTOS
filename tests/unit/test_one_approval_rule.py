@@ -164,6 +164,28 @@ def test_the_default_context_still_approves_at_two_thirds(db):
     assert goals == 1
 
 
+TUNING = ('Tune the retry timeout', 'A longer retry timeout cuts polling')
+
+
+@pytest.mark.parametrize('context, values', [
+    (DEFAULT, [2, 2, 2, -1, -1]),   # 3/5 = 0.6: over 0.5, under 2/3
+    (TUNING, [2, 2, -1, -1]),       # 2/4 = 0.5: over 0.3, under 2/3
+])
+def test_a_low_context_threshold_never_lowers_the_two_thirds_floor(
+        db, context, values):
+    """A context may raise the bar (security 0.8), never lower it below the
+    owner's 2/3: technical_improvement says 0.5 and operational_tuning 0.3."""
+    e = _experiment(db, context)
+    if context is TUNING:
+        assert ThoughtExperimentService.tally_votes(
+            db, e.id)['decision_context'] == 'operational_tuning'
+    _votes(db, e.id, values)
+    result, goals = _evaluate(db, e)
+    assert result['success'] is False
+    assert result['verdict']['reason'] == 'below_threshold'
+    assert goals == 0
+
+
 def test_one_voter_never_approves_whatever_the_context(db):
     e = _experiment(db, DEFAULT)
     _votes(db, e.id, [2], steward=2)
