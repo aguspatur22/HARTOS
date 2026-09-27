@@ -8355,8 +8355,10 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                 parsed['prompt_id'] = prompt_id
                 parsed['creator_user_id'] = user_id
                 try:
+                    from core.prompt_files import proposed_plan_filename
                     _plan_path = os.path.join(
-                        PROMPTS_DIR, f'{prompt_id}.proposed.r{review_rounds}.json')
+                        PROMPTS_DIR,
+                        proposed_plan_filename(prompt_id, review_rounds))
                     os.makedirs(os.path.dirname(_plan_path), exist_ok=True)
                     with open(_plan_path, 'w') as f:
                         json.dump(parsed, f)
@@ -8427,8 +8429,9 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                 # feedback) can refine; surface it to the peer reviewer.
                 parsed['prompt_id'] = prompt_id
                 parsed['creator_user_id'] = user_id
+                from core.prompt_files import proposed_plan_filename
                 _plan_path = os.path.join(
-                    PROMPTS_DIR, f'{prompt_id}.proposed.json')
+                    PROMPTS_DIR, proposed_plan_filename(prompt_id))
                 try:
                     os.makedirs(os.path.dirname(_plan_path), exist_ok=True)
                     with open(_plan_path, 'w') as f:
@@ -11481,41 +11484,37 @@ def get_prompts():
 
     prompts = []
 
-    # 1. Read from local prompts/*.json files
-    if os.path.isdir(PROMPTS_DIR):
-        for fname in os.listdir(PROMPTS_DIR):
-            if fname.endswith('.json') and '_' not in fname:
-                try:
-                    fpath = os.path.join(PROMPTS_DIR, fname)
-                    with open(fpath, 'r') as f:
-                        data = json.load(f)
-                    pid = fname.replace('.json', '')
-                    creator = str(data.get('creator_user_id', ''))
-                    if creator == str(req_user_id) or not creator:
-                        prompts.append({
-                            'prompt_id': pid,
-                            'name': data.get('name', ''),
-                            'prompt': data.get('goal', ''),
-                            'agent_name': data.get('agent_name', ''),
-                            'is_active': data.get('status', '') == 'completed',
-                            'user_id': creator or req_user_id,
-                            'has_recipe': os.path.exists(
-                                os.path.join(PROMPTS_DIR, f'{pid}_0_recipe.json')),
-                            'flow_count': len(data.get('flows', [])),
-                            'source': 'local',
-                            # Media passthrough — /prompts/public already
-                            # exposes image_url; the user-scoped list dropped
-                            # it, so /local agents rendered an empty video
-                            # column (no idle fallback portrait). fillers is
-                            # future-proofing: local agents have none today
-                            # (cloud-agent feature), but if cloud-sync ever
-                            # writes them locally, idle videos light up with
-                            # no further code change.
-                            'image_url': data.get('image_url', ''),
-                            'fillers': data.get('fillers') or [],
-                        })
-                except Exception:
-                    continue
+    # 1. Local agent records (core.prompt_files: agents only, never the plans
+    # the CREATE path stages beside them for review)
+    from core.prompt_files import local_agent_prompts
+    for pid, data in local_agent_prompts(PROMPTS_DIR):
+        try:
+            creator = str(data.get('creator_user_id', ''))
+            if creator == str(req_user_id) or not creator:
+                prompts.append({
+                    'prompt_id': pid,
+                    'name': data.get('name', ''),
+                    'prompt': data.get('goal', ''),
+                    'agent_name': data.get('agent_name', ''),
+                    'is_active': data.get('status', '') == 'completed',
+                    'user_id': creator or req_user_id,
+                    'has_recipe': os.path.exists(
+                        os.path.join(PROMPTS_DIR, f'{pid}_0_recipe.json')),
+                    'flow_count': len(data.get('flows', [])),
+                    'source': 'local',
+                    # Media passthrough — /prompts/public already
+                    # exposes image_url; the user-scoped list dropped
+                    # it, so /local agents rendered an empty video
+                    # column (no idle fallback portrait). fillers is
+                    # future-proofing: local agents have none today
+                    # (cloud-agent feature), but if cloud-sync ever
+                    # writes them locally, idle videos light up with
+                    # no further code change.
+                    'image_url': data.get('image_url', ''),
+                    'fillers': data.get('fillers') or [],
+                })
+        except Exception as e:
+            app.logger.debug(f'/prompts: skipped local agent {pid}: {e}')
 
     # 2. Merge in cloud-only agents the user owns on hevolve.ai —
     # the local store doesn't know about agents the user created from
@@ -11538,33 +11537,29 @@ def get_public_prompts():
     Equivalent to the legacy /getprompt_all/ cloud endpoint."""
     prompts = []
 
-    # 1. Read ALL prompts from local files (no user filter)
-    if os.path.isdir(PROMPTS_DIR):
-        for fname in os.listdir(PROMPTS_DIR):
-            if fname.endswith('.json') and '_' not in fname:
-                try:
-                    fpath = os.path.join(PROMPTS_DIR, fname)
-                    with open(fpath, 'r') as f:
-                        data = json.load(f)
-                    pid = fname.replace('.json', '')
-                    prompts.append({
-                        'prompt_id': pid,
-                        'name': data.get('name', ''),
-                        'prompt': data.get('goal', ''),
-                        'agent_name': data.get('agent_name', ''),
-                        'is_active': data.get('status', '') == 'completed',
-                        'is_public': True,
-                        'user_id': data.get('creator_user_id', ''),
-                        'teacher_image_url': data.get('teacher_image_url', ''),
-                        'image_url': data.get('image_url', ''),
-                        'video_text': data.get('video_text', ''),
-                        'has_recipe': os.path.exists(
-                            os.path.join(PROMPTS_DIR, f'{pid}_0_recipe.json')),
-                        'flow_count': len(data.get('flows', [])),
-                        'source': 'local',
-                    })
-                except Exception:
-                    continue
+    # 1. ALL local agent records, no user filter (core.prompt_files: agents
+    # only, never the plans the CREATE path stages beside them for review)
+    from core.prompt_files import local_agent_prompts
+    for pid, data in local_agent_prompts(PROMPTS_DIR):
+        try:
+            prompts.append({
+                'prompt_id': pid,
+                'name': data.get('name', ''),
+                'prompt': data.get('goal', ''),
+                'agent_name': data.get('agent_name', ''),
+                'is_active': data.get('status', '') == 'completed',
+                'is_public': True,
+                'user_id': data.get('creator_user_id', ''),
+                'teacher_image_url': data.get('teacher_image_url', ''),
+                'image_url': data.get('image_url', ''),
+                'video_text': data.get('video_text', ''),
+                'has_recipe': os.path.exists(
+                    os.path.join(PROMPTS_DIR, f'{pid}_0_recipe.json')),
+                'flow_count': len(data.get('flows', [])),
+                'source': 'local',
+            })
+        except Exception as e:
+            app.logger.debug(f'/prompts/public: skipped local agent {pid}: {e}')
 
     # 2. Merge in cloud-only public agents.  Same central-vs-local-DB_URL
     # rationale as /prompts above — DB_URL is localhost in bundled mode
