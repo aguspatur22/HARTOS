@@ -260,13 +260,27 @@ def admitted_peers(limit: int = 8) -> List[Dict[str, str]]:
     Same selection filter the integrity/gradient services use: active,
     not banned, not self. Rows only enter this table through the
     gossip admission gate (guardrail_hash + Ed25519), so presence here
-    IS the trust rail. Returns [] on any failure (logged)."""
+    IS the trust rail. Returns [] on any failure (logged).
+
+    One entry per url: several rows can share an address (a node that
+    re-keyed, one-shot identities behind one host; 106 such urls on the
+    owner's desktop, 2026-09-26), and the node answering there is one node.
+    The row kept is the one _admitted_query ranks first for that url, so a
+    caller that invokes the matched peer signs for that node_id."""
     try:
         from integrations.social.models import db_session
         with db_session(commit=False) as db:
-            rows = _admitted_query(db).limit(limit).all()
-            return [{'node_id': r.node_id, 'url': r.url}
-                    for r in rows if r.url]
+            out, seen = [], set()
+            # Bounded over-fetch so duplicates cannot starve the limit.
+            for r in _admitted_query(db).limit(max(limit, 1) * 8).all():
+                key = (r.url or '').rstrip('/')
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                out.append({'node_id': r.node_id, 'url': r.url})
+                if len(out) >= limit:
+                    break
+            return out
     except Exception as e:
         logger.info(f'peer_reuse: peer store unavailable: {e}')
         return []
@@ -274,7 +288,13 @@ def admitted_peers(limit: int = 8) -> List[Dict[str, str]]:
 
 def _admitted_query(db):
     """The admitted-peer filter (active, not banned, not self) as a query,
-    so a lookup of ONE peer applies the same rule as the list."""
+    so a lookup of ONE peer applies the same rule as the list.
+
+    Ordered: rows this node VERIFIED first (the identity that answered this
+    node's integrity challenge, signed by its key, at that address), then
+    the most recently seen.  last_seen alone is a guess: a one-shot identity
+    that announced from the same address a minute ago outranks the real
+    node, and the peer refuses a request signed for it."""
     from integrations.social.models import PeerNode
     self_id = None
     try:
@@ -282,13 +302,16 @@ def _admitted_query(db):
         self_id = getattr(gossip, 'node_id', None)
     except Exception as e:
         logger.debug(f'peer_reuse: gossip node_id unavailable: {e}')
+    from sqlalchemy import case
     q = db.query(PeerNode).filter(
         PeerNode.status == 'active',
         PeerNode.integrity_status != 'banned',
     )
     if self_id:
         q = q.filter(PeerNode.node_id != self_id)
-    return q
+    return q.order_by(
+        case((PeerNode.integrity_status == 'verified', 0), else_=1),
+        PeerNode.last_seen.desc())
 
 
 # ─── Discovery ───────────────────────────────────────────────────────
@@ -379,6 +402,17 @@ def discover_peer_agent(
     _match_entry. Returns (peer_url, entry) or None. Bounded: per-peer
     timeout + optional monotonic *deadline* across the sweep. Every
     failure is logged and skipped; never raises."""
+    found = _discover_peer(identity, peers, timeout, deadline)
+    if not found:
+        return None
+    peer, entry = found
+    return (peer.get('url') or '').rstrip('/'), entry
+
+
+def _discover_peer(identity, peers=None, timeout=_DIRECTORY_TIMEOUT_S,
+                   deadline=None):
+    """discover_peer_agent, returning the PEER it matched (node_id + url)
+    instead of its url, so the invoke can be signed for that node."""
     if peers is None:
         peers = admitted_peers()
     for peer in peers:
@@ -404,7 +438,7 @@ def discover_peer_agent(
             logger.info(
                 f"peer_reuse: matched agent {entry.get('agent_id')} "
                 f"on {url} (slug={identity.get('goal_slug') or '-'})")
-            return url, entry
+            return peer, entry
     return None
 
 
@@ -416,17 +450,16 @@ def _peer_node_id_for(peer_url: str) -> str:
     want = (peer_url or '').rstrip('/')
     if not want:
         return ''
-    # One lookup by url in SQL, not a scan of the first 1000 admitted rows
-    # (a store past 1000 rows never found a peer beyond them, and the scan
-    # loaded every row to sign one request).  Several identities can share
-    # a url (a node that re-keyed, one-shot identities behind one address):
-    # the one heard from most recently is the node answering there now.
+    # The LAST RESORT: a caller that matched a peer passes its node_id
+    # (try_peer_recipe_reuse).  One lookup by url in SQL, not a scan of the
+    # first 1000 admitted rows.  Several identities can share a url; the
+    # row _admitted_query ranks first (verified, then most recent) is the
+    # one signed for.
     try:
         from integrations.social.models import db_session, PeerNode
         with db_session(commit=False) as db:
             row = (_admitted_query(db)
                    .filter(PeerNode.url.in_([want, want + '/']))
-                   .order_by(PeerNode.last_seen.desc())
                    .first())
             return (row.node_id or '') if row else ''
     except Exception as e:
@@ -865,10 +898,11 @@ def try_peer_recipe_reuse(identity: Dict[str, str], local_prompt_id: str,
         logger.debug('peer_reuse: no admitted peers')
         return None
 
-    found = discover_peer_agent(identity, peers, deadline=deadline)
+    found = _discover_peer(identity, peers, deadline=deadline)
     if not found:
         return None
-    peer_url, entry = found
+    peer, entry = found
+    peer_url = (peer.get('url') or '').rstrip('/')
     agent_id = entry.get('agent_id') or ''
     if not agent_id:
         logger.info(f'peer_reuse: matched entry on {peer_url} has no '
@@ -891,9 +925,11 @@ def try_peer_recipe_reuse(identity: Dict[str, str], local_prompt_id: str,
     if not prompt_text:
         logger.info('peer_reuse: no prompt text for remote invoke')
         return None
+    # Signed for the node this sweep matched, not a guess from the url.
     result = invoke_peer_agent(
         peer_url, agent_id, prompt_text,
-        timeout=min(_INVOKE_TIMEOUT_S, remaining))
+        timeout=min(_INVOKE_TIMEOUT_S, remaining),
+        peer_node_id=peer.get('node_id') or None)
     if not result or result.get('state') != 'completed':
         if result:
             logger.info(

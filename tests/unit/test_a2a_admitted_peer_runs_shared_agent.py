@@ -272,6 +272,80 @@ def test_two_identities_at_one_url_sign_for_the_one_heard_from_last(
     assert _audience_of_invoke()[0] == 'livetest-old-identity'
 
 
+def _stale_identities_at_the_peer_url(n=4):
+    """What the owner's desktop holds (2026-09-26): 106 active urls with more
+    than one row; at http://192.168.0.9:6777 four older node_ids sit beside
+    230c3115, the node that answers there.  Here they are UNVERIFIED and seen
+    MORE recently than the real node (a one-shot identity that announced from
+    that address a minute ago), which is what makes a last_seen guess wrong."""
+    later = datetime.utcnow() + timedelta(minutes=1)
+    with db_session() as db:
+        for i in range(n):
+            db.add(PeerNode(node_id=f'livetest-stale-{i}', url=PEER_URL,
+                            status='active', public_key=_other_key(),
+                            integrity_status='unverified', last_seen=later))
+
+
+def test_reuse_signs_for_the_peer_it_matched_not_a_guess_by_url(
+        node, invoker, monkeypatch):
+    """try_peer_recipe_reuse already holds the peer it matched: that node_id
+    is the audience.  Driven through the REAL admitted_peers, discovery,
+    invoker and serving gate; the directory and the refused recipe export
+    are the only simulated responses."""
+    _admit(invoker.node_id, invoker.public_key)
+    _stale_identities_at_the_peer_url()
+    ident = {'goal_slug': f'livetest-slug-{uuid.uuid4().hex[:6]}',
+             'goal_title': 'collect metrics', 'goal_type': 'ops'}
+
+    class _Get:
+        def __init__(self, code, body):
+            self.status_code, self._body = code, body
+
+        def json(self):
+            return self._body
+
+    def get(url, timeout=None, **kw):
+        if url == f'{PEER_URL}/a2a/agents':
+            return _Get(200, {'agents': [{
+                'agent_id': AGENT, 'status': 'completed', 'flow_id': 0,
+                'goal_slug': ident['goal_slug']}]})
+        if url.endswith('/recipe'):
+            return _Get(403, {'error': 'export_refused'})
+        return _Get(404, {})
+    monkeypatch.setattr(peer_reuse, 'pooled_get', get)
+    monkeypatch.setattr(peer_reuse, '_record_remote_outcome',
+                        lambda *a, **k: None)
+    # The url lookup is the last resort: with a matched peer in hand it must
+    # not decide the audience (the store can change between the sweep and
+    # the invoke).  Were it consulted, this answer would be refused.
+    monkeypatch.setattr(peer_reuse, '_peer_node_id_for',
+                        lambda url: 'livetest-stale-0')
+    verdict = peer_reuse.try_peer_recipe_reuse(
+        ident, f'livetest-{uuid.uuid4().hex[:8]}',
+        deadline=time.monotonic() + 30)
+    assert verdict == 'invoked', node.seen
+    assert node.ran == ['collect metrics']
+
+
+def test_the_url_fallback_prefers_the_verified_row(node, invoker):
+    """The last resort (no node_id in hand): of the rows at the url, the one
+    this node VERIFIED is the node that answered its challenge there."""
+    _admit(invoker.node_id, invoker.public_key)
+    _stale_identities_at_the_peer_url()
+    assert _audience_of_invoke()[0] == SERVER_ID
+
+
+def test_discovery_sweeps_each_url_once(node, invoker, monkeypatch):
+    """Five rows at one url are one peer: the sweep (8 peers per tick) must
+    not spend five of its slots asking the same directory."""
+    _admit(invoker.node_id, invoker.public_key)
+    _stale_identities_at_the_peer_url()
+    urls = [p['url'] for p in peer_reuse.admitted_peers()]
+    assert urls.count(PEER_URL) == 1, urls
+    assert {p['node_id'] for p in peer_reuse.admitted_peers()
+            if p['url'] == PEER_URL} == {SERVER_ID}
+
+
 def test_a_banned_row_at_the_url_is_not_the_audience(node, invoker):
     """Same admission filter as admitted_peers: a banned row is skipped."""
     _admit(invoker.node_id, invoker.public_key)
