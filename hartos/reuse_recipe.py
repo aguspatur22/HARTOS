@@ -647,6 +647,31 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
     return f'Message sent successfully to user with request_id: {original_request_id}'
 
 
+def _reuse_speaker_says_to_user(user_id, message, prompt_id):
+    """Send a group member's mid-round message2userfinal to the user, but
+    only when it IS something the user can read.
+
+    The three speaker selectors (state_transition and the timer and visual
+    groups' state_transition1/2) see every message and used to send any
+    message2userfinal they found.  That included the StatusVerifier's own
+    verdict carrying the key and an unfilled '<your answer here>' template,
+    which on the desktop land in the user's chat (review of 31ea54045).
+    The question "is this for the user?" already has one answer,
+    _reuse_message_is_user_answer; this asks it first.  Returns whether it
+    sent."""
+    if not _reuse_message_is_user_answer(message):
+        _ctx_safe_log(
+            'info',
+            f"not sending a message2userfinal from "
+            f"{(message or {}).get('name') or '?'}: not an answer for the user")
+        return False
+    json_obj = retrieve_json((message or {}).get('content') or '')
+    if not isinstance(json_obj, dict) or 'message2userfinal' not in json_obj:
+        return False
+    send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
+    return True
+
+
 def _reuse_answer_off_box(user_id, answer, prompt_id):
     """The off-box leg for a /chat turn's finished answer, which the caller
     RETURNS: the return value IS the reply.
@@ -3161,7 +3186,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                     json_obj = retrieve_json(messages[-1]["content"])
                     if json_obj:
                         try:
-                            send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
+                            _reuse_speaker_says_to_user(user_id, messages[-1], prompt_id)
                         except Exception as e:
                             current_app.logger.error(f'Error sending message to user: {e}')
 
@@ -3244,7 +3269,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             if json_obj:
                 try:
                     current_app.logger.info('Sending user the message')
-                    send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
+                    _reuse_speaker_says_to_user(user_id, messages[-1], prompt_id)
                 except Exception:
                     pass
                 return verify1 if last_speaker is time_agent else time_agent
@@ -3285,7 +3310,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             if json_obj:
                 try:
                     current_app.logger.info('Sending user the message')
-                    send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
+                    _reuse_speaker_says_to_user(user_id, messages[-1], prompt_id)
                 except Exception:
                     pass
 

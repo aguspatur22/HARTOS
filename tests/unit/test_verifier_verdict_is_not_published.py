@@ -74,10 +74,16 @@ def test_source_guard_selectors_send_only_through_the_gate(rr):
                  if isinstance(n, ast.FunctionDef)
                  and n.name in ('state_transition', 'state_transition1',
                                 'state_transition2')]
-    assert sorted(n.name for n in selectors) == [
-        'state_transition', 'state_transition1', 'state_transition2']
+    # The role-group selector (create_agents_for_role) is a fourth; it
+    # reads no message2userfinal and sends nothing.
+    assert {n.name for n in selectors} == {
+        'state_transition', 'state_transition1', 'state_transition2'}
+    reading = 0
     for fn in selectors:
         calls = [c.func.id for c in ast.walk(fn) if isinstance(c, ast.Call)
                  and isinstance(c.func, ast.Name)]
-        assert '_reuse_speaker_says_to_user' in calls, fn.name
-        assert 'send_message_to_user1' not in calls, fn.name
+        assert 'send_message_to_user1' not in calls, (fn.name, fn.lineno)
+        if 'message2userfinal' in ast.unparse(fn):
+            reading += 1
+            assert '_reuse_speaker_says_to_user' in calls, (fn.name, fn.lineno)
+    assert reading == 3, reading
