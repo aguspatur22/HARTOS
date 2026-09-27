@@ -235,6 +235,23 @@ DELIVERABLE = frozenset({
 })
 
 
+#: security.secrets_manager.NODE_SECRET_KEYS, copied here so is_node_secret
+#: needs no import of the security package (1 to 2 s on Nunba's boot).
+#: GENERATED as well; the test checks it equals the source.
+NODE_SECRETS = frozenset({
+    'DATABASE_URL',
+    'REDIS_URL',
+    'SOCIAL_DB_KEY',
+    'SOCIAL_SECRET_KEY',
+})
+
+
+def collect_node() -> frozenset:
+    """The node secrets, from their source (security.secrets_manager)."""
+    from security.secrets_manager import NODE_SECRET_KEYS
+    return frozenset(NODE_SECRET_KEYS)
+
+
 def collect() -> frozenset:
     """The deliverable names, by importing every declaring module."""
     import importlib
@@ -248,19 +265,19 @@ def collect() -> frozenset:
     return frozenset(names - set(NODE_SECRET_KEYS))
 
 
-def render(names, text) -> str:
-    """``text`` (this file) with DELIVERABLE set to ``names``."""
-    head, rest = text.split('DELIVERABLE = frozenset({\n', 1)
+def render(names, text, const='DELIVERABLE') -> str:
+    """``text`` (this file) with ``const`` set to ``names``."""
+    head, rest = text.split(const + ' = frozenset({\n', 1)
     tail = rest.split('})\n', 1)[1]
     body = ''.join(f"    '{n}',\n" for n in sorted(names))
-    return head + 'DELIVERABLE = frozenset({\n' + body + '})\n' + tail
+    return head + const + ' = frozenset({\n' + body + '})\n' + tail
 
 
 if __name__ == '__main__':
     with open(__file__, encoding='utf-8') as fh:
         current = fh.read()
     names = collect()
-    updated = render(names, current)
+    updated = render(collect_node(), render(names, current), 'NODE_SECRETS')
     with open(__file__, 'w', encoding='utf-8', newline='\n') as fh:
         fh.write(updated)
     print('wrote', os.path.relpath(__file__), len(names), 'names')

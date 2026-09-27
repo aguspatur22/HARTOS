@@ -576,10 +576,10 @@ def test_protocol_values_survive_and_person_values_do_not():
         'type': 'announce', 'node_id': '8f3a1c9e2b7d4f60', 'url': PEER_URL,
         'public_key': '3fa91234567890' + 'ab' * 25,
         'x25519_public': 'q2+/4155550199/Zx9yA=', 'address': '203.0.113.7:6777',
-        'lan_ip': '192.168.1.42', 'peers': ['http://198.51.100.9:6777'],
+        'lan_ip': '192.168.1.42', 'peer_urls': ['http://198.51.100.9:6777'],
         'hart_version': '2026.9.27.1', 'build': '1.4.0.12',
         'sig': 'MEUCIQ/4155550199/+x', 'nonce': '4155550199',
-        'hostname': 'msi-203-0-113-7', 'q': '10.1.2.3',
+        'hostname': 'msi-203-0-113-7',
         'vram_bytes': '8589934592', 'phone_like_count': '1234567890',
         'artifact': 'sha256:' + '12' * 32, 'date': '2026-09-27',
     }
@@ -588,12 +588,15 @@ def test_protocol_values_survive_and_person_values_do_not():
         'api_key': API_KEY, 'private_key': API_KEY,
         'contact_email': EMAIL, 'phone': '4155550199', 'mobile': 'call me',
         'note': PHONE, 'reply': f'my number is 4155550199 {EMAIL}',
+        # a bare ip in content is personal data (review of d89d50223 F1)
+        'q': '10.1.2.3',
         'author': {'name': 'a', 'email': EMAIL, 'voice_profile': 'v1'},
         # an identifier SUFFIX never exempts a contact or secret key
         'email_address': EMAIL, 'recovery_token_hash': API_KEY,
     })
     blob = json.dumps(person)
-    for raw in (API_KEY, EMAIL, PHONE, '4155550199', 'call me', 'v1'):
+    for raw in (API_KEY, EMAIL, PHONE, '4155550199', 'call me', 'v1',
+                '10.1.2.3'):
         assert raw not in blob, raw
     assert person['author'] == {'name': 'a'}
 
@@ -704,7 +707,8 @@ def test_identifier_keys_exempt_only_values_shaped_like_their_key():
         'version': 'call 4155550199', 'host': 'john@example.com',
         'status': 'jane@acme.io phone 4155550199',
         'reply_to_address': 'jane@acme.io',
-        'home_address': '221B Baker Street', 'address': '1 Main St, Springfield',
+        'home_address': '221B Baker Street, j@x.io',
+        'address': '1 Main St, Springfield',
     }
     blob = json.dumps(scrub_for_egress(raw))
     for v in ('jane@acme.io', 'john@example.com', '4155550199',

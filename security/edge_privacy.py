@@ -302,13 +302,15 @@ def scrub_text(text: str) -> str:
 
 
 def scrub_contact(text: str) -> str:
-    """A contact field's value (email, phone, a street address): its PII
-    redacted, and when no pattern recognises it, withheld whole -- it is a
-    person's either way."""
+    """A contact field's value (email, phone, a street address) is a
+    person's whole: it goes as the one placeholder its pattern names when
+    it is exactly one email / phone / ..., and withheld whole otherwise (a
+    street with an email in it keeps no street)."""
+    if not text:
+        return text
     dlp, redact_secrets = _redactors()
-    text, _ = redact_secrets(text)
-    redacted = dlp.redact(text)
-    if redacted != text or not text:
+    redacted = dlp.redact(redact_secrets(text)[0])
+    if _PLACEHOLDER.fullmatch(redacted):
         return redacted
     return '[CONTACT_REDACTED]'
 

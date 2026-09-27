@@ -549,8 +549,8 @@ def is_node_secret(name) -> bool:
     (security.secrets_manager.NODE_SECRET_KEYS): only the node's vault
     preload sets them; the consent card, /api/credentials/submit,
     /api/vault/store and hold_credential never do, held or not."""
-    from security.secrets_manager import NODE_SECRET_KEYS
-    return name in NODE_SECRET_KEYS
+    from hartos.env_secrets_manifest import NODE_SECRETS
+    return name in NODE_SECRETS
 
 
 # ── Module-level singleton (HARTOS convention) ─────────────────────

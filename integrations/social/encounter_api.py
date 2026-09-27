@@ -214,7 +214,8 @@ def _number(body: dict, key: str, default, *, whole: bool = True,
     if raw is None and nullable:
         return None, None
     kinds = (int,) if whole else (int, float)
-    if isinstance(raw, bool) or not isinstance(raw, kinds)             or not math.isfinite(raw):
+    if (isinstance(raw, bool) or not isinstance(raw, kinds)
+            or not math.isfinite(raw)):
         return None, (f'{key} must be a whole number' if whole
                       else f'{key} must be a number')
     return raw, None

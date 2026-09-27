@@ -260,6 +260,7 @@ def test_the_manifest_is_current():
     generated from the declarations; this fails when it is stale.
     Regenerate: python -m hartos.env_secrets_manifest"""
     from hartos import env_secrets_manifest as m
+    assert m.NODE_SECRETS == m.collect_node(), 'stale: run python -m hartos.env_secrets_manifest'
     assert m.DELIVERABLE == m.collect(), (
         'stale: run python -m hartos.env_secrets_manifest; '
         f'missing {sorted(m.collect() - m.DELIVERABLE)}, '
@@ -273,7 +274,8 @@ def test_reads_from_env_imports_no_adapter():
     code = ("import sys; sys.path.insert(0, '.')\n"
             "from hartos.ai_key_vault import reads_from_env\n"
             "reads_from_env('NEWS_API_KEY'); reads_from_env('TWITCH_CLIENT_SECRET')\n"
-            "bad = [m for m in sys.modules if m.startswith('integrations.channels')"
+            "from hartos.ai_key_vault import is_node_secret; is_node_secret('SOCIAL_DB_KEY')\n"
+            "bad = [m for m in sys.modules if m.startswith('integrations.channels') or m == 'security'"
             " or m == 'integrations.service_tools.gh_pr_tool']\n"
             "print(','.join(sorted(bad)))\n")
     out = subprocess.run([sys.executable, '-c', code], cwd=ROOT, capture_output=True,
