@@ -280,19 +280,29 @@ def _action_grace_s(action: str) -> float:
     return float(SHELL_COMMAND_TIMEOUT_S) if action == 'shell' else 0.0
 
 
+#: The status of an action the loop let go of while it still ran: it did not
+#: fail and did not succeed, and nobody can yet say which (review F2).  Every
+#: other action result says 'ok' / 'error' / 'blocked' / 'safety_blocked'.
+ACTION_STATUS_UNKNOWN = 'unknown'
+
+
 def _execute_within_budget(execute_action, action_payload, tier, *,
-                           safety, verify, remaining_s, cancel=None):
+                           safety, verify, remaining_s, grace_s=0.0,
+                           cancel=None):
     """Run one action, but never past the loop's remaining time budget.
 
-    Returns ``(outcome, result)``; ``result`` is the action's dict only for
-    ``'done'``:
+    Returns ``(outcome, result)``.  ``result`` is the action's own dict for
+    ``'done'``, ``{'output': '', 'status': ACTION_STATUS_UNKNOWN}`` for
+    ``'abandoned'`` and ``'stopped'``, and None for the rest:
 
       * ``'done'``        -- it returned in time;
       * ``'no_budget'``   -- nothing was left, so it was NOT started;
       * ``'busy'``        -- NOT started: an earlier action on the same target
                              is still running (see _abandoned_by_target);
-      * ``'abandoned'``   -- still running at the deadline (plus the action's
-                             own grace, _action_grace_s).  The caller is
+      * ``'abandoned'``   -- still running at the deadline plus ``grace_s``
+                             (the caller computes it once with
+                             _action_grace_s and says the same number to
+                             the model).  The caller is
                              released; the action finishes on its worker and
                              its result is unknown -- it may yet succeed;
       * ``'stopped'``     -- still running when ``cancel`` (the session's
@@ -328,7 +338,12 @@ def _execute_within_budget(execute_action, action_payload, tier, *,
             state['started'] = True
         try:
             thread_local_data.adopt(context)
-            return execute_action(action_payload, tier, safety=safety, verify=verify)
+            state['result'] = execute_action(
+                action_payload, tier, safety=safety, verify=verify)
+            return state['result']
+        except Exception as e:
+            state['error'] = e
+            raise
         finally:
             with _abandoned_lock:
                 state['done'] = True
@@ -340,8 +355,7 @@ def _execute_within_budget(execute_action, action_payload, tier, *,
                         _abandoned_by_target.pop(target, None)
 
     finished, result, error = call_bounded(
-        _act, remaining_s + _action_grace_s(action_payload.get('action')),
-        name='hart-vlm-action', cancel=cancel)
+        _act, remaining_s + grace_s, name='hart-vlm-action', cancel=cancel)
     if finished:
         if error is not None:
             raise error
@@ -350,14 +364,24 @@ def _execute_within_budget(execute_action, action_payload, tier, *,
     with _abandoned_lock:
         if not state['started']:
             return 'not_started', None
-        if not state['done']:
+        late = state['done']
+        if not late:
             state['abandoned'] = True
             _abandoned_by_target[target] = _abandoned_by_target.get(target, 0) + 1
         in_flight = sum(_abandoned_by_target.values())
+    if late:
+        # It finished between the wait giving up and this lock: its result
+        # is known, so report it, and its run stamp stays open (peer review
+        # 2026-09-27 -- this used to be reported abandoned and its stamp
+        # closed).
+        if state.get('error') is not None:
+            raise state['error']
+        return 'done', state.get('result')
     from integrations.vlm.activity_stream import close_run_stamp
     close_run_stamp(context.get('activity_run'))
     logger.warning(f"VLM loop: {in_flight} abandoned action(s) still running")
-    return ('stopped' if stopped else 'abandoned'), None
+    return (('stopped' if stopped else 'abandoned'),
+            {'output': '', 'status': ACTION_STATUS_UNKNOWN})
 
 
 def run_local_agentic_loop(
@@ -987,22 +1011,24 @@ def _drive_local_agentic_loop(
             # The ETA bounds the action in flight, not only the gap between
             # iterations -- see _execute_within_budget.
             _remaining = max_eta - (time.time() - start_time)
+            # Computed ONCE: the grace waited and the grace named to the
+            # model below are this one value.
+            _grace = _action_grace_s(next_action)
             _outcome, result = _execute_within_budget(
                 execute_action, action_payload, tier,
                 safety=_safety_on, verify=_verify_on, remaining_s=_remaining,
-                cancel=_stop_event)
+                grace_s=_grace, cancel=_stop_event)
             # Where this iteration ends the run, and why.  An action still
             # running when the loop lets go of it did not FAIL: nobody knows
             # what it did, and calling it a failure invites the caller to
             # repeat a step that may yet complete (review F2).
             _ends_run = None
             _why = ''
-            _unknown = _outcome in ('abandoned', 'stopped')
+            _unknown = (result or {}).get('status') == ACTION_STATUS_UNKNOWN
             if _outcome == 'abandoned':
-                _grace = _action_grace_s(next_action)
                 _why = (f"{next_action} still running when the time ran out "
                         f"({max_eta}s budget"
-                        + (f" + {_grace:.0f}s own cap" if _grace else '')
+                        + (f" + {_grace:g}s own cap" if _grace else '')
                         + "); result unknown - check its effect before "
                         "repeating it")
                 _ends_run = 'timeout'
@@ -1026,7 +1052,7 @@ def _drive_local_agentic_loop(
                 logger.warning(
                     f"VLM loop: {_why} (iteration {iteration + 1}, "
                     f"user={user_id}, prompt={prompt_id})")
-                result = ({'output': _why} if _unknown else
+                result = (dict(result, output=_why) if _unknown else
                           {'output': '', 'status': 'blocked', 'error': _why,
                            'block_reason': _why})
             # A result carrying an error did not happen on the machine: the

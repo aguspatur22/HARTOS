@@ -17,7 +17,8 @@ Adds:
   - Channel-specific key namespacing (discord + BOT_TOKEN → DISCORD_BOT_TOKEN)
   - Pending credential request tracking (what agents are waiting for)
   - Boot-time env preloading (config_cache.py contract)
-  - store_credential() that persists + injects into os.environ
+  - store_credential() that persists; os.environ only for a name the
+    process reads from it (reads_from_env)
   - is_local_request() gate for credential endpoints
 
 Usage:
@@ -93,9 +94,9 @@ class AIKeyVault:
         self._pending: Dict[str, PendingCredentialRequest] = {}
         self._lock = threading.Lock()
         self._sm = None  # Lazy — loaded on first use
-        # Names stored through store_credential this process.  With no
-        # HEVOLVE_MASTER_KEY the value lives only in os.environ, so the
-        # vault cache alone cannot say which env vars are user credentials.
+        # Names stored through store_credential this process: with no
+        # HEVOLVE_MASTER_KEY the value lives only in this process's vault
+        # cache, which cannot say which of its names the owner entered.
         self._stored: set = set()
         # Every credential value this process has known -> its name: each
         # value resolve_aliases handed a tool and each value mask_secrets
@@ -192,9 +193,9 @@ class AIKeyVault:
             try:
                 self._secrets_manager().set_secret(resolved, value)
             except RuntimeError:
-                # HEVOLVE_MASTER_KEY not set — env-only fallback
+                # HEVOLVE_MASTER_KEY not set: held in memory only
                 logger.warning(
-                    f"Vault unavailable, storing {resolved} in env only "
+                    f"Vault unavailable, holding {resolved} in memory only "
                     "(will not persist across restarts)"
                 )
 

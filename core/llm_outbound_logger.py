@@ -884,6 +884,10 @@ _elided_evict_lock = threading.Lock()
 _ELIDED_KINDS = {'tool': 'a tool result', 'user': 'a user turn',
                  'assistant': 'an assistant turn', 'system': 'the system prompt'}
 _ELIDED_LISTED_DROPS = 5        # dropped tool results named in the explanation
+# Pointers are sent only when the budget is at least this many times what
+# the explanation costs (~400 tokens today); below it the explanation
+# would crowd out the very text it points at, so plain markers go instead.
+_ELIDED_MIN_BUDGET_MULTIPLE = 4
 
 ELIDED_POINTER_EXPLANATION = (
     "\n\nSome messages below were shortened to fit. A mark like "
@@ -1634,7 +1638,7 @@ def _trim_to_budget(body: dict, _reserve: int = 0) -> tuple:
     _added = count_tokens_for_text(
         ELIDED_POINTER_EXPLANATION + ' Removed earlier: '
         + ' '.join(listed) + '.', model) if live else 0
-    if live and _added * 4 > full_budget:
+    if live and _added * _ELIDED_MIN_BUDGET_MULTIPLE > full_budget:
         # A budget this small cannot spare the explanation for the text it
         # needs: plain markers, as before pointers existed.
         live = {}

@@ -42,6 +42,12 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from integrations.vlm import local_loop  # noqa: E402
+# Imported HERE, before any test runs: _run_loop's patch.dict('sys.modules')
+# drops every module first imported inside it, after which `from
+# integrations.vlm import activity_stream` hands back the stale package
+# attribute while the loop re-imports a fresh copy -- so a test patching
+# activity_stream would patch a module the loop no longer uses.
+from integrations.vlm import activity_stream as act  # noqa: E402
 from integrations.vlm.local_loop import run_local_agentic_loop  # noqa: E402
 
 #: Budget given to the loop in these tests, seconds.
@@ -357,7 +363,6 @@ class TestALateStepCannotReopenTheRun:
     def test_nothing_reaches_the_owner_after_the_run_closed(self, tmp_path, monkeypatch):
         from agent_ledger import SmartLedger, TaskStatus
         from agent_ledger.backends import JSONBackend
-        from integrations.vlm import activity_stream as act
         from hartos.threadlocal import thread_local_data as tld
 
         monkeypatch.delenv('HEVOLVE_OWNER_USER_ID', raising=False)
@@ -439,3 +444,74 @@ class TestAFastActionIsUnchanged:
         assert result['exit_reason'] == 'action_error'
         assert result['extracted_responses'][0]['type'] == 'error'
         assert 'pyautogui exploded' in result['extracted_responses'][0]['content']
+
+
+class TestTheHelperDirectly:
+    """_execute_within_budget's own contract (peer review, 2026-09-27)."""
+
+    def test_an_action_that_finishes_just_after_the_deadline_is_done(self):
+        """It finished between call_bounded giving up and the loop taking
+        the lock: report its real result, and leave its run stamp open."""
+        from core import subprocess_safe
+        from hartos.threadlocal import thread_local_data as tld
+
+        def _late_finish(fn, wait, **_kw):
+            fn()                          # it completes...
+            return False, None, None      # ...just after the wait gave up
+
+        tld.set_activity_run('r-late', user_id='u', prompt_id='p')
+        try:
+            with patch.object(subprocess_safe, 'call_bounded', side_effect=_late_finish), \
+                    patch.object(act, 'close_run_stamp') as close:
+                outcome, result = local_loop._execute_within_budget(
+                    lambda a, t, **k: {'output': 'Opened'},
+                    {'action': 'open_file_gui', 'path': 'x.py'}, 'inprocess',
+                    safety=True, verify=False, remaining_s=1.0, grace_s=0.0)
+        finally:
+            tld.clear_activity_run()
+        assert (outcome, result) == ('done', {'output': 'Opened'})
+        close.assert_not_called()
+        assert local_loop.abandoned_actions_in_flight() == 0
+
+    def test_the_grace_it_applies_is_the_one_it_is_given(self):
+        """One grace, computed once by the loop and passed in, so the text
+        the model reads can never promise a grace that was not waited."""
+        def _slow(action, tier, **_kw):
+            _pause(0.9)
+            return {'output': 'Opened'}
+
+        outcome, result = local_loop._execute_within_budget(
+            _slow, {'action': 'open_file_gui', 'path': 'y.py'}, 'inprocess',
+            safety=True, verify=False, remaining_s=0.3, grace_s=2.0)
+        assert (outcome, result) == ('done', {'output': 'Opened'})
+
+    def test_an_unknown_result_says_so_in_its_status(self, stuck_tool):
+        outcome, result = local_loop._execute_within_budget(
+            stuck_tool, {'action': 'open_file_gui', 'path': 'z.py'}, 'inprocess',
+            safety=True, verify=False, remaining_s=0.3, grace_s=0.0)
+        assert outcome == 'abandoned'
+        assert result['status'] == local_loop.ACTION_STATUS_UNKNOWN
+        assert 'error' not in result          # not a failure either
+
+    def test_an_abandoned_workers_run_stamp_is_closed(self, stuck_tool):
+        """The worker's adopted stamp is marked, so a step it announces
+        between the abandonment and the loop's finish_run is refused too
+        (record_activity's closed-task check only covers after finish)."""
+        from hartos.threadlocal import thread_local_data as tld
+        seen = {}
+
+        def _stuck(action, tier, **kw):
+            seen['stamp'] = tld.get_activity_run()
+            return stuck_tool(action, tier, **kw)
+
+        tld.set_activity_run('r-stamp', user_id='u', prompt_id='p')
+        try:
+            outcome, _ = local_loop._execute_within_budget(
+                _stuck, {'action': 'open_file_gui', 'path': 's.py'}, 'inprocess',
+                safety=True, verify=False, remaining_s=0.3, grace_s=0.0)
+            assert outcome == 'abandoned'
+            assert seen['stamp'].get('closed') is True
+            # the loop's own stamp is its own copy, still open
+            assert not tld.get_activity_run().get('closed')
+        finally:
+            tld.clear_activity_run()

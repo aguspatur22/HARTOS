@@ -215,6 +215,10 @@ class StrictNumbers(unittest.TestCase):
             '{"q": x/*y, "id": 620e51403072992921}',
             "{'v': 1e999)}", "{'v': (1e999)}", "{'v': 1e999;}",
             "{\"v\": 1e999'}",
+            # json_repair's own number reader turns these into Infinity
+            # whatever the quoting does: refused, never sent.
+            '{"v": 1e999e}', '{"v": +1e999}', '{"v": 1e999+1}',
+            '{"v": 1e999-}',
         )
         for text in rows:
             with self.subTest(text=text):
