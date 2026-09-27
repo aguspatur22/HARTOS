@@ -624,6 +624,7 @@ class GPUWorker:
                 f"the appropriate _<X>_deps tuple) AND to "
                 f"tts/package_installer.py legacy fallback "
                 f"plan so the next build bundles it.",
+                failed_step='pip_install',
             )
 
         threading.Thread(
@@ -710,37 +711,52 @@ class GPUWorker:
                     category='subprocess.tool_load',
                     context={'backend': self.name, 'missing_package': pkg},
                 )
-                logger.info(f"{self.name}: setup offer: {outcome}")
             except Exception as e:
-                # The once-flag is already set, so this worker never offers
-                # again: tell the owner through the goal instead of falling
-                # back to another voice in silence.  No 'backend' in its
-                # context: that would route to repair_backend_venv and
-                # install the engine without the owner's yes.
-                logger.error(
-                    f"{self.name}: setup could not be offered: "
-                    f"{type(e).__name__}: {e}; raising the missing-package "
-                    f"goal instead")
-                self._raise_missing_package_goal(
+                self._setup_offer_failed(pkg, f"{type(e).__name__}: {e}")
+                return
+            if outcome == 'unavailable':
+                # request_capability_setup's return for "nobody could be
+                # asked" (no owner, consent unreachable): no card was filed.
+                self._setup_offer_failed(
                     pkg,
-                    f"The {self.name} engine is not installed (its worker ran "
-                    f"on {self.python_exe}, not its own venv, and cannot "
-                    f"import '{pkg}'), and offering its setup to the owner "
-                    f"failed: {type(e).__name__}: {e}. Do NOT pip '{pkg}' "
-                    f"into the shared site. Diagnose why "
-                    f"capability_setup.request_capability_setup failed so "
-                    f"the owner can be asked to set up tts:{self.name}.",
-                )
+                    "request_capability_setup returned 'unavailable' (no "
+                    "owner to ask, or consent could not be reached)")
+                return
+            # 'asked' (card filed), 'declined' (the owner said no; a goal
+            # would override that), 'provisioning' (the work is raised).
+            logger.info(f"{self.name}: setup offer: {outcome}")
 
         threading.Thread(
             target=_offer, daemon=True, name=f"setup-offer-{self.name}",
         ).start()
 
-    def _raise_missing_package_goal(self, pkg: str, hint: str) -> None:
+    def _setup_offer_failed(self, pkg: str, cause: str) -> None:
+        """The owner could not be offered the engine's setup.  The once-flag
+        is already set, so this worker never offers again: tell the owner
+        through the goal instead of falling back to another voice in
+        silence."""
+        logger.error(
+            f"{self.name}: setup could not be offered: {cause}; raising the "
+            f"missing-package goal instead")
+        self._raise_missing_package_goal(
+            pkg,
+            f"The {self.name} engine is not installed (its worker ran on "
+            f"{self.python_exe}, not its own venv, and cannot import "
+            f"'{pkg}'), and offering its setup to the owner failed: {cause}. "
+            f"Do NOT pip '{pkg}' into the shared site. Diagnose why "
+            f"capability_setup.request_capability_setup failed so the owner "
+            f"can be asked to set up tts:{self.name}.",
+            failed_step='setup_offer',
+        )
+
+    def _raise_missing_package_goal(self, pkg: str, hint: str, *,
+                                    failed_step: str) -> None:
         """Raise the agentic self-heal goal for a package this worker could
         not import (``core.error_advice``, throttled per failure shape).
-        The context names no ``backend``, so the goal's prompt takes the
-        missing-dependency route, never ``repair_backend_venv``."""
+        ``failed_step`` ('pip_install' / 'setup_offer') is what the goal's
+        prompt reads to say which step failed.  The context names no
+        ``backend``, so the prompt takes the missing-dependency route,
+        never ``repair_backend_venv`` (an install without the owner's yes)."""
         try:
             from core.error_advice import handle_exception
             synthetic = ModuleNotFoundError(f"No module named '{pkg}'")
@@ -754,6 +770,7 @@ class GPUWorker:
                     'worker_name': self.name,
                     'worker_module': self.module,
                     'missing_package': pkg,
+                    'failed_step': failed_step,
                     'remediation_hint': hint,
                 },
             )

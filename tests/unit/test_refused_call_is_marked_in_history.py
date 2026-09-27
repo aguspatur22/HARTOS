@@ -593,6 +593,62 @@ class KwargsToolsGetNoInventedKeys(_Chat):
         self.assertEqual(self.ran, [{'command': 'deploy', 'status': 'ok'}])
 
 
+class KwargsRefusalsNameTheRealFix(KwargsToolsGetNoInventedKeys):
+    """Review of 30042a2b6: an unquoted extra key on a **kwargs tool was
+    refused with "Expected parameters: command ... using these names",
+    which steers the model into dropping the key; a repair that emptied a
+    value the model wrote ran the tool with ''; and the quoted-key scan ran
+    once per extra key, even on strict JSON."""
+
+    def test_an_unquoted_extra_key_is_told_to_quote_it_not_to_drop_it(self):
+        reply = self.call('run_command', '{"command": "ls", cwd: "/tmp"}')
+        self.assertEqual(self.ran, [])
+        content = reply['content']
+        self.assertIn('every key', content)
+        self.assertIn('double quotes', content)
+        self.assertNotIn('using these names', content)
+        self.assertIn('also takes other named values', content)
+
+    def test_a_repair_that_empties_a_written_value_is_refused(self):
+        reply = self.call('run_command', '{"command": "ls", "cwd": /tmp}')
+        self.assertEqual(self.ran, [], reply['content'])
+        self.assertIn('cwd', reply['content'])
+
+    def test_an_empty_value_the_model_wrote_still_runs_after_a_repair(self):
+        self.call('run_command', '{"command": "ls", "cwd": "",}')
+        self.assertEqual(self.ran, [{'command': 'ls', 'cwd': ''}])
+
+    def test_strict_json_with_an_empty_value_runs(self):
+        self.call('run_command', '{"command": "ls", "cwd": ""}')
+        self.assertEqual(self.ran, [{'command': 'ls', 'cwd': ''}])
+
+
+class QuotedKeysAreReadOnce(unittest.TestCase):
+    """The quoted-key scan is a full read of the text: once per call after
+    a repair, never on strict JSON (review of 30042a2b6: 0.42 s on a 20-key
+    100 KB call, once per extra key)."""
+
+    def _count(self, arguments, repaired, as_written):
+        import hartos.helper as h
+
+        def run_command(command: str = '', **kwargs):
+            return 'done'
+        with mock.patch.object(h, '_quoted_top_level_keys',
+                               wraps=h._quoted_top_level_keys) as scan:
+            h.tool_argument_error(run_command, 'run_command', arguments,
+                                  repaired, as_written=as_written)
+        return scan.call_count
+
+    def test_strict_json_is_not_scanned(self):
+        args = {'command': 'ls', **{'k%d' % i: 'v' * 5000 for i in range(20)}}
+        self.assertEqual(self._count(args, False, json.dumps(args)), 0)
+
+    def test_a_repaired_call_is_scanned_once(self):
+        text = '{"command": "ls", a: "1", b: "2", c: "3"}'
+        args = {'command': 'ls', 'a': '1', 'b': '2', 'c': '3'}
+        self.assertEqual(self._count(args, True, text), 1)
+
+
 class QuotedTopLevelKeys(unittest.TestCase):
     """The keys the rule above credits: quoted, in the outermost object,
     followed by ':' -- never a nested key, a quoted value, or a bare word."""

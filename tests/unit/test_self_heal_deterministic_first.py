@@ -436,6 +436,95 @@ def test_an_offer_that_cannot_be_made_raises_the_missing_package_goal(
     assert ctx['worker_name'] == 'f5_tts'
     assert 'backend' not in ctx
     assert 'no capability_setup here' in ctx['remediation_hint']
+    assert ctx['failed_step'] == 'setup_offer'
     said = [r.getMessage() for r in caplog.records
             if r.levelno == logging.ERROR and 'could not be offered' in r.getMessage()]
     assert said and 'no capability_setup here' in said[0], said
+
+
+def _offer_returning(monkeypatch, outcome):
+    monkeypatch.setattr('core.venv_paths.venv_python_if_exists',
+                        lambda backend: None)
+    monkeypatch.setattr(gpu_worker.subprocess, 'run',
+                        MagicMock(side_effect=_fake_run(0)))
+    offer = MagicMock(return_value=outcome)
+    monkeypatch.setattr(
+        'integrations.agent_engine.capability_setup.request_capability_setup',
+        offer)
+    w = gpu_worker.GPUWorker(name='f5_tts',
+                             module='integrations.service_tools.gpu_worker')
+    monkeypatch.setattr(w, 'stop', MagicMock())
+    return w, offer
+
+
+def test_an_offer_nobody_could_be_asked_raises_the_goal(
+        monkeypatch, he_mock, caplog):
+    """request_capability_setup turns most failures (no owner set, consent
+    DB unreachable) into the return 'unavailable', not an exception.  That
+    is the same silent fallback as a raised offer, so it gets the same ERROR
+    and the same goal."""
+    w, offer = _offer_returning(monkeypatch, 'unavailable')
+
+    with caplog.at_level(logging.ERROR, logger=gpu_worker.logger.name):
+        w._maybe_self_heal_from_line(
+            "ModuleNotFoundError: No module named 'vocos'")
+
+    offer.assert_called_once()
+    he_mock.assert_called_once()
+    (exc,), kwargs = he_mock.call_args
+    assert exc.name == 'vocos'
+    ctx = kwargs['context']
+    assert ctx['missing_package'] == 'vocos'
+    assert ctx['failed_step'] == 'setup_offer'
+    assert 'backend' not in ctx
+    assert "'unavailable'" in ctx['remediation_hint']
+    said = [r.getMessage() for r in caplog.records
+            if r.levelno == logging.ERROR and 'could not be offered' in r.getMessage()]
+    assert said and "'unavailable'" in said[0], said
+
+
+@pytest.mark.parametrize('outcome', ['asked', 'declined', 'provisioning'])
+def test_an_offer_that_reached_the_owner_raises_no_goal(
+        monkeypatch, he_mock, outcome):
+    """The card is up, the owner said no, or the work is raised: nothing is
+    silent, and a goal after a 'declined' would override the owner's no."""
+    w, offer = _offer_returning(monkeypatch, outcome)
+
+    w._maybe_self_heal_from_line(
+        "ModuleNotFoundError: No module named 'vocos'")
+
+    offer.assert_called_once()
+    he_mock.assert_not_called()
+
+
+def test_the_pip_failed_goal_says_pip_was_the_step_that_failed(
+        monkeypatch, he_mock):
+    monkeypatch.setattr(gpu_worker.subprocess, 'run', _fake_run(1))
+    w = _make_worker()
+    monkeypatch.setattr(w, 'stop', MagicMock())
+
+    w._maybe_self_heal_from_line(_MODNOTFOUND_LINE)
+
+    assert he_mock.call_args[1]['context']['failed_step'] == 'pip_install'
+
+
+def test_prompt_for_a_failed_setup_offer_does_not_claim_a_pip_install():
+    p = _build_self_heal_prompt(_goal('subprocess.tool_load', {
+        'missing_package': 'vocos', 'failed_step': 'setup_offer'}))
+    assert 'vocos' in p
+    assert 'NOT a source-code bug' in p
+    assert 'pip install' not in p
+    assert 'was already attempted' not in p
+    assert 'capability_setup' in p
+    assert 'repair_backend_venv' not in p     # no install without the owner
+    assert 'Read the source file' not in p
+
+
+@pytest.mark.parametrize('ctx', [
+    {'missing_package': 'pyloudnorm', 'failed_step': 'pip_install'},
+    {'missing_package': 'pyloudnorm'},          # goals filed before the key
+])
+def test_prompt_for_a_failed_pip_install_still_says_so(ctx):
+    p = _build_self_heal_prompt(_goal('subprocess.tool_load', ctx))
+    assert '`pip install pyloudnorm` was already attempted' in p
+    assert 'capability_setup' not in p

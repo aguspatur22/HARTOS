@@ -1166,6 +1166,30 @@ def _quoted_top_level_keys(original):
     return keys
 
 
+def _written_blank_values(original):
+    """How many values the model wrote EMPTY in the outermost object of
+    ``original``: a quoted string of nothing but whitespace, or a bare
+    ``null``, right after a ``:`` at depth one.  Read with the one scanner
+    (_scan_segments).  A repair that leaves more empty values than this
+    emptied one the model wrote (``"cwd": /tmp`` -> ``"cwd": ""``, review
+    of 30042a2b6)."""
+    count, depth, after_colon = 0, 0, False
+    for kind, piece in _scan_segments(str(original)):
+        if kind == "char" and piece.isspace() or kind == "comment":
+            continue
+        if after_colon and depth == 1:
+            if kind == "string" and not piece[1:-1].strip():
+                count += 1
+            elif kind == "run" and piece == "null":
+                count += 1
+        after_colon = kind == "char" and piece == ":"
+        if kind == "char" and piece in "{[":
+            depth += 1
+        elif kind == "char" and piece in "}]":
+            depth -= 1
+    return count
+
+
 def _invents_a_constant(value, original):
     """True when ``value`` carries Infinity / NaN the model never wrote as a
     value: a float inf/nan (json.loads of an overflowing number -- the model
@@ -4418,14 +4442,21 @@ def tool_argument_error(func, func_name, arguments, repaired, as_written=None):
     repaired call that binds but leaves a required value empty (None, or a
     blank string json_repair filled in) is refused the same way.
 
-    ``as_written`` is the text the model wrote.  A call carrying a key that
-    the tool does not declare and the model did not write in quotes (only a
-    repair can make one) is refused the same way, whatever the signature: a
-    tool that takes **kwargs binds any name, so json_repair's split of an
-    unquoted value (``{"command": deploy the app, then report status: ok}`` ->
-    ``status``) used to run it with the value cut short (review of the
-    defect-14 fix; MCP tool_executor and service_tools endpoint_executor
-    keep a **kwargs signature when a tool has no schema).
+    ``as_written`` is the text the model wrote.  After a repair, a key that
+    the tool does not declare and the model did not write in quotes is
+    refused the same way, whatever the signature.  Such a key is either one
+    the model wrote bare (``cwd: "/tmp"``) or one json_repair split out of
+    an unquoted value (``{"command": deploy the app, then report status:
+    ok}`` -> ``status``); the two cannot be told apart, and a tool that
+    takes **kwargs binds any name, so the split used to run it with the
+    value cut short (review of the defect-14 fix; MCP tool_executor and
+    service_tools endpoint_executor keep a **kwargs signature when a tool
+    has no schema).  For such a tool the refusal asks for every key in
+    double quotes and does not present the declared names as the only ones
+    (review of 30042a2b6: that steered the model into dropping ``cwd``).
+    Strict JSON quotes every key, so it is not scanned.  After a repair, a
+    value left empty that the model did not write empty (``"cwd": /tmp``
+    -> ``""``) is refused like a required one (_written_blank_values).
     """
     import inspect
     if not isinstance(arguments, dict):
@@ -4469,6 +4500,14 @@ def tool_argument_error(func, func_name, arguments, repaired, as_written=None):
     emptied = ([p.name for p in params
                 if p.default is p.empty and blank(bound.get(p.name))]
                if repaired and bound is not None else [])
+    # Any value, required or not, that the repair emptied: more empty
+    # values than the model wrote empty (review of 30042a2b6: "cwd": /tmp
+    # ran a **kwargs tool with cwd='').
+    blanks = [k for k, v in kwargs.items() if blank(v)]
+    emptied_written = (blanks if repaired and as_written is not None
+                       and len(blanks) > _written_blank_values(as_written)
+                       else [])
+    emptied_written = [k for k in emptied_written if k not in emptied]
     unholdable = (_numbers_out_of_range(params, bound)
                   if bound is not None else [])
     if unholdable:
@@ -4480,10 +4519,15 @@ def tool_argument_error(func, func_name, arguments, repaired, as_written=None):
                 f"{', '.join(unholdable)} must be a finite number, and the "
                 f"value given cannot be held as one. Call {func_name} again "
                 f"with a number in range.")
-    invented = ([k for k in kwargs if k not in {p.name for p in params}
-                 and k not in _quoted_top_level_keys(as_written)]
-                if as_written is not None and bound is not None else [])
-    if bound is not None and not emptied and not invented:
+    # Strict JSON quotes every key, so only a repaired call is scanned, and
+    # once (review of 30042a2b6: once per extra key, 0.42 s on 100 KB).
+    declared = {p.name for p in params}
+    extra = [k for k in kwargs if k not in declared]
+    quoted = (_quoted_top_level_keys(as_written)
+              if repaired and extra and as_written is not None
+              and bound is not None else None)
+    invented = [k for k in extra if k not in quoted] if quoted is not None else []
+    if bound is not None and not emptied and not emptied_written             and not invented:
         return None
     takes_any = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
     names = {p.name for p in params}
@@ -4514,6 +4558,19 @@ def tool_argument_error(func, func_name, arguments, repaired, as_written=None):
         text += f" Missing required argument(s): {', '.join(missing)}."
     if emptied:
         text += f" Required argument(s) left empty: {', '.join(emptied)}."
+    if emptied_written:
+        text += (f" Value(s) that could not be read and came out empty: "
+                 f"{', '.join(map(str, emptied_written))}.")
+    if takes_any:
+        # Any name is accepted: the declared ones are not the only ones, so
+        # they are not offered as the fix -- quoting is (review of 30042a2b6).
+        if invented:
+            text += (f" Key(s) not written in double quotes: "
+                     f"{', '.join(map(str, invented))}.")
+        return (text + f" Declared parameters: {expected}; {func_name} also "
+                f"takes other named values. Call {func_name} again with one "
+                f"JSON object, every key and every string value in double "
+                f"quotes.")
     return (text + f" Expected parameters: {expected}. Call {func_name} again "
             f"with one JSON object using these names.")
 
