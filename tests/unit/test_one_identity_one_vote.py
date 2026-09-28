@@ -136,10 +136,22 @@ def test_without_the_human_the_agents_majority_is_the_vote(db):
 
 
 def test_a_split_identity_casts_no_vote(db):
+    """One FOR, one AGAINST: a tie in COUNT is no vote, however strong one
+    side is (+2 against -1 would otherwise average to a FOR)."""
     e = _experiment(db)
     owner = _user(db)
-    for v in (2, -2):
+    for v in (2, -1):
         _vote(db, e.id, _user(db, 'agent', owner_id=owner.id), v)
+    t = _tally(db, e)
+    assert t['distinct_voters'] == 0 and t['distinct_supporters'] == 0
+    assert t['total_for'] == 0 and t['total_against'] == 0
+
+
+def test_an_identity_that_only_abstained_is_no_voter(db):
+    e = _experiment(db)
+    owner = _user(db)
+    _vote(db, e.id, owner, 0)
+    _vote(db, e.id, _user(db, 'agent', owner_id=owner.id), 0)
     t = _tally(db, e)
     assert t['distinct_voters'] == 0
     assert t['total_for'] == 0 and t['total_against'] == 0
