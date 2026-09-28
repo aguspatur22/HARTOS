@@ -204,3 +204,89 @@ def test_only_user_lang_names_the_file():
                       and id(n) not in docs and 'hart_language.json' in n.value
                       and not any(c.isspace() for c in n.value)]
     assert offenders == []
+
+
+
+# ── Once means once (the admin config's marker, 4b1796862's review) ─────────
+#
+# The per-process flag was the only guard: delete hart_language.json (the way
+# to reset the preference) and restart, and the old file was copied back.  A
+# marker beside the new file (core.file_cache.adopt_legacy_json_once) now
+# records that the move is done.
+
+def _restart(monkeypatch):
+    """A new process: the once-per-process flag and the read cache reset."""
+    monkeypatch.setattr(ul, '_legacy_checked', False)
+    monkeypatch.setattr(ul, '_cache', {'value': None, 'mtime': 0})
+
+
+def _marker(new):
+    return new.parent / 'hart_language.migrated.json'
+
+
+def test_a_deleted_preference_does_not_bring_the_old_one_back(lang_paths, monkeypatch):
+    new, old = lang_paths
+    _write(old, {'language': 'ta'})
+    assert ul.get_preferred_lang() == 'ta'
+    assert _marker(new).exists()
+
+    new.unlink()                        # the owner resets the preference
+    _restart(monkeypatch)
+
+    assert ul.get_preferred_lang() == 'en', 'the old preference came back'
+    assert not new.exists()
+    assert json.loads(old.read_text(encoding='utf-8')) == {'language': 'ta'}
+
+
+def test_an_install_that_moved_before_the_marker_is_marked_on_first_read(
+        lang_paths, monkeypatch):
+    """A preference already at the new place (copied before the marker
+    existed) is marked on the first read of a process, so deleting it later
+    does not copy the old one either."""
+    new, old = lang_paths
+    _write(old, {'language': 'ta'})
+    _write(new, {'language': 'hi'})
+
+    assert ul.get_preferred_lang() == 'hi'
+    assert _marker(new).exists()
+    new.unlink()
+    _restart(monkeypatch)
+    assert ul.get_preferred_lang() == 'en'
+    assert not new.exists()
+
+
+def test_an_unusable_old_file_leaves_no_marker_and_moves_once_fixed(
+        lang_paths, monkeypatch):
+    new, old = lang_paths
+    _write(old, {'language': 'xx'})
+    assert ul.get_preferred_lang() == 'en'
+    assert not _marker(new).exists()
+
+    _write(old, {'language': 'ta'})
+    _restart(monkeypatch)
+    assert ul.get_preferred_lang() == 'ta'
+
+
+def test_the_first_read_of_a_process_is_the_only_one_that_looks(lang_paths, monkeypatch):
+    """The /chat hot path: after the first read nothing asks again."""
+    calls = []
+    import core.file_cache as fc
+    real = fc.adopt_legacy_json_once
+    monkeypatch.setattr(fc, 'adopt_legacy_json_once',
+                        lambda *a, **k: calls.append(1) or real(*a, **k))
+    for _ in range(3):
+        ul.get_preferred_lang()
+    assert calls == [1]
+
+
+
+def test_the_settle_step_itself_runs_once_per_process(lang_paths, monkeypatch):
+    """Two threads can both see the flag unset before either sets it; the
+    step checks it again under its lock, so it still runs once."""
+    calls = []
+    import core.file_cache as fc
+    monkeypatch.setattr(fc, 'adopt_legacy_json_once',
+                        lambda *a, **k: calls.append(1) or 'none')
+    ul._adopt_legacy_file()
+    ul._adopt_legacy_file()
+    assert calls == [1]

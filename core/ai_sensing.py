@@ -22,6 +22,7 @@ screen the human cut. `start_authority_server()` exposes the gate over a Unix
 socket in the canonical state holder (the brain); `query_authority(sensor)` is
 the FAIL-CLOSED client the portal MUST consult before any capture.
 """
+import logging
 import os
 import socket
 import threading
@@ -37,8 +38,15 @@ _state = {'mic': False, 'camera': False, 'screen': False}
 # answering thread, so the No holds from that instant -- the hardware stop runs
 # later, on its own worker, and may be stuck behind a start that never returns.
 _withheld = {'camera': False, 'screen': False}
+# The feeds whose answer this process already holds, given here (withhold) or
+# restored from the saved consent at startup (restore_withheld).  A restore
+# never overwrites an answer given in this process: the consent row of a No
+# given moments ago may not be committed yet, and reading it would say Yes.
+_answered = set()
 
 _SENSES = ('mic', 'camera', 'screen')
+
+_logger = logging.getLogger(__name__)
 
 
 def is_disabled(sensor: str) -> bool:
@@ -51,6 +59,18 @@ def withhold(sensor: str, withheld: bool) -> None:
     with _lock:
         if sensor in _withheld:
             _withheld[sensor] = bool(withheld)
+            _answered.add(sensor)
+
+
+def restore_withheld(sensor: str, withheld: bool) -> bool:
+    """At startup, the owner's saved answer for a feed; True when applied.
+    Does nothing once this process holds an answer for the feed."""
+    with _lock:
+        if sensor not in _withheld or sensor in _answered:
+            return False
+        _withheld[sensor] = bool(withheld)
+        _answered.add(sensor)
+        return True
 
 
 def is_withheld(sensor: str) -> bool:
@@ -70,24 +90,35 @@ def any_disabled() -> bool:
         return any(_state.values())
 
 
-def _stop_vision() -> None:
-    """Best-effort hard-cut of the camera/vision service (observable in status)."""
+def _running_vision_services() -> list:
+    """Every VisionService running in this process, whoever owns it.
+
+    There are three owners (Nunba's boot instance on __main__, standalone
+    hart_intelligence_entry._vision_service, the integrations.vision
+    singleton the admin toggle drives), so no one accessor reaches the camera
+    that is on.  This used to import get_vision_service from
+    integrations.vision.vision_service, which does not define it: the import
+    raised, the except swallowed it, and the eye button never stopped the
+    camera.  An empty list when vision is not installed."""
     try:
-        from integrations.vision.vision_service import get_vision_service
-        vs = get_vision_service()
-        if vs and vs.is_running():
+        from integrations.vision.vision_service import running_vision_services
+    except ImportError:
+        return []
+    return running_vision_services()
+
+
+def _stop_vision() -> None:
+    """Hard-cut of the camera/vision service (observable in status)."""
+    for vs in _running_vision_services():
+        try:
             vs.stop()
-    except Exception:
-        pass
+        except Exception:
+            _logger.warning("ai_sensing: a VisionService did not stop",
+                            exc_info=True)
 
 
 def _vision_running() -> bool:
-    try:
-        from integrations.vision.vision_service import get_vision_service
-        vs = get_vision_service()
-        return bool(vs and vs.is_running())
-    except Exception:
-        return False
+    return bool(_running_vision_services())
 
 
 def disable_all() -> dict:

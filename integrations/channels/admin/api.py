@@ -151,58 +151,19 @@ class AdminAPI:
         return os.path.join(os.path.dirname(__file__), "..", "..", "..",
                             "agent_data", "admin_config.json")
 
-    @staticmethod
-    def _migration_marker_path(config_path: str) -> str:
-        """Beside the new config: its presence means the move is done."""
-        return os.path.join(os.path.dirname(config_path),
-                            "admin_config.migrated.json")
-
-    @staticmethod
-    def _mark_migrated(marker: str, legacy: str, copied: bool) -> None:
-        from core.file_cache import atomic_json_write
-        try:
-            atomic_json_write(marker, {
-                "from": legacy, "copied": copied,
-                "at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            }, indent=2)
-        except Exception as e:
-            logger.warning("Admin config move not marked done at %s (%s); "
-                           "a deleted config could be copied again", marker, e)
-
     def _adopt_legacy_config(self, config_path: str) -> None:
-        """One-time, non-destructive move to the user data dir: when nothing
-        is at ``config_path`` yet and the pre-bff95ab44 file is, copy its
-        content there.  The old file is never changed or deleted (a rollback
-        or another install may still read it), a file already at the new
-        place is never overwritten, and an old file that is not valid JSON
-        is left behind, not copied.  Without this an upgrade dropped every
-        saved channel, workflow and the agent identity.
-
-        Once means once: when the new place is in use (just copied, or found
-        already there) a marker beside it records that, and nothing is ever
-        copied again.  Deleting the new file is how an owner resets the
-        admin config; without the marker the next start copied the old file
-        back, with its channels and their bot tokens."""
-        legacy = os.path.abspath(self._legacy_config_path())
-        marker = self._migration_marker_path(config_path)
-        try:
-            if (os.path.exists(marker) or not os.path.isfile(legacy)
-                    or os.path.normcase(legacy)
-                    == os.path.normcase(os.path.abspath(config_path))):
-                return
-            if os.path.exists(config_path):
-                self._mark_migrated(marker, legacy, copied=False)
-                return
-            with open(legacy, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            from core.file_cache import atomic_json_write
-            atomic_json_write(config_path, data, indent=2)
-            self._mark_migrated(marker, legacy, copied=True)
-            logger.info("Copied admin configuration from %s to %s",
-                        legacy, config_path)
-        except Exception as e:
-            logger.warning("Admin config at %s not carried over to %s: %s",
-                           legacy, config_path, e)
+        """One-time, non-destructive move to the user data dir (the
+        pre-bff95ab44 file to ``config_path``), through the shared
+        core.file_cache.adopt_legacy_json_once: the old file is never changed
+        or deleted, a config already at the new place is never overwritten,
+        an old file that is not JSON is not copied, and once the new place is
+        in use a marker (admin_config.migrated.json) keeps it that way.
+        Without the copy an upgrade dropped every saved channel, workflow and
+        the agent identity; without the marker, deleting the new config and
+        restarting brought the old channels and their bot tokens back."""
+        from core.file_cache import adopt_legacy_json_once
+        adopt_legacy_json_once(config_path, self._legacy_config_path(),
+                               what="Admin configuration", indent=2)
 
     def _load_config(self) -> None:
         """Restore persisted admin state (channels + workflows + identity +

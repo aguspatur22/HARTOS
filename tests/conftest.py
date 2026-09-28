@@ -155,8 +155,10 @@ def reopen_owner_feed_answers():
     on record, as a fresh process does."""
     yield
     from core import ai_sensing
-    for sensor in ('camera', 'screen'):
-        ai_sensing.withhold(sensor, False)
+    with ai_sensing._lock:
+        for sensor in ai_sensing._withheld:
+            ai_sensing._withheld[sensor] = False
+        ai_sensing._answered.clear()
 
 
 @pytest.fixture

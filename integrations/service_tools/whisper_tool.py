@@ -24,6 +24,7 @@ import logging
 import math
 import os
 import re
+import sys
 import tarfile
 import urllib.request
 import wave
@@ -467,6 +468,53 @@ def _drop_faster_whisper_model() -> None:
             logger.exception("_drop_faster_whisper_model: swallowed Exception")
 
 
+# ctranslate2's wording when it cannot load a CUDA library it needs (cuBLAS is
+# loaded lazily, at the first encode).  The library it names is the one
+# _cuda_library_report asks about.
+_CT2_LIBRARY_LOAD_ERROR_RE = re.compile(r'Library (\S+) is not found or cannot be loaded')
+
+
+def _cuda_library_report(error) -> Optional[str]:
+    """For a cuda error naming a library ctranslate2 could not load, what this
+    process gets when it loads that library itself, and the search path.
+
+    None when the error names no library.  Diagnosis only: on the one box
+    where it was logged (2026-09-25/26), ctranslate2 reported "Library
+    cublas64_12.dll is not found or cannot be loaded" although the installed
+    python-embed hook puts torch/lib first on the worker's PATH and torch/lib
+    held that DLL since 2026-09-01; why it still did not resolve was never
+    measured.  A plain load (``winmode=0``: LoadLibrary, which searches PATH
+    as ctranslate2's own load does) either names the file it resolved to or
+    gives the loader's own error -- either answer narrows the cause.
+
+    Never raises: it runs inside the cuda-failure branch, and a diagnosis
+    must not cost the request its CPU answer.
+    """
+    m = _CT2_LIBRARY_LOAD_ERROR_RE.search(str(error))
+    if not m:
+        return None
+    name = m.group(1)
+    import ctypes
+    search_var = 'PATH' if sys.platform == 'win32' else 'LD_LIBRARY_PATH'
+    try:
+        if sys.platform == 'win32':
+            lib = ctypes.CDLL(name, winmode=0)
+            kernel32 = ctypes.WinDLL('kernel32')
+            kernel32.GetModuleFileNameW.argtypes = (
+                ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32)
+            buf = ctypes.create_unicode_buffer(32768)
+            kernel32.GetModuleFileNameW(lib._handle, buf, len(buf))
+            outcome = f"loads in this process from {buf.value or '?'}"
+        else:
+            ctypes.CDLL(name)
+            outcome = "loads in this process"
+    except OSError as e:
+        outcome = f"does not load in this process either: {e}"
+    except Exception as e:  # noqa: BLE001 -- see "Never raises" above
+        outcome = f"could not be probed ({type(e).__name__}: {e})"
+    return f"{name} {outcome}; {search_var}={os.environ.get(search_var, '')}"
+
+
 def _decode_on_faster_whisper(model_size: str, decode):
     """Run ``decode(model)`` on the cached faster-whisper model -- the ONE
     place a faster-whisper decode runs (transcribe and language detection).
@@ -507,6 +555,9 @@ def _decode_on_faster_whisper(model_size: str, decode):
                 "faster-whisper decode failed on cuda (%s) — dropping that "
                 "model; STT decodes on CPU (int8) until the STT worker "
                 "restarts", e)
+            report = _cuda_library_report(e)
+            if report:
+                logger.warning("faster-whisper cuda library: %s", report)
 
 
 # ── Anti-hallucination gate: "did a human actually speak, or is this noise?" ──

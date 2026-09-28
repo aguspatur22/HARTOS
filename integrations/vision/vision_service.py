@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 from typing import Callable, Dict, List, Optional
 
 import numpy as np
@@ -29,6 +30,61 @@ from .minicpm_installer import MiniCPMInstaller
 from .lightweight_backend import get_vision_backend, VisionBackend
 
 logger = logging.getLogger('hevolve_vision')
+
+#: Every VisionService constructed in this process.  Weak: an instance its
+#: owner dropped is not kept alive here.
+_LIVE = weakref.WeakSet()
+_LIVE_LOCK = threading.Lock()
+
+
+def running_vision_services() -> List['VisionService']:
+    """Every VisionService running in this process, whichever of its owners
+    made it (Nunba's boot instance, hart_intelligence_entry's standalone one,
+    the integrations.vision singleton).  Never constructs one."""
+    with _LIVE_LOCK:
+        live = list(_LIVE)
+    return [vs for vs in live if vs.is_running()]
+
+
+def restore_feed_answers() -> None:
+    """Load the owner's saved camera/screen answers into the capture gate
+    (core.ai_sensing), before any frame can reach a store.
+
+    The gate is process memory and started open on every boot, so after a
+    restart camera frames were accepted until the owner answered again.
+    Now: a standing No on file (no active grant, a revocation that stands)
+    closes the feed; a grant or no answer at all leaves it open, as before.
+    If the consent cannot be read, both feeds close: the owner may have said
+    No.  An answer this process already holds is kept (restore_withheld).
+
+    The owner is HEVOLVE_OWNER_USER_ID, whose camera and screen they are, as
+    everywhere else.  With no owner configured nothing is restored: the node
+    has no desktop owner whose answer could be on file."""
+    from core import ai_sensing
+    owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+    if not owner:
+        logger.info("Feed answers not restored: no HEVOLVE_OWNER_USER_ID")
+        return
+    feeds = ('camera', 'screen')
+    try:
+        from integrations.social.models import db_session
+        from integrations.social.consent_service import (
+            ConsentService, consent_type_for_action)
+        answers = {}
+        with db_session(commit=False) as db:
+            for feed in feeds:
+                ctype = consent_type_for_action(feed)
+                answers[feed] = (
+                    not ConsentService.check_consent(db, owner, ctype)
+                    and ConsentService.declined(db, owner, ctype))
+    except Exception:
+        logger.warning("Feed answers could not be read: camera and screen "
+                       "stay closed until the owner answers", exc_info=True)
+        answers = {feed: True for feed in feeds}
+    for feed, said_no in answers.items():
+        if ai_sensing.restore_withheld(feed, said_no):
+            logger.info("Feed %s restored from saved consent: %s",
+                        feed, 'No' if said_no else 'open')
 
 
 def run_screen_capture_loop(consent_ok, grab, put, yielding, sleep, stop):
@@ -123,6 +179,11 @@ class VisionService:
         self._last_describe_time: Dict[str, float] = {}  # user_id → timestamp
         self._frames_skipped: int = 0
         self._frames_described: int = 0
+
+        with _LIVE_LOCK:
+            _LIVE.add(self)
+        # Before this service can take a frame: the owner's saved answers.
+        restore_feed_answers()
 
     # ─── Public API ───
 

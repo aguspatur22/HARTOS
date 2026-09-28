@@ -25,6 +25,7 @@ and a recording orchestrator.
     python -m pytest tests/unit/test_stt_cuda_runtime_fallback.py --noconftest -q
 """
 import json
+import os
 import sys
 import types
 from types import SimpleNamespace
@@ -42,13 +43,23 @@ class _Engine:
     is recorded; ``cuda_decode_fails`` / ``cpu_decode_fails`` script how many
     decodes on that device raise before one succeeds."""
 
-    def __init__(self, cuda_decode_fails=0, cpu_decode_fails=0):
+    def __init__(self, cuda_decode_fails=0, cpu_decode_fails=0,
+                 cuda_load_fails=0, failing_cpu_sizes=(),
+                 cuda_error=CUBLAS_ERR):
         self.models = []
+        self.attempts = []          # every WhisperModel() call, raised or not
         self.fail_left = {'cuda': cuda_decode_fails, 'cpu': cpu_decode_fails}
+        self.cuda_load_fails_left = cuda_load_fails
         engine = self
 
         class WhisperModel:
             def __init__(self, size, device='cpu', compute_type='int8'):
+                engine.attempts.append((size, device))
+                if device == 'cuda' and engine.cuda_load_fails_left > 0:
+                    engine.cuda_load_fails_left -= 1
+                    raise RuntimeError('CUDA failed with error out of memory')
+                if device == 'cpu' and size in failing_cpu_sizes:
+                    raise RuntimeError(f'no model files for {size}')
                 self.size, self.device, self.compute_type = size, device, compute_type
                 self.decodes = 0
                 engine.models.append(self)
@@ -57,7 +68,7 @@ class _Engine:
                 self.decodes += 1
                 if engine.fail_left[self.device] > 0:
                     engine.fail_left[self.device] -= 1
-                    raise RuntimeError(CUBLAS_ERR if self.device == 'cuda'
+                    raise RuntimeError(cuda_error if self.device == 'cuda'
                                        else 'decode failed')
                 seg = SimpleNamespace(text=f'hello from {self.device}',
                                       no_speech_prob=0.01, avg_logprob=-0.2)
@@ -191,3 +202,100 @@ def test_a_failure_on_the_cpu_rung_too_is_recorded_and_returns_none(orch):
     assert 'decode failed' in (wt.get_whisper_last_error() or '')
     # Neither model that raised stays cached.
     assert wt._faster_whisper_model is None
+
+
+def test_a_cuda_load_failure_keeps_cuda_off_after_the_cache_empties(orch):
+    # A cuda LOAD that raised switches cuda off for the process, like a cuda
+    # decode that raised: whatever empties the cache later (a drop, a size
+    # change) must load the CPU rung, not walk back into the failing load.
+    eng = _Engine(cuda_load_fails=1)
+    with _modules(eng):
+        first = wt._faster_whisper_transcribe('a.wav', None, model_size='medium')
+        wt._drop_faster_whisper_model()
+        second = wt._faster_whisper_transcribe('a.wav', None, model_size='small')
+    assert json.loads(first)['text'] == 'hello from cpu'
+    assert json.loads(second)['text'] == 'hello from cpu'
+    assert eng.attempts == [('medium', 'cuda'),
+                            (wt.STT_CPU_MODEL_SIZE, 'cpu'),
+                            (wt.STT_CPU_MODEL_SIZE, 'cpu')]
+
+
+def test_a_decode_on_the_cached_model_clears_an_earlier_failure(orch, monkeypatch):
+    # The cached model answers without a load, so the transcribe itself must
+    # clear what an earlier failure left: the user-visible error and the
+    # backoff that would refuse the next load.
+    from core.circuit_breaker import PeerBackoff
+    backoff = PeerBackoff(initial=60.0, maximum=300.0)
+    monkeypatch.setattr(wt, '_whisper_load_backoff', backoff)
+    eng = _Engine(failing_cpu_sizes=('small',))
+    eng.ct.get_cuda_device_count = lambda: 0          # a CPU-only box
+    with _modules(eng):
+        assert wt._faster_whisper_transcribe('a.wav', None, model_size='base')
+        assert wt._faster_whisper_transcribe('a.wav', None, model_size='small') is None
+        assert 'no model files for small' in (wt.get_whisper_last_error() or '')
+        assert backoff.is_backed_off('faster_whisper')
+        out = wt._faster_whisper_transcribe('a.wav', None, model_size='base')
+    assert json.loads(out)['text'] == 'hello from cpu'
+    assert eng.attempts == [('base', 'cpu'), ('small', 'cpu')], 'base came from the cache'
+    assert wt.get_whisper_last_error() is None
+    assert not backoff.is_backed_off('faster_whisper')
+
+
+# ── What the worker logs when ctranslate2 cannot load a CUDA library ────────
+# The live boxes' failure was "Library cublas64_12.dll is not found or cannot
+# be loaded" while torch/lib, which carries that DLL, was on the worker's PATH
+# (review measurement, 2026-09-28).  Why it did not resolve was never
+# measured, so a cuda decode that names a library logs what THIS process gets
+# when it loads that library itself, and the search path it used.
+
+def _cuda_decode_warnings(caplog, error):
+    eng = _Engine(cuda_decode_fails=1, cuda_error=error)
+    with caplog.at_level('WARNING', logger=wt.logger.name), _modules(eng):
+        out = wt._faster_whisper_transcribe('a.wav', None, model_size='medium')
+    assert json.loads(out)['text'] == 'hello from cpu'
+    return [r.getMessage() for r in caplog.records
+            if 'cuda library' in r.getMessage()]
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows DLL search')
+def test_a_library_found_on_path_is_logged_with_the_file_it_resolved_to(
+        caplog, monkeypatch, tmp_path):
+    # A DLL that exists ONLY in a directory on PATH: the probe must search
+    # PATH the way ctranslate2's LoadLibrary does, and name the file.
+    import shutil
+    lib = tmp_path / 'hart_cuda_probe_copy.dll'
+    shutil.copyfile(os.path.join(os.environ['SystemRoot'], 'System32', 'version.dll'), lib)
+    monkeypatch.setenv('PATH', str(tmp_path) + os.pathsep + os.environ.get('PATH', ''))
+    lines = _cuda_decode_warnings(
+        caplog, 'Library hart_cuda_probe_copy.dll is not found or cannot be loaded')
+    assert len(lines) == 1
+    msg = lines[0]
+    assert 'hart_cuda_probe_copy.dll loads in this process from ' in msg
+    resolved = msg.split(' from ', 1)[1].split(';', 1)[0]
+    assert os.path.normcase(resolved) == os.path.normcase(str(lib))
+    assert f"PATH={os.environ['PATH']}" in msg
+
+
+def test_a_library_that_does_not_load_here_either_is_logged_with_why(caplog):
+    lines = _cuda_decode_warnings(
+        caplog, 'Library hart_no_such_cuda_lib_12.dll is not found or cannot be loaded')
+    assert len(lines) == 1
+    msg = lines[0]
+    assert 'hart_no_such_cuda_lib_12.dll does not load in this process either: ' in msg
+    var = 'PATH' if sys.platform == 'win32' else 'LD_LIBRARY_PATH'
+    assert f"{var}={os.environ.get(var, '')}" in msg
+
+
+def test_a_cuda_error_that_names_no_library_logs_no_library_report(caplog):
+    assert _cuda_decode_warnings(caplog, 'CUDA failed with error out of memory') == []
+
+
+def test_a_probe_that_itself_fails_still_leaves_the_cpu_answer(caplog, monkeypatch):
+    import ctypes
+
+    def _broken_loader(*a, **kw):
+        raise ValueError('loader exploded')
+    monkeypatch.setattr(ctypes, 'CDLL', _broken_loader)
+    lines = _cuda_decode_warnings(caplog, 'Library cublas64_12.dll is not found or cannot be loaded')
+    assert len(lines) == 1
+    assert 'cublas64_12.dll could not be probed (ValueError: loader exploded)' in lines[0]
