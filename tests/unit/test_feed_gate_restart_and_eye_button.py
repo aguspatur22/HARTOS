@@ -180,6 +180,22 @@ def test_an_answer_given_in_this_process_is_not_overwritten(gate, saved_consent)
     assert gate.allowed('camera') is False
 
 
+def test_a_later_service_does_not_read_again(gate, saved_consent, monkeypatch):
+    """The restore happens once: a VisionService made later (the admin
+    toggle's singleton, a crash-recovery one) must not re-read, or a DB
+    error at that moment would close feeds the owner left open."""
+    import integrations.social.models as models
+    _new_service()
+    assert (gate.allowed('camera'), gate.allowed('screen')) == (True, True)
+
+    def _broken(commit=True):
+        raise RuntimeError('database is locked')
+
+    monkeypatch.setattr(models, 'db_session', _broken)
+    _new_service()
+    assert (gate.allowed('camera'), gate.allowed('screen')) == (True, True)
+
+
 def test_the_restore_reads_once(gate, saved_consent):
     """A later VisionService does not re-read: a Yes given since the boot
     stands even though the row said No at boot."""
