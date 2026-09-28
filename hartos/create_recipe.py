@@ -1538,16 +1538,18 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                         if user_prompt in user_tasks and hasattr(user_tasks[user_prompt], 'current_action'):
                             action_id = user_tasks[user_prompt].current_action
 
-                        # Determine file path
+                        # Determine file path.  The number in this filename is the
+                        # action's IDENTITY, not a uniquifier: load_vlm_agent_files
+                        # parses it back (parts[2]) and the REUSE merge applies the
+                        # file to THAT action.  A walker to the next free slot filed
+                        # each learning under another action's id or past the end
+                        # of the flow -- agent 18088688973's 6-action flow carries
+                        # orphan _7/_8/_9 files of unrelated C:\ chores.  Same
+                        # builder the REUSE writer uses; re-learning an action
+                        # overwrites that action's file.
                         role_number = get_current_flow(user_prompt)
-                        action_id_to_use = action_id
-                        base_path = helper_fun.safe_prompt_path(prompt_id, role_number, ext='')
-
-                        # Find next available action_id
-                        while os.path.exists(f"{base_path}_{action_id_to_use}_vlm_agent.json"):
-                            action_id_to_use += 1
-
-                        vlm_agent_path = f"{base_path}_{action_id_to_use}_vlm_agent.json"
+                        vlm_agent_path = helper_fun.safe_prompt_path(
+                            prompt_id, role_number, action_id, 'vlm_agent')
                         os.makedirs(os.path.dirname(vlm_agent_path), exist_ok=True)
 
                         # Bank what the run DID, not what it was asked.
@@ -1567,7 +1569,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             "action": instructions,
                             "fallback_action": f"Perform a Google search using {os_to_control}",
                             "persona": persona,
-                            "action_id": action_id_to_use,
+                            "action_id": action_id,
                             "recipe": recipe_steps,
                             "can_perform_without_user_input": "no",
                             "scheduled_tasks": [],
