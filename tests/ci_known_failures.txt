@@ -1,0 +1,37 @@
+# Python tests that FAIL ON MAIN, one JUnit id (classname.name) per line.
+#
+# Read by scripts/ci_failure_ratchet.py in the flake-checks gate: a failing
+# test NOT listed here fails the "Python failure ratchet" job; a listed test
+# that passes is reported so its line gets deleted.  This list only shrinks:
+#   * fixed one of these?  delete its line in the same commit.
+#   * never ADD a line to make a PR green.  A new failure is a regression to
+#     fix; the one legitimate addition is a test that already fails on main,
+#     proven by main's own run.
+#
+# Measured on main 492a57aa, flake-checks run 36402628009 (2026-09-28):
+# shards 2, 4, 5 and 7 from their job logs; shard 1's two red files
+# (test_agentic_router, test_draft_first_dispatch) sit past the log API's
+# 5000-line window, so their ids come from running those two files at
+# 492a57aa.  The ratchet's --write-current output on the next nightly is the
+# authoritative refresh.
+
+tests.unit.test_agentic_router.TestTimeoutGuard.test_handler_source_has_timeout
+tests.unit.test_draft_first_dispatch.TestDispatchDraftFirstDelegation.test_delegate_hive_falls_back_to_fast_when_no_expert
+tests.unit.test_one_announcement_two_surfaces.test_a_completed_step_does_not_churn_the_ribbon
+tests.unit.test_one_announcement_two_surfaces.test_a_refused_step_corrects_the_ribbon
+tests.unit.test_one_announcement_two_surfaces.test_one_announcement_reaches_both_surfaces
+tests.unit.test_p2p_flow_fixes.test_resolver_caches_positive_answer
+tests.unit.test_p2p_flow_fixes.test_resolver_picks_first_alive_central
+tests.unit.test_refused_call_is_marked_in_history.GroupChatSeesTheMark.test_every_seat_holds_the_marked_call
+tests.unit.test_refused_call_is_marked_in_history.RefusedBrokenJsonIsMarked.test_split_call_async_is_marked
+tests.unit.test_refused_call_is_marked_in_history.RefusedBrokenJsonIsMarked.test_split_call_is_sent_back_marked_refused
+tests.unit.test_refused_call_is_marked_in_history.RefusedBrokenJsonIsMarked.test_the_marked_call_is_never_run_again
+tests.unit.test_remote_compute_charge.TestMigrationV57.test_a_failed_pass_is_not_stamped_done
+tests.unit.test_reuse_history_sync.ReuseHistorySync.test_sync_fires_on_STALE_not_only_on_EMPTY
+tests.unit.test_reuse_history_sync.ReuseHistorySync.test_sync_replaces_in_place_never_appends_a_duplicate_prefix
+tests.unit.test_shared_history_agent_scope.test_create_writes_the_buffer_through_the_shared_writer
+tests.unit.test_shared_history_agent_scope.test_every_writeback_call_passes_the_agent
+tests.unit.test_tool_args_bound_before_call.SplitArgumentsAreNotCalled.test_async_sync_tool_unquoted_value_does_not_run
+tests.unit.test_tool_args_bound_before_call.SplitArgumentsAreNotCalled.test_async_unquoted_value_does_not_run_the_tool
+tests.unit.test_tool_args_bound_before_call.SplitArgumentsAreNotCalled.test_sync_unquoted_value_does_not_run_the_tool
+tests.unit.test_vlm_stop_node_scope.test_node_stop_is_logged_with_its_count
