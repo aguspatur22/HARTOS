@@ -46,25 +46,39 @@ def running_vision_services() -> List['VisionService']:
     return [vs for vs in live if vs.is_running()]
 
 
+def stop_running_vision_services(why: str) -> int:
+    """Stop every running VisionService, whoever owns it; how many stopped.
+    The one stop for every cut: the eye button (core.ai_sensing) and the
+    owner's No (admin._apply_embodied_toggle).  A service that fails to stop
+    is logged and the rest still stop."""
+    stopped = 0
+    for vs in running_vision_services():
+        try:
+            vs.stop()
+            stopped += 1
+        except Exception:
+            logger.warning("VisionService did not stop (%s)", why,
+                           exc_info=True)
+    return stopped
+
+
 def restore_feed_answers() -> None:
-    """Load the owner's saved camera/screen answers into the capture gate
+    """Load the saved camera/screen answers into the capture gate
     (core.ai_sensing), before any frame can reach a store.
 
     The gate is process memory and started open on every boot, so after a
     restart camera frames were accepted until the owner answered again.
-    Now: a standing No on file (no active grant, a revocation that stands)
-    closes the feed; a grant or no answer at all leaves it open, as before.
-    If the consent cannot be read, both feeds close: the owner may have said
-    No.  An answer this process already holds is kept (restore_withheld).
-
-    The owner is HEVOLVE_OWNER_USER_ID, whose camera and screen they are, as
-    everywhere else.  With no owner configured nothing is restored: the node
-    has no desktop owner whose answer could be on file."""
+    Now the gate starts where the last answer left it, read by the rule the
+    running process applies: every camera/screen answer, from any surface
+    and signed in as anyone, sets the one node-wide gate, and the latest one
+    stands (ConsentService.feed_said_no).  So it does not matter which user
+    id the answer was filed under -- the admin toggle files it under the
+    signed-in user, the privacy page under the JWT user, /api/agent/approval
+    under HEVOLVE_OWNER_USER_ID -- and no owner has to be configured.  No
+    answer on file leaves the feed open, as before.  If the consent cannot
+    be read, both feeds close: the last answer may have been No.  An answer
+    this process already holds is kept (restore_withheld)."""
     from core import ai_sensing
-    owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
-    if not owner:
-        logger.info("Feed answers not restored: no HEVOLVE_OWNER_USER_ID")
-        return
     feeds = ('camera', 'screen')
     try:
         from integrations.social.models import db_session
@@ -73,10 +87,8 @@ def restore_feed_answers() -> None:
         answers = {}
         with db_session(commit=False) as db:
             for feed in feeds:
-                ctype = consent_type_for_action(feed)
-                answers[feed] = (
-                    not ConsentService.check_consent(db, owner, ctype)
-                    and ConsentService.declined(db, owner, ctype))
+                answers[feed] = ConsentService.feed_said_no(
+                    db, consent_type_for_action(feed))
     except Exception:
         logger.warning("Feed answers could not be read: camera and screen "
                        "stay closed until the owner answers", exc_info=True)

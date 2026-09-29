@@ -61,6 +61,7 @@ STEP_PHASES = frozenset({'executing', 'completed', 'blocked', 'failed', 'stopped
 _EXIT_STATUS = {
     'done': 'COMPLETED',
     'stopped': 'USER_STOPPED',
+    'user_active': 'USER_STOPPED',
     'action_error': 'FAILED',
     'timeout': 'FAILED',
     'max_iterations': 'FAILED',
@@ -71,6 +72,7 @@ _EXIT_STATUS = {
 _EXIT_PHASE = {
     'done': 'completed',
     'stopped': 'stopped',
+    'user_active': 'stopped',
 }
 
 

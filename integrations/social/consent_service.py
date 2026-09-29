@@ -1037,6 +1037,26 @@ class ConsentService:
         _embodied_feed_from_consent(consent_type, False)
 
     @staticmethod
+    def feed_said_no(db, consent_type: str) -> bool:
+        """True when the latest answer on file for a camera/screen feed is a
+        No, whoever gave it and for whichever agent or scope.
+
+        The feed is this node's hardware and its capture gate is node-wide:
+        every answer, from any surface, reaches the same gate
+        (_embodied_feed_from_consent) and the last one stands.  A process
+        restoring the gate at startup (vision_service.restore_feed_answers)
+        reads that same last answer here.  An answer is a grant (granted_at)
+        or a No (revoked_at: revoke_consent, the privacy page's revoke, a
+        declined ask); a pending ask is neither.  On a tie the No wins.
+        """
+        _validate_consent_type(consent_type)
+        from sqlalchemy import func
+        last_yes, last_no = db.query(
+            func.max(UserConsent.granted_at), func.max(UserConsent.revoked_at),
+        ).filter(UserConsent.consent_type == consent_type).one()
+        return last_no is not None and (last_yes is None or last_no >= last_yes)
+
+    @staticmethod
     def active_grant(db, user_id: str, consent_type: str,
                      scope: str = '*', agent_id=None):
         """The granted, unrevoked row for EXACTLY this combination, or None.

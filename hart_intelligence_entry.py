@@ -2394,12 +2394,12 @@ try:
     if _CrossbarPub is not None:
         client = _CrossbarPub(_wamp_url)
     elif _legacy_cb is not None and hasattr(_legacy_cb, 'Client'):
-        client = _legacy_cb.Client(_wamp_url)
+        client = _legacy_cb.Client(_wamp_url, timeout=2.0)
     else:
         # Legacy package may expose Client at .crossbarhttp.Client
         # (broken namespace install).  Probe before giving up.
         _nested = getattr(_legacy_cb, 'crossbarhttp', None) if _legacy_cb else None
-        client = _nested.Client(_wamp_url) if (_nested and hasattr(_nested, 'Client')) else None
+        client = _nested.Client(_wamp_url, timeout=2.0) if (_nested and hasattr(_nested, 'Client')) else None
 except Exception as _cb_err:
     client = None
     try:
@@ -2415,20 +2415,31 @@ crossbar_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='crossb
 atexit.register(lambda: crossbar_executor.shutdown(wait=False))
 
 
+_crossbar_client_lock = threading.Lock()
+
+
 def _http_crossbar_publish(topic: str, payload: str, timeout: float = 2.0):
-    """HTTP Crossbar publish — injected into MessageBus as transport fallback."""
+    """Use the publisher's timeout; never change another socket's defaults."""
     if client is None:
         return
-    import socket
     try:
-        original_timeout = socket.getdefaulttimeout()
-        socket.setdefaulttimeout(timeout)
-        client.publish(topic, payload)
+        # The installed crossbarhttp3 distribution exposes crossbarhttp.Client.
+        # Its timeout and signed-message sequence are mutable client state.
+        # Serialize only this cloud leg; local/SSE/PeerLink fanout stays async.
+        with _crossbar_client_lock:
+            if hasattr(client, 'timeout'):
+                previous = client.timeout
+                try:
+                    client.timeout = timeout
+                    client.publish(topic, payload)
+                finally:
+                    client.timeout = previous
+            else:
+                # Preserve alternate SDK compatibility. Its implementation
+                # owns its timeout; process-global socket mutation is unsafe.
+                client.publish(topic, payload)
     except Exception:
         logging.getLogger(__name__).exception("_http_crossbar_publish: swallowed Exception")
-    finally:
-        if original_timeout is not None:
-            socket.setdefaulttimeout(original_timeout)
 
 
 # Inject HTTP transport into MessageBus (avoids Layer 2 importing Layer 3)
@@ -2607,20 +2618,8 @@ def publish_async(topic, message, timeout=2.0):
     if _out is not _wire:
         raw_message = json.dumps(_out, default=str) if _wire_is_json else _out
 
-    def _publish():
-        import socket
-        try:
-            original_timeout = socket.getdefaulttimeout()
-            socket.setdefaulttimeout(timeout)
-            client.publish(topic, raw_message)
-            app.logger.debug(f"Published to Crossbar: {topic}")
-        except Exception as e:
-            app.logger.debug(f"Crossbar HTTP publish failed (offline OK): {e}")
-        finally:
-            if original_timeout is not None:
-                socket.setdefaulttimeout(original_timeout)
+    crossbar_executor.submit(_http_crossbar_publish, topic, raw_message, timeout)
 
-    crossbar_executor.submit(_publish)
 
 
 def _get_dynamic_capability_prompt() -> str:
@@ -6808,6 +6807,19 @@ def parse_image_to_text(inp):
     '''
         LlaVA implemetation
     '''
+
+    # Saved attachments use this node's canonical image describer. Remote
+    # URL behavior remains below; a local reference never goes to LLAVA.
+    image_ref, _, question = str(inp).partition(',')
+    image_ref = image_ref.strip()
+    if image_ref.startswith('/uploads/'):
+        from integrations.vision.image_describe import resolve_uploaded_image, describe_image
+        try:
+            path = resolve_uploaded_image(image_ref)
+            answer = describe_image(str(path), question.strip() or None, cache=True)
+            return answer or 'Uploaded image analysis is unavailable; no visual answer was obtained.'
+        except (ValueError, FileNotFoundError) as e:
+            return f'Uploaded image analysis failed: {e}'
 
     try:
         post_dict = {'user_id': '', 'task_type': 'async', 'status': TaskStatus.EXECUTING.value, 'task_name': TaskNames.LLAVA.value, 'uid': thread_local_data.get_request_id(

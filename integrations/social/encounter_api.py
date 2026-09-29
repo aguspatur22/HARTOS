@@ -214,10 +214,19 @@ def _number(body: dict, key: str, default, *, whole: bool = True,
     if raw is None and nullable:
         return None, None
     kinds = (int,) if whole else (int, float)
-    if (isinstance(raw, bool) or not isinstance(raw, kinds)
-            or not math.isfinite(raw)):
-        return None, (f'{key} must be a whole number' if whole
-                      else f'{key} must be a number')
+    error = (f'{key} must be a whole number' if whole
+             else f'{key} must be a number')
+    if isinstance(raw, bool) or not isinstance(raw, kinds):
+        return None, error
+    # Whole integers (including TTLs subsequently clamped by the caller)
+    # are finite without conversion. Coordinate fields must fit a float.
+    if not whole:
+        try:
+            finite = math.isfinite(raw)
+        except OverflowError:
+            finite = False
+        if not finite:
+            return None, error
     return raw, None
 
 

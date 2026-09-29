@@ -571,6 +571,12 @@ def _drive_local_agentic_loop(
     # the wait on a stuck action instead of the budget doing it (review F4).
     _stop_event = _register_session(user_id, prompt_id)
     _finish_error = ''
+    # A hardware-input baseline for this whole run, unaffected by injected
+    # automation. Background file/command actions remain usable while busy.
+    _input_token = None
+    from core.resource_governor import get_physical_input_state
+    _input_state = get_physical_input_state()
+    _input_token = _input_state[0] if _input_state is not None else None
 
     # Each goal gets its own action budget.  The SessionGuard is one
     # process-wide object; nothing reset it, so its 100-action cap was spent
@@ -608,7 +614,10 @@ def _drive_local_agentic_loop(
         logger.info(f"VLM loop iteration {iteration + 1}/{max_iterations}")
 
         try:
-            # 1. Take screenshot
+            # Foreground identity belongs to this screenshot, not to the
+            # later moment inference returns after a person may switch apps.
+            from integrations.vlm.local_computer_tool import foreground_window_handle
+            _captured_foreground = foreground_window_handle()
             screenshot_b64 = take_screenshot(tier)
 
             if use_unified and qwen3vl is not None:
@@ -970,6 +979,8 @@ def _drive_local_agentic_loop(
             # but ON in the loop is the right safe default — solo
             # /visual_agent calls keep their existing behaviour.
             action_payload = _build_action_payload(action_json, parsed)
+            action_payload['_human_input_token'] = _input_token
+            action_payload['_expected_foreground'] = _captured_foreground
             # Persist the run identity beside the action in the existing VLM
             # audit JSONL, so a ledger event can retain a redacted evidence
             # reference without duplicating the action stream in the UI.
@@ -1057,6 +1068,10 @@ def _drive_local_agentic_loop(
                 result = (dict(result, output=_why) if _unknown else
                           {'output': '', 'status': 'blocked', 'error': _why,
                            'block_reason': _why})
+            if result.get('status') == 'user_active':
+                _ends_run = 'user_active'
+                _why = result.get('error', 'Paused for user activity')
+
             # A result carrying an error did not happen on the machine: the
             # safety guard refused it (status 'safety_blocked') or the
             # executor failed ({'error': ...}, often with no status).  Both

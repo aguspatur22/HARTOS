@@ -174,6 +174,11 @@ def computer_control_granted(monkeypatch):
     from integrations.vlm import safety
     monkeypatch.setattr(safety, 'computer_control_block',
                         lambda agent_id, **_kw: None)
+    # These model tests mock OS actions and assume an idle desktop.
+    # Dedicated takeover tests override the signal with event transitions.
+    from core import resource_governor
+    monkeypatch.setattr(resource_governor, 'get_physical_input_state',
+                        lambda **_kw: (0, None))
 
 
 @pytest.fixture

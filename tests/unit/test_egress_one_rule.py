@@ -239,11 +239,13 @@ def _publish_async(client):
     its module globals: the Crossbar HTTP client and the executor."""
     src = open(os.path.join(_ROOT, 'hart_intelligence_entry.py'),
                encoding='utf-8').read()
-    fn = next(n for n in ast.parse(src).body
-              if isinstance(n, ast.FunctionDef) and n.name == 'publish_async')
-    ns = {'json': json, 'os': os, 'client': client,
+    functions = [n for n in ast.parse(src).body
+                 if isinstance(n, ast.FunctionDef)
+                 and n.name in ('publish_async', '_http_crossbar_publish')]
+    ns = {'json': json, 'os': os, 'client': client, 'logging': logging,
+          '_crossbar_client_lock': threading.Lock(),
           'crossbar_executor': _Inline(), 'app': MagicMock()}
-    exec(compile(ast.Module(body=[fn], type_ignores=[]),
+    exec(compile(ast.Module(body=functions, type_ignores=[]),
                  'hart_intelligence_entry.py', 'exec'), ns)
     return ns['publish_async']
 

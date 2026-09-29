@@ -1145,3 +1145,23 @@ def test_icebreaker_draft_missing_match_id_400(client):
         headers=_as_user(1),
     )
     assert r.status_code == 400
+
+
+@pytest.mark.parametrize('ttl', [10**400, -(10**400)])
+def test_discoverable_oversized_integer_is_clamped_not_server_error(client, ttl):
+    response = client.post('/api/social/encounter/discoverable',
+        json={'enabled': True, 'age_claim_18': True, 'ttl_sec': ttl},
+        headers=_as_user(10))
+    assert response.status_code == 200
+
+
+def test_coordinate_integer_overflow_is_a_client_error():
+    from integrations.social.encounter_api import _number
+    value, error = _number({'lat': 10**400}, 'lat', None, whole=False)
+    assert value is None and error
+
+
+def test_large_but_float_representable_integer_retains_existing_validation():
+    from integrations.social.encounter_api import _number
+    raw = 15 * 10**307
+    assert _number({'lat': raw}, 'lat', None, whole=False) == (raw, None)

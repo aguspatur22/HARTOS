@@ -1453,6 +1453,28 @@ def wire_tool_arguments(args):
     return refused_arguments_json(args), True
 
 
+class _CallArguments(str):
+    """Wire-compatible arguments retaining this call's source through transforms."""
+    def __new__(cls, wire, as_written, record):
+        obj = super().__new__(cls, wire)
+        obj.as_written = as_written
+        obj.record = record
+        return obj
+
+    def __deepcopy__(self, memo):
+        # TransformMessages copies history, not the identity of its source call.
+        return type(self)(str(self), self.as_written, self.record)
+
+
+def _bind_argument_sources(messages):
+    for msg in messages or ():
+        for fn in call_functions(msg):
+            raw = fn.get('arguments')
+            if isinstance(raw, str) and not isinstance(raw, _CallArguments):
+                fn['arguments'] = _CallArguments(raw, raw, fn)
+    return messages
+
+
 def ensure_tool_call_arguments_json(messages):
     """Coerce every tool_call / function_call ``arguments`` field to a valid
     JSON-object string, in place, and return the same list.
@@ -1507,8 +1529,10 @@ def ensure_tool_call_arguments_json(messages):
         for fn in call_functions(msg):
             args = fn.get('arguments')
             fixed, changed = wire_tool_arguments(args)
-            if fixed != args:
-                fn['arguments'] = fixed
+            if isinstance(args, _CallArguments):
+                fn['arguments'] = _CallArguments(fixed, args.as_written, args.record)
+            elif fixed != args:
+                fn['arguments'] = _CallArguments(fixed, args, fn)
             coerced += changed
     if coerced:
         try:
@@ -4650,40 +4674,21 @@ def tool_argument_error(func, func_name, arguments, repaired, as_written=None):
 
 
 def stored_call_records(agent, func_call):
-    """``(as_written, records)`` for the call ``func_call`` an executor was
-    handed: the arguments as the model wrote them, and the function dicts in
-    ``agent``'s own conversations (``_oai_messages``) that record the call
-    with that text.
-
-    Review of 7d07c0a2d, measured: every production pipeline attaches
-    TransformMessages to its seats, and autogen 0.2.37 deep-copies the
-    history before any reply function runs (transform_messages.py:64), then
-    runs the TOOL-ARGS-GUARD on the copy.  So the executor was handed the
-    guard's repair of a copy: json_repair's split dict read as strict JSON
-    ("Unknown argument(s): Consulting", a naming mistake), '{"text":' ran
-    the tool with text '' as {"text": ""}, and marking the handed dict
-    marked nothing the conversation keeps.  A stored record matches when its
-    name is the call's and its arguments are the handed ones, or are what
-    the guard makes of them (wire_tool_arguments); the most recent match is
-    the text the model wrote.  No match: the handed arguments and no
-    records."""
+    """Recover only this call's source; never infer it from repaired arguments."""
     handed = func_call.get('arguments', '{}')
-    name = func_call.get('name', '')
-    found = []
-    for conversation in list((getattr(agent, '_oai_messages', None) or {}).values()):
-        for msg in conversation or []:
-            for fn in call_functions(msg):
-                if fn.get('name') != name:
-                    continue
-                raw = fn.get('arguments')
-                if raw is handed or raw == handed or (
-                        isinstance(raw, str)
-                        and wire_tool_arguments(raw)[0] == handed):
-                    found.append(fn)
-    if not found:
-        return handed, []
-    as_written = found[-1].get('arguments')
-    return as_written, [fn for fn in found if fn.get('arguments') == as_written]
+    records = [fn
+               for conversation in (getattr(agent, '_oai_messages', None) or {}).values()
+               for msg in conversation or () for fn in call_functions(msg)]
+    if isinstance(handed, _CallArguments):
+        if any(fn is handed.record for fn in records):
+            return handed.as_written, [handed.record]
+        # A guard called directly on a copy has no source identity. An exact,
+        # unique raw match can mark history, but cannot change what is parsed.
+        matches = [fn for fn in records
+                   if fn.get('name') == func_call.get('name')
+                   and fn.get('arguments') == handed.as_written]
+        return handed.as_written, matches if len(matches) == 1 else []
+    return handed, [fn for fn in records if fn is func_call]
 
 
 def mark_call_refused(records, input_string):
@@ -4906,6 +4911,22 @@ def force_apply_autogen_json_fix():
         # Store original methods for verification
         original_execute = getattr(ConversableAgent, 'execute_function', None)
         original_a_execute = getattr(ConversableAgent, 'a_execute_function', None)
+
+        # Bind before existing transforms deepcopy history. Both reply modes
+        # retain the same call identity, without adding another reply runner.
+        if not getattr(ConversableAgent, '_hart_argument_sources_bound', False):
+            sync_process = ConversableAgent.process_all_messages_before_reply
+            async_process = ConversableAgent.a_process_all_messages_before_reply
+
+            def process_with_sources(self, messages):
+                return sync_process(self, _bind_argument_sources(messages))
+
+            async def async_process_with_sources(self, messages):
+                return await async_process(self, _bind_argument_sources(messages))
+
+            ConversableAgent.process_all_messages_before_reply = process_with_sources
+            ConversableAgent.a_process_all_messages_before_reply = async_process_with_sources
+            ConversableAgent._hart_argument_sources_bound = True
 
         # Apply patches
         ConversableAgent.execute_function = enhanced_execute_function

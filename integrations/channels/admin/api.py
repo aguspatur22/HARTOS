@@ -2419,18 +2419,25 @@ def _apply_embodied_toggle(feed: str, enabled: bool, cfg) -> None:
     try:
         if feed in ('camera', 'screen', 'all'):
             from integrations.vision import get_vision_service
-            vs = get_vision_service()
+            from integrations.vision.vision_service import (
+                running_vision_services, stop_running_vision_services)
             want_running = (
                 enabled and
                 (cfg.camera_enabled or cfg.screen_capture_enabled or cfg.enabled)
             )
-            if want_running and not vs.is_running():
+            # Every running VisionService, not just the integrations.vision
+            # singleton: in bundled Nunba the one taking frames is Nunba's
+            # boot instance (main._start_vision_service), so a No that stopped
+            # only the singleton stopped nothing, and a Yes started a second
+            # service beside Nunba's.
+            running = running_vision_services()
+            if want_running and not running:
                 mode = 'full' if cfg.enabled else 'lite'
-                vs.start(mode=mode)
+                get_vision_service().start(mode=mode)
                 logger.info(f"VisionService started (mode={mode}) via {feed} toggle")
-            elif not want_running and vs.is_running():
-                vs.stop()
-                logger.info(f"VisionService stopped via {feed} toggle")
+            elif not want_running and running:
+                n = stop_running_vision_services(f'{feed} toggled off')
+                logger.info(f"VisionService stopped via {feed} toggle ({n})")
     except ImportError:
         logger.debug("VisionService not installed — skipping toggle side effect")
     except Exception as e:

@@ -22,10 +22,13 @@ screen the human cut. `start_authority_server()` exposes the gate over a Unix
 socket in the canonical state holder (the brain); `query_authority(sensor)` is
 the FAIL-CLOSED client the portal MUST consult before any capture.
 """
+import importlib
 import logging
 import os
 import socket
 import threading
+
+_logger = logging.getLogger(__name__)
 
 _lock = threading.RLock()
 # True = that sense is DISABLED (the AI is blind/deaf to it). Default: sensing on.
@@ -45,8 +48,6 @@ _withheld = {'camera': False, 'screen': False}
 _answered = set()
 
 _SENSES = ('mic', 'camera', 'screen')
-
-_logger = logging.getLogger(__name__)
 
 
 def is_disabled(sensor: str) -> bool:
@@ -90,35 +91,64 @@ def any_disabled() -> bool:
         return any(_state.values())
 
 
-def _running_vision_services() -> list:
-    """Every VisionService running in this process, whoever owns it.
+_VISION_MODULE = 'integrations.vision.vision_service'
+#: A ModuleNotFoundError naming one of these means vision is not installed
+#: here; any other import failure means it is installed and broken.
+_VISION_ABSENT = frozenset({'integrations', 'integrations.vision', _VISION_MODULE})
+#: What the proof says when this process cannot tell whether a camera runs.
+VISION_UNKNOWN = 'unknown'
+_NOT_INSTALLED = object()
 
-    There are three owners (Nunba's boot instance on __main__, standalone
-    hart_intelligence_entry._vision_service, the integrations.vision
-    singleton the admin toggle drives), so no one accessor reaches the camera
-    that is on.  This used to import get_vision_service from
-    integrations.vision.vision_service, which does not define it: the import
-    raised, the except swallowed it, and the eye button never stopped the
-    camera.  An empty list when vision is not installed."""
+
+def _vision_call(name: str):
+    """``name`` from the vision module, _NOT_INSTALLED when vision is not
+    installed here (so no VisionService can exist), or None when it is
+    installed and ``name`` cannot be reached -- logged as an ERROR.
+
+    The last case must never read as "nothing running": this seam used to
+    import get_vision_service, a name vision_service never defined, inside
+    `except ImportError: return`, so the eye button's camera cut stopped
+    nothing and the proof said no camera was running.  The names this module
+    calls are pinned by tests/unit/test_ai_sensing_never_swallows.py."""
     try:
-        from integrations.vision.vision_service import running_vision_services
-    except ImportError:
+        module = importlib.import_module(_VISION_MODULE)
+    except Exception as e:
+        if isinstance(e, ModuleNotFoundError) and e.name in _VISION_ABSENT:
+            return _NOT_INSTALLED
+        _logger.error("ai_sensing: %s is installed but cannot be imported; "
+                      "the camera cut and its proof cannot reach it",
+                      _VISION_MODULE, exc_info=True)
+        return None
+    fn = getattr(module, name, None)
+    if not callable(fn):
+        _logger.error("ai_sensing: %s.%s is missing (renamed?); the camera "
+                      "cut and its proof cannot reach the vision service",
+                      _VISION_MODULE, name)
+        return None
+    return fn
+
+
+def _running_vision_services():
+    """Every VisionService running in this process, whoever owns it (there
+    are three owners, so no one accessor reaches the camera that is on);
+    [] when vision is not installed; None when that cannot be known."""
+    fn = _vision_call('running_vision_services')
+    if fn is _NOT_INSTALLED:
         return []
-    return running_vision_services()
+    return None if fn is None else fn()
 
 
 def _stop_vision() -> None:
     """Hard-cut of the camera/vision service (observable in status)."""
-    for vs in _running_vision_services():
-        try:
-            vs.stop()
-        except Exception:
-            _logger.warning("ai_sensing: a VisionService did not stop",
-                            exc_info=True)
+    fn = _vision_call('stop_running_vision_services')
+    if fn is not _NOT_INSTALLED and fn is not None:
+        fn('the eye button cut the camera')
 
 
-def _vision_running() -> bool:
-    return bool(_running_vision_services())
+def _vision_running():
+    """True / False, or VISION_UNKNOWN: never False because a name broke."""
+    services = _running_vision_services()
+    return VISION_UNKNOWN if services is None else bool(services)
 
 
 def disable_all() -> dict:
@@ -232,6 +262,9 @@ def start_authority_server(path: str = None) -> bool:
         os.chmod(sock_path, 0o660)
         srv.listen(8)
     except Exception:
+        _logger.warning("ai_sensing: authority socket %s not served; every "
+                        "portal capture will be refused as unreachable",
+                        sock_path, exc_info=True)
         return False
 
     def _serve():
@@ -239,20 +272,28 @@ def start_authority_server(path: str = None) -> bool:
             try:
                 conn, _ = srv.accept()
             except Exception:
+                _logger.error("ai_sensing: authority socket %s stopped "
+                              "accepting; every later portal query fails "
+                              "closed as unreachable", sock_path, exc_info=True)
                 break
             try:
                 sensor = conn.recv(64).decode('ascii', 'replace').strip()
                 conn.sendall(b'1' if allowed(sensor) else b'0')
-            except Exception:
+            except Exception as e:
+                _logger.warning("ai_sensing: authority query failed (%s); "
+                                "answering No", e)
                 try:
                     conn.sendall(b'0')          # fail-closed on any error
-                except Exception:
-                    pass
+                except Exception as e2:
+                    _logger.warning("ai_sensing: the No did not reach the "
+                                    "asker (%s); it fails closed on its side",
+                                    e2)
             finally:
                 try:
                     conn.close()
-                except Exception:
-                    pass
+                except Exception as e3:
+                    _logger.debug("ai_sensing: authority connection close "
+                                  "failed (%s)", e3)
 
     threading.Thread(target=_serve, daemon=True,
                      name='ai-sensing-authority').start()
@@ -294,7 +335,11 @@ def query_authority_state(sensor: str, path: str = None,
         c.sendall(sensor.encode('ascii'))
         reply = c.recv(8).strip()
         c.close()
-    except Exception:
+    except Exception as e:
+        # The answer stays fail-closed; the cause is kept, so a permission
+        # or path fault is never mistaken for a human's cut (2026-08-25).
+        _logger.warning("ai_sensing: authority at %s unreachable for %r: %s",
+                        _authority_path(path), sensor, e)
         return SENSE_UNREACHABLE
     return SENSE_ALLOW if reply == b'1' else SENSE_CUT
 

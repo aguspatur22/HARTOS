@@ -819,3 +819,53 @@ class QuotedKeysAreReadAsTheReaderReadsThem(_KwargsChat):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ConversationArgumentIdentity(unittest.TestCase):
+    def test_colliding_conversations_do_not_change_execution_or_refusal(self):
+        from hartos.helper import (wire_tool_arguments, _bind_argument_sources,
+                                   ensure_tool_call_arguments_json,
+                                   stored_call_records, bind_tool_call_arguments)
+        raw = '{"command": ls -la, command: rm -rf /tmp/x}'
+        repaired = wire_tool_arguments(raw)[0]
+        for run_async in (False, True):
+            for current_raw, older_raw, allowed in (
+                    (raw, repaired, False), ('{"command": ""}', '{"command":', True)):
+                with self.subTest(run_async=run_async, allowed=allowed):
+                    calls = []
+                    def run_command(command: str):
+                        calls.append(command)
+                        return 'done'
+                    force_apply_autogen_json_fix()
+                    executor = ConversableAgent('executor', llm_config=False,
+                                                human_input_mode='NEVER')
+                    executor.register_function({'run_command': run_command})
+                    current = {'name': 'run_command', 'arguments': current_raw}
+                    older = {'name': 'run_command', 'arguments': older_raw}
+                    message = lambda fn: {'role': 'assistant', 'content': None,
+                        'tool_calls': [{'id': 'same_id', 'type': 'function', 'function': fn}]}
+                    executor._oai_messages['current'] = [message(current)]
+                    executor._oai_messages['older'] = [message(older)]
+                    source = executor._oai_messages['current']
+                    transformed = ensure_tool_call_arguments_json(
+                        copy.deepcopy(_bind_argument_sources(source)))
+                    handed = transformed[-1]['tool_calls'][0]['function']
+                    # Wire serialization contains ordinary strings, no provenance fields.
+                    json.loads(json.dumps(transformed))
+                    with Flask(__name__).app_context():
+                        if run_async:
+                            success, _ = asyncio.run(executor.a_execute_function(handed))
+                        else:
+                            success, _ = executor.execute_function(handed)
+                    self.assertEqual(success, allowed)
+                    self.assertEqual(calls, [''] if allowed else [])
+                    self.assertEqual(older['arguments'], older_raw)
+                    if not allowed:
+                        self.assertEqual(json.loads(current['arguments'])[REFUSED_ARGUMENTS_KEY], raw)
+
+    def test_unscoped_strict_call_never_borrows_another_conversation(self):
+        from hartos.helper import stored_call_records
+        other = {'name': 'tool', 'arguments': '{"text":'}
+        agent = mock.Mock(_oai_messages={'other': [{'function_call': other}]})
+        handed = {'name': 'tool', 'arguments': '{"text": ""}'}
+        self.assertEqual(stored_call_records(agent, handed), (handed['arguments'], []))
