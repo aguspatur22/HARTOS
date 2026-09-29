@@ -102,3 +102,28 @@ def test_installed_sdk_uses_owned_timeout_over_real_local_http(slow):
         server.shutdown()
         server.server_close()
         worker.join(timeout=2)
+
+
+def test_an_outage_is_announced_once_and_its_end_once(caplog):
+    """Offline Crossbar is an ordinary state: one warning (no traceback) when
+    publishing starts failing, debug while it keeps failing, one line when it
+    recovers -- not an ERROR traceback on every publish."""
+    state = {'down': True}
+    client = SimpleNamespace(timeout=None)
+    def publish(topic, payload):
+        if state['down']:
+            raise ConnectionError('refused')
+    client.publish = publish
+    send = transport(client)
+    with caplog.at_level(logging.DEBUG):
+        for _ in range(3):
+            send('topic', 'x')
+        state['down'] = False
+        send('topic', 'x')
+        send('topic', 'x')
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and 'refused' in warnings[0].getMessage()
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert not [r for r in caplog.records if r.exc_info]
+    assert sum('still failing' in r.getMessage() for r in caplog.records) == 2
+    assert sum('recovered' in r.getMessage() for r in caplog.records) == 1

@@ -2419,7 +2419,12 @@ _crossbar_client_lock = threading.Lock()
 
 
 def _http_crossbar_publish(topic: str, payload: str, timeout: float = 2.0):
-    """Use the publisher's timeout; never change another socket's defaults."""
+    """Use the publisher's timeout; never change another socket's defaults.
+
+    An unreachable Crossbar is an ordinary state (an offline node), so an
+    outage is announced once when it starts and once when it ends -- tracked
+    on this function (``.failing``) -- not as a traceback per publish.
+    """
     if client is None:
         return
     try:
@@ -2438,8 +2443,20 @@ def _http_crossbar_publish(topic: str, payload: str, timeout: float = 2.0):
                 # Preserve alternate SDK compatibility. Its implementation
                 # owns its timeout; process-global socket mutation is unsafe.
                 client.publish(topic, payload)
-    except Exception:
-        logging.getLogger(__name__).exception("_http_crossbar_publish: swallowed Exception")
+    except Exception as e:
+        log = logging.getLogger(__name__)
+        if not getattr(_http_crossbar_publish, 'failing', False):
+            _http_crossbar_publish.failing = True
+            log.warning("Crossbar publish failing (cloud copy of %s not "
+                        "sent; local/PeerLink delivery unaffected): %s: %s -- "
+                        "repeats are logged at debug until it recovers",
+                        topic, type(e).__name__, e)
+        else:
+            log.debug("Crossbar publish still failing for %s: %s", topic, e)
+        return
+    if getattr(_http_crossbar_publish, 'failing', False):
+        _http_crossbar_publish.failing = False
+        logging.getLogger(__name__).info("Crossbar publish recovered")
 
 
 # Inject HTTP transport into MessageBus (avoids Layer 2 importing Layer 3)
