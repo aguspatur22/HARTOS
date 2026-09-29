@@ -24,11 +24,8 @@
 # consent_fanout_p2, drm_capture_gate, tool_args_must_be_an_object,
 # venv_built_by_this_interpreter, vision_sidecar): their 15 ids deleted.
 
-tests.unit.test_draft_first_dispatch.TestDispatchDraftFirstDelegation.test_delegate_hive_falls_back_to_fast_when_no_expert
-tests.unit.test_p2p_flow_fixes.test_resolver_caches_positive_answer
-tests.unit.test_p2p_flow_fixes.test_resolver_picks_first_alive_central
-tests.unit.test_reuse_history_sync.ReuseHistorySync.test_sync_fires_on_STALE_not_only_on_EMPTY
-tests.unit.test_reuse_history_sync.ReuseHistorySync.test_sync_replaces_in_place_never_appends_a_duplicate_prefix
-tests.unit.test_shared_history_agent_scope.test_create_writes_the_buffer_through_the_shared_writer
-tests.unit.test_shared_history_agent_scope.test_every_writeback_call_passes_the_agent
-tests.unit.test_vlm_stop_node_scope.test_node_stop_is_logged_with_its_count
+#
+# EMPTY since the green-CI change (stacked on #132): the last 8 were stale
+# tests (a registry fixture without base_url, the p2p resolver's CI gate,
+# two source-text checks rewritten as behavioural tests, a caplog double
+# count).  With the list empty, any failing test is a new failure.
