@@ -16,9 +16,10 @@ WHY
 INPUT (written by the shard step in .github/workflows/flake-checks.yml)
     <reports>/pytest-red-shard-<N>/red_files.tsv, one line per red test file:
         <pytest exit code>\t<test file path>\t<junit xml, relative to the tsv>
-    It starts with a `#` header, so it is never empty; it exists for every
-    shard that reached a verdict, and a missing one means the shard died, so
-    the ratchet fails closed.
+    It starts with a `#` header, so it is never empty, and ends with a
+    `# complete:` line written after the shard ran every selected file.  A
+    shard with no file, or a file without that line (killed part-way), has
+    no verdict for the files it never reached, so the ratchet fails closed.
 
 IDS
     ``classname.name`` exactly as the JUnit report spells it, parsed by the
@@ -27,6 +28,11 @@ IDS
     failing testcase still gets an id, so it can't hide:
         <file>::INTERPRETER_HANG     the per-file `timeout` fired (124/137)
         <file>::NO_REPORT_EXIT_<rc>  red, but no report or no failing testcase
+        <file>::ABNORMAL_EXIT_<rc>   pytest stopped early (2 interrupted with no
+                                     collection error, 3 internal error, 4
+                                     usage): the report's failures, if any,
+                                     are kept, but the tests it never ran are
+                                     not vouched for by them
 
 Usage:
     python scripts/ci_failure_ratchet.py --reports DIR --baseline FILE \
@@ -41,7 +47,10 @@ from generate_regression_report import parse_junit_xml  # noqa: E402
 
 SHARD_DIR = 'pytest-red-shard-{}'
 RED_FILES = 'red_files.tsv'
+COMPLETE_MARKER = '# complete'
 _HANG_EXIT_CODES = (124, 137)
+_PYTEST_INTERRUPTED = 2       # also what a collection error exits with
+_PYTEST_EARLY_EXITS = (_PYTEST_INTERRUPTED, 3, 4)
 
 
 def red_file_failures(rc, path, xml_path):
@@ -51,6 +60,7 @@ def red_file_failures(rc, path, xml_path):
               f'counted as one failure, its report (if any) is not trusted')
         return {f'{path}::INTERPRETER_HANG'}
     ids = set()
+    collection_error = False
     if not os.path.isfile(xml_path):
         why = 'no JUnit report was written'
     else:
@@ -58,10 +68,19 @@ def red_file_failures(rc, path, xml_path):
         for failed in report['test_details']:
             # A collection error has an empty classname, so the reader's
             # "classname.name" starts with the dot.
+            collection_error |= failed['name'].startswith('.')
             ids.add(failed['name'].lstrip('.'))
         why = (f'its JUnit report is unreadable: {report["error"]}'
                if report.get('error') else
                'its JUnit report lists no failing testcase')
+    early = rc in _PYTEST_EARLY_EXITS and not (
+        rc == _PYTEST_INTERRUPTED and collection_error)
+    if ids and early:
+        # The report lists what failed before pytest stopped; the tests it
+        # never reached are unaccounted for, so the file is flagged too.
+        print(f'::warning::{path}: pytest stopped early (rc={rc}); its '
+              f'report covers only the tests that ran')
+        return ids | {f'{path}::ABNORMAL_EXIT_{rc}'}
     if ids:
         return ids
     print(f'::warning::{path}: red (rc={rc}) but {why}; counted as one '
@@ -78,12 +97,18 @@ def current_failures(reports, shards):
             missing.append(SHARD_DIR.format(n))
             continue
         with open(tsv, encoding='utf-8') as fp:
-            for line in fp:
-                if not line.strip() or line.startswith('#'):
-                    continue
-                rc, path, xml_name = line.rstrip('\n').split('\t')
-                ids |= red_file_failures(
-                    int(rc), path, os.path.join(os.path.dirname(tsv), xml_name))
+            lines = fp.read().splitlines()
+        if not any(line.startswith(COMPLETE_MARKER) for line in lines):
+            print(f'::warning::{SHARD_DIR.format(n)}: its report has no '
+                  f'"{COMPLETE_MARKER}" line, so the shard stopped part-way')
+            missing.append(SHARD_DIR.format(n))
+            continue
+        for line in lines:
+            if not line.strip() or line.startswith('#'):
+                continue
+            rc, path, xml_name = line.split('\t')
+            ids |= red_file_failures(
+                int(rc), path, os.path.join(os.path.dirname(tsv), xml_name))
     return ids, missing
 
 

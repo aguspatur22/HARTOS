@@ -41,9 +41,10 @@ def _run_pytest(tmp_path, body, name='test_sample.py'):
     return rc, str(test_file.relative_to(tmp_path)), str(xml)
 
 
-def _shard(root, n, rows):
+def _shard(root, n, rows, complete=True):
     """The layout the shard step uploads: its reports next to red_files.tsv,
-    which names them relative to itself."""
+    which names them relative to itself, closed by the end marker the loop
+    writes after its last file (absent when the shard was killed part-way)."""
     d = root / f'pytest-red-shard-{n}'
     d.mkdir(parents=True)
     lines = ['# exit code\ttest file\tjunit report\n']
@@ -52,6 +53,8 @@ def _shard(root, n, rows):
         if os.path.isfile(xml):
             shutil.move(xml, d / name)
         lines.append(f'{rc}\t{path}\t{name}\n')
+    if complete:
+        lines.append('# complete: 3 files\n')
     (d / 'red_files.tsv').write_text(''.join(lines))
     return d
 
@@ -218,3 +221,42 @@ def test_a_file_level_id_says_why(tmp_path, capsys):
     assert any('test_x.py' in w and 'unreadable' in w for w in warnings)
     assert any('test_y.py' in w and 'no JUnit report' in w for w in warnings)
     assert any('test_z.py' in w and 'did not exit' in w for w in warnings)
+
+
+def test_a_shard_killed_part_way_fails_closed(tmp_path, capsys):
+    """No end marker: the files after the kill were never checked, so a
+    report listing only known failures must not read as a clean shard."""
+    rc, path, xml = _run_pytest(tmp_path, """
+        def test_known_bad():
+            assert 1 == 2
+    """)
+    reports = tmp_path / 'reports'
+    _shard(reports, 0, [(rc, path, xml)], complete=False)
+    baseline = tmp_path / 'known.txt'
+    baseline.write_text('tests.unit.test_sample.test_known_bad\n')
+
+    assert ratchet.main(['--reports', str(reports), '--baseline', str(baseline),
+                         '--shards', '1']) == 1
+    out = capsys.readouterr().out
+    assert 'stopped part-way' in out and 'pytest-red-shard-0' in out
+
+
+def test_an_early_pytest_exit_is_flagged_even_if_its_failures_are_known(tmp_path):
+    """pytest.exit() after a known failure: the report lists only that
+    failure, but the tests after it never ran."""
+    rc, path, xml = _run_pytest(tmp_path, """
+        import pytest
+
+        def test_known_bad():
+            assert 1 == 2
+
+        def test_stops_the_run():
+            pytest.exit('stopping')
+
+        def test_never_runs():
+            pass
+    """)
+    assert rc == 2
+    ids = ratchet.red_file_failures(rc, path, xml)
+    assert 'tests.unit.test_sample.test_known_bad' in ids
+    assert 'tests/unit/test_sample.py::ABNORMAL_EXIT_2' in ids

@@ -323,8 +323,11 @@ jobs:
           # by the failure-ratchet job, which fails only on a failing test id
           # that tests/ci_known_failures.txt (main's list) does not have. The
           # file is created up front with a header line (never zero bytes, so
-          # the upload always carries it): header-only means "nothing red",
-          # and a MISSING file means this shard never reached a verdict.
+          # the upload always carries it).  The END MARKER line is written
+          # only after the loop has run every selected file: a file without
+          # it is a shard killed part-way (the job's time cap has fired
+          # before), and the ratchet treats it as no report at all, because
+          # the files it never reached were never checked.
           REPORTS="$RUNNER_TEMP/pytest-red"
           mkdir -p "$REPORTS"
           printf '# exit code\ttest file\tjunit report\n' > "$REPORTS/red_files.tsv"
@@ -358,6 +361,7 @@ jobs:
               fi
             fi
           done
+          printf '# complete: %s files\n' "${#SEL[@]}" >> "$REPORTS/red_files.tsv"
           set -e
           if [ "$overall" -ne 0 ]; then
             {
