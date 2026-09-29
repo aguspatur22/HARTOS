@@ -205,3 +205,16 @@ def test_baseline_lines(tmp_path, line, expected):
     p = tmp_path / 'b.txt'
     p.write_text(line + '\n')
     assert ratchet.load_baseline(str(p)) == expected
+
+
+def test_a_file_level_id_says_why(tmp_path, capsys):
+    xml = tmp_path / 'broken.xml'
+    xml.write_text('<not junit')
+    ratchet.red_file_failures(1, 'tests/unit/test_x.py', str(xml))
+    ratchet.red_file_failures(1, 'tests/unit/test_y.py', str(tmp_path / 'none.xml'))
+    ratchet.red_file_failures(124, 'tests/unit/test_z.py', str(xml))
+    warnings = [l for l in capsys.readouterr().out.splitlines()
+                if l.startswith('::warning::')]
+    assert any('test_x.py' in w and 'unreadable' in w for w in warnings)
+    assert any('test_y.py' in w and 'no JUnit report' in w for w in warnings)
+    assert any('test_z.py' in w and 'did not exit' in w for w in warnings)

@@ -376,7 +376,9 @@ jobs:
         with:
           name: pytest-red-shard-${{ matrix.shard }}
           path: ${{ runner.temp }}/pytest-red/
-          if-no-files-found: ignore
+          # warn, not ignore: nothing to upload means the test step died
+          # before writing its header, and the ratchet will fail closed.
+          if-no-files-found: warn
           retention-days: 14
 
       # Integration + e2e — cross-module flows. Best-effort: surfaced but
@@ -459,7 +461,7 @@ jobs:
         with:
           name: current-failures
           path: current_failures.txt
-          if-no-files-found: ignore
+          if-no-files-found: warn
           retention-days: 14
 
   # ─── Compositor: default-feature pure-logic floor (the dev-box build path) ──

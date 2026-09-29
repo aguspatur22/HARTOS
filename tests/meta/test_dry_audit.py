@@ -220,15 +220,19 @@ _CURRENT_FRAMES_ALLOWED = {
 
 
 def _source_trees():
-    """(repo-relative posix path, AST) for every non-test source module."""
+    """({repo-relative posix path: AST} for every non-test source module,
+    [modules that do not parse]).  An unparseable module is reported, never
+    skipped: a guard that quietly ignores a file cannot vouch for it."""
+    trees, unparseable = {}, []
     for rel, path in _walk():
         rel = rel.replace(os.sep, '/')
         if rel.split('/')[0] == 'tests':
             continue
         try:
-            yield rel, ast.parse(_read(path))
-        except SyntaxError:
-            continue
+            trees[rel] = ast.parse(_read(path))
+        except SyntaxError as e:
+            unparseable.append(f'{rel}: {e}')
+    return trees, unparseable
 
 
 def _definitions(tree):
@@ -254,7 +258,13 @@ class SingleOwnerGuards(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.trees = dict(_source_trees())
+        cls.trees, cls.unparseable = _source_trees()
+
+    def test_source_guard_every_module_was_checked(self):
+        self.assertFalse(
+            self.unparseable,
+            'these modules do not parse, so no guard here checked them:\n  '
+            + '\n  '.join(self.unparseable))
 
     def test_source_guard_each_canonical_name_has_one_owner(self):
         where = {name: [] for name in CANONICAL_OWNERS}

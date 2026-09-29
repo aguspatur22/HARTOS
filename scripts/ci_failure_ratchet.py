@@ -47,14 +47,26 @@ _HANG_EXIT_CODES = (124, 137)
 def red_file_failures(rc, path, xml_path):
     """The failing test ids of ONE red test file."""
     if rc in _HANG_EXIT_CODES:
+        print(f'::warning::{path}: the interpreter did not exit (rc={rc}); '
+              f'counted as one failure, its report (if any) is not trusted')
         return {f'{path}::INTERPRETER_HANG'}
     ids = set()
-    if os.path.isfile(xml_path):
-        for failed in parse_junit_xml(xml_path)['test_details']:
+    if not os.path.isfile(xml_path):
+        why = 'no JUnit report was written'
+    else:
+        report = parse_junit_xml(xml_path)
+        for failed in report['test_details']:
             # A collection error has an empty classname, so the reader's
             # "classname.name" starts with the dot.
             ids.add(failed['name'].lstrip('.'))
-    return ids or {f'{path}::NO_REPORT_EXIT_{rc}'}
+        why = (f'its JUnit report is unreadable: {report["error"]}'
+               if report.get('error') else
+               'its JUnit report lists no failing testcase')
+    if ids:
+        return ids
+    print(f'::warning::{path}: red (rc={rc}) but {why}; counted as one '
+          f'failure under a file-level id')
+    return {f'{path}::NO_REPORT_EXIT_{rc}'}
 
 
 def current_failures(reports, shards):
