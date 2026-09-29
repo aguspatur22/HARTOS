@@ -53,7 +53,11 @@ MAX_BARE_SWALLOWS = 1517        # `except ...: pass` (was 1533 -> 1528 -> 1521
 #: Note 4 of the remainder are in hive_guardrails.py, which CLAUDE.md forbids
 #: modifying (circuit breaker / structural immutability) — they need the steward,
 #: not a refactor.
-MAX_SECURITY_SWALLOWS = 61      # was 68 -> 63 -> 62 -> 61.
+MAX_SECURITY_SWALLOWS = 60      # was 68 -> 63 -> 62 -> 61 -> 60.
+                                # 2026-09-29: the staleness check below
+                                # measured 60 on main 492a57aa (CI run
+                                # 36402628009, shard 7) and on a clean local
+                                # checkout; this guard was the red file.
                                 # 2026-09-27: security/node_integrity.py's five
                                 # identity-race swallows (584cdec55 took the
                                 # count to 67) now log; one more had gone
