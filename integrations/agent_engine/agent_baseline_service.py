@@ -36,11 +36,8 @@ def _resolve_baseline_dir():
     if db_path and db_path != ':memory:' and os.path.isabs(db_path):
         return os.path.join(os.path.dirname(db_path), 'agent_data', 'baselines')
     if os.environ.get('NUNBA_BUNDLED') or getattr(_sys, 'frozen', False):
-        try:
-            from core.platform_paths import get_agent_data_dir
-            return os.path.join(get_agent_data_dir(), 'baselines')
-        except ImportError:
-            return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data', 'baselines')
+        from core.platform_paths import get_agent_data_dir
+        return os.path.join(get_agent_data_dir(), 'baselines')
     return os.path.join('agent_data', 'baselines')
 
 BASELINE_DIR = _resolve_baseline_dir()
@@ -60,6 +57,12 @@ def _sanitize_id(value: str) -> str:
     if not _SAFE_ID_RE.match(s):
         raise ValueError(f'Invalid identifier: {s!r}')
     return s
+
+
+def _version_sort_key(fname: str) -> int:
+    """Numeric version of a 'vN.json' snapshot filename; -1 for anything else."""
+    m = re.match(r'^v(\d+)\.json$', fname)
+    return int(m.group(1)) if m else -1
 
 
 class AgentBaselineService:
@@ -147,7 +150,12 @@ class AgentBaselineService:
             return snapshot
 
         except Exception as e:
-            logger.debug(f'Baseline capture failed: {e}')
+            # WARNING, not DEBUG: a swallowed capture failure is how the
+            # autoresearch gate stayed inert (it passed flow_id='autoresearch',
+            # int() raised here, and no baseline was ever written; hevolveai
+            # Master 11.433 gate A). Still fire-and-forget: never raises.
+            logger.warning(f'Baseline capture failed for {prompt_id!r} '
+                           f'flow {flow_id!r}: {e}')
             return None
 
     # ── Metric Collectors ────────────────────────────────────────
@@ -503,7 +511,10 @@ class AgentBaselineService:
         if not os.path.isdir(agent_dir):
             return []
         results = []
-        for fname in sorted(os.listdir(agent_dir)):
+        # NUMERIC version order: a plain sorted() is a string sort, which puts
+        # v10 before v9, so compute_trend's [-1] read v9 as the latest once a
+        # tenth snapshot existed (hevolveai Master 11.433, gate C).
+        for fname in sorted(os.listdir(agent_dir), key=_version_sort_key):
             m = re.match(r'^v(\d+)\.json$', fname)
             if not m:
                 continue
@@ -691,7 +702,12 @@ class AgentBaselineAdapter(BenchmarkAdapter):
         for agent_dir in baseline_dir.iterdir():
             if not agent_dir.is_dir():
                 continue
-            snapshots = sorted(agent_dir.glob('v*.json'))
+            # Numeric version order (see list_snapshots): [-2]/[-1] must be the
+            # two NEWEST snapshots, which a string sort gets wrong from v10 on.
+            snapshots = sorted(
+                (p for p in agent_dir.glob('v*.json')
+                 if re.match(r'^v(\d+)\.json$', p.name)),
+                key=lambda p: _version_sort_key(p.name))
             if len(snapshots) < 2:
                 continue
             try:

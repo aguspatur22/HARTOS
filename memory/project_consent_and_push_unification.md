@@ -359,7 +359,11 @@ owner's decision recorded above.
 
 ## TIER 2 — a concern with no canonical store at all
 
-### F4 — the mic has no consent type — **UNBLOCKED 2026-09-21: nobody holds it**
+### F4 — the mic shares the goal gate's consent — **OWNER DECISION 2026-09-21; do not implement**
+Owner asked 2026-09-21 with the three options below costed; answer was **file it, do
+not change behaviour**. So F4 stays open by decision, not by ignorance: the finding
+and its measurements are recorded, nothing is folded, and the next session must NOT
+"just add microphone_capture" without revisiting the grant-migration question.
 The "HELD" premise was wrong. fix-all-log-observed-issues confirms it has **no**
 `consent_service.py` edits and never had any in this session — it only READ the
 file — and `git status`/`git diff` on that path are both empty. So F4 is
@@ -368,8 +372,47 @@ unclaimed and doable now.
 peer who once discussed a file, is not evidence that a session owns work in it.
 Ask, or check authorship, before holding a fold for someone — holding on a false
 attribution costs exactly as much as a real block.*
-`core/ai_sensing.py:27-102` in-process kill switch is the only gate;
-`consent_service.py:136-137` says an ask "belongs here" if built.
+**PREMISE CORRECTED 2026-09-21 — the fold is bigger and needs an owner call.**
+"The mic has no consent type" is WRONG. The mic IS gated, on a SHARED generic
+type, which is worse than ungated because it conflates two capabilities:
+
+    whisper_tool._mic_learning_consented:
+        check_consent(db, user, 'data_access', scope='*')     -> ingest mic PCM
+    hive_guardrails.py:1407-1413:
+        consent_type = cfg.get('consent_type', 'data_access')
+        check_consent(db, user_id, consent_type, scope='*')   -> run a goal
+
+Identical type AND scope. So a user who approves a consent-gated GOAL (whose type
+DEFAULTS to `data_access`) thereby also permits raw mic PCM16 to be ingested into
+HevolveAI's world model for continual learning, and a user who answers the mic ask
+thereby satisfies every default-typed goal gate. The whisper docstring intends the
+second direction on purpose ("a user who has granted the speech-therapy or spoken
+English agent its microphone consent is not asked a second time"); the FIRST
+direction — a goal's data-access approval silently enabling the microphone — reads
+as unintended, and it is the privacy-relevant one.
+
+This blocks the fold on a decision I must not take alone, because BOTH options cost
+something and the owner has reserved exactly this kind of call ("one flag per
+concept; consents have scope+TTL", and "never discard an existing grant without
+knowing its scope+TTL"):
+  (a) switch the mic to `microphone_capture` and re-ask everyone. Honest and
+      separates the concepts, but it revokes de-facto permission that users
+      currently hold and interrupts live voice agents (speech therapy, spoken
+      English) mid-flow. The original F4 text assumed this without noticing it
+      discards grants.
+  (b) accept `microphone_capture` OR a pre-existing `data_access` grant during a
+      migration window. No interruption, but it keeps the conflation alive for as
+      long as the window lasts, and needs a TTL to ever end.
+Whichever is chosen, `ai_sensing` stays as the hard cut (a kill switch that works
+with the DB down is a legitimate second layer, not a parallel store) but must not
+be the only record.
+
+Original notes below, kept because the rest of the fold still applies:
+`core/ai_sensing.py:27-102` in-process kill switch (`_state = {'mic', 'camera',
+'screen'}`, `allowed(sensor)`); `consent_service.py:136-137` says an ask "belongs
+here" if built. Note `screen_capture` IS already in CONSENT_TYPES and
+`CAPABILITY_CONSENT_TYPES` maps camera/screen aliases, so the registry pattern to
+copy for the mic is established.
 Fold: add `microphone_capture` to `CONSENT_TYPES` + `CAPABILITY_CONSENT_TYPES` +
 `consentAsks.js`; the audio path (`whisper_tool.py:1595`) checks it; `ai_sensing`
 stays as the hard cut (legitimate second layer — a kill switch that works with the
@@ -413,11 +456,47 @@ Track to landed per #119.
   verifying a privacy fix must not itself switch a camera on.
   *Lesson: grep the flag NAME and the enclosing schema assignment; the PUT wrote
   the same permission through an object assignment no name-grep would find.*
-- **F7 NodeComputeConfig + `HEVOLVE_*`** (`compute_config.py:16-89`, env > DB >
-  defaults). **Distinguish permission from capacity**: fold only the permission-ish
-  fields (`allow_metered_for_hive`, `accept_*`) onto consent; leave capacity
-  numbers (`max_hive_gpu_pct`, `offered_gpu_hours_per_day`) as config. Do not
-  over-fold.
+- **F7 NodeComputeConfig + `HEVOLVE_*`** — **defect 1 DONE + PUSHED (`a1789b6c2`),
+  defect 2 OPEN (needs an owner call).** Defect 1: the env pin may now only
+  RESTRICT `allow_metered_for_hive`, never grant, via `_ENV_MAY_ONLY_RESTRICT`.
+  Red-first proved the guard discriminates (env=true fix-off -> True, fix-on ->
+  False, env=false -> still restricts); 22 tests pass and the 4 new ones were
+  verified BY NAME. The pre-existing `test_env_allow_metered_override` asserted the
+  GRANT works, i.e. it pinned the defect, and is replaced.
+  Audit detail below stands.
+  *Path in this plan was wrong: it is `integrations/agent_engine/compute_config.py`,
+  not `integrations/social/`. Third premise error caught by checking first.*
+
+  `_DEFAULTS` (`:16-24`), precedence **env > DB > defaults** (`:54-77`), split by
+  kind as the fold intends:
+  | field | kind |
+  |---|---|
+  | `allow_metered_for_hive` (False) | **PERMISSION** — spends the user's metered link |
+  | `accept_thought_experiments` (**True**) | **PERMISSION** — accepts hive work |
+  | `accept_frontier_training` (False) | **PERMISSION** |
+  | `max_hive_gpu_pct` (50), `offered_gpu_hours_per_day` (0.0), `metered_daily_limit_usd` | capacity — LEAVE as config |
+  | `compute_policy`, `hive_compute_policy`, `auto_settle`, `min_settlement_spark` | policy/financial — out of scope |
+
+  **Two real defects found, one of them F2's exact shape:**
+  1. `HEVOLVE_ALLOW_METERED_HIVE` (`:76`) overrides `allow_metered_for_hive`, and
+     env outranks DB — so **an env pin can GRANT a permission the user declined**,
+     which is precisely what F2 fixed for the copilot (`66386a45e`). Same remedy
+     applies verbatim: the override may only ever RESTRICT, never grant. Copy F2's
+     asymmetric predicate and its test shape.
+  2. `accept_thought_experiments` **defaults to True**, so a node accepts hive
+     thought-experiment work with no record that anyone agreed. Permission by
+     default, and nothing to revoke.
+
+  **Do defect 1 first, alone.** It is a strict narrowing with an accepted precedent,
+  so it carries no self-DoS risk. Defect 2 flips a default that other nodes'
+  work depends on, so consent-gating it could stop hive work fleet-wide — that needs
+  BLOCK + ASK + RECOVERY designed before it lands, and probably an owner call on
+  whether existing accepting nodes are grandfathered. Do NOT bundle them.
+
+  Callers to audit before either (the fields are read in 5 non-test files):
+  `hart_intelligence_entry.py`, `compute_config.py`,
+  `integrations/coding_agent/tool_backends.py`, `integrations/social/api_tracker.py`,
+  `integrations/social/_models_local.py`; tests in `tests/unit/test_compute_config.py`.
 - **F8 ShareEvent(event_type='consent')** — **CLOSED, NOT FOLDED (`afe51600a`)**.
   Determination: this is **not** the same concern as `UserConsent` and folding it
   would be over-folding. `UserConsent` is "I permit software to do X to me",
@@ -448,9 +527,9 @@ Track to landed per #119.
   DIFFERENT concern wearing the same word. Check subject/object/lifecycle before
   folding — and when the answer is "do not fold", still audit the code, because
   the reason it looked like a consent store is that it gates something.*
-- **F9 — IMPLEMENTED 2026-09-21, NOT YET COMMITTED** (holding for a clean
-  regression comparison; the owner asked for zero regression and the sweep
-  decides, not my confidence).
+- **F9 — DONE + PUSHED 2026-09-21** (`077b27332`). Zero regression EVIDENCED, not
+  asserted: hermetic A/B of `a34e6489f^` vs this change, fresh pinned
+  `HEVOLVE_DB_PATH` per arm, 254 passed / 0 failed / 0 errors in both arms.
 
   **What it turned out to be, bigger than the audit said.** Implementing half A
   hit `IntegrityError` and exposed a defect in the SHARED writer:
@@ -643,25 +722,445 @@ message *originates* at the canonical entry and picks a transport; nothing else 
 an entry point.
 
 - **F12** legacy `publish_async` bypass (`hart_intelligence_entry.py:3028-3029`,
-  `:11145-11160`) — the migration already tracked in
-  `memory/project_publish_aop_migration.md`. Own it; do not start a rival doc.
-- **F13** FCM three paths → one `send_push` (`core/fcm_sync.py:325-365`,
-  `local_subscribers.py:165-183`, `device_routing_service.py`). Note the
-  self-contradiction to resolve: `local_subscribers.py:40-45` says FCM is
-  cloud-only, `:165-173` then sends FCM. Also fix the hardcoded generic body.
+  `:11145-11160`) — **PREMISE PARTLY WRONG, checked 2026-09-22.**
+  `memory/project_publish_aop_migration.md` **DOES NOT EXIST** — `memory/` holds
+  only this plan, `tool_name_unification_plan.md` and `tool_naming_audit.md`. So
+  there is nothing to "own", and F12 needs its own audit from scratch. The
+  instruction "do not start a rival doc" was predicated on a doc that isn't there;
+  it should not stop the next session from writing the first one.
+  `publish_async` itself DOES exist and has real callers
+  (`core/persona_registry.py:211`, `core/peer_link/crossbar_publish.py:143-148`,
+  `core/peer_link/message_bus.py:135`), several resolving it indirectly through
+  `safe_hartos_attr('publish_async')` — which is the interesting part, because an
+  attr-resolved callable is invisible to a name grep of call sites.
+  ### F12 AUDIT 2026-09-22 — **DO NOT FOLD THE CALL SITES YET. There is a live
+  feature riding on this exact function, and folding it silently breaks it.**
+
+  **Three definitions, and they are NOT rival copies** (my own first reading, and
+  it was wrong):
+  | site | what it is |
+  |---|---|
+  | `hart_intelligence_entry.py:2408` | **the canonical one** |
+  | `hartos/reuse_recipe.py:391` | thin delegator via `safe_hartos_attr('publish_async')` |
+  | `hartos/create_recipe.py:141` | same, and the docstring gives the REASON: a worker eager-importing `hart_intelligence` deadlocks against the canonical loader's import lock |
+  So the duplication is deliberate and load-bearing. Deleting either delegator
+  reintroduces an import deadlock in workers.
+
+  **THE HAZARD, measured in both repos.** Nunba monkey-patches `publish_async`
+  **in place, in all three modules**, to call `_capture_thinking(message)`:
+  `Nunba-HART-Companion/routes/hartos_backend_adapter.py:94` says so outright
+  ("We monkey-patch publish_async in all 3 modules so thinking traces are..."),
+  with `_capture_thinking` at `:107`, the canonical patch at `:222-230` and the
+  per-module loop at `:235-243`. That buffer is what the `/chat` HTTP response
+  embeds as its thinking trace.
+  → **Folding these call sites onto the bus / a canonical push entry silently
+  strips thinking traces from every `/chat` response.** Nothing errors; a feature
+  just goes quiet. Exactly the failure shape the rest of this plan keeps finding.
+  → PREREQUISITE, and it is cross-repo: migrate Nunba's interceptor from an
+  in-place monkey-patch to a bus subscriber on `chat.response` FIRST, ship it, and
+  only then fold HARTOS's call sites. Same ordering constraint as F11 and the WAMP
+  ACL: the consumer moves before the producer.
+
+  **DOUBLE-CAPTURE: mechanically REAL, currently LATENT. Measured, not inferred.**
+  The chain exists, every link read from source:
+  1. Nunba patches the delegators too, not just the canonical
+     (`hartos_backend_adapter.py:235-243`, "all 3 modules").
+  2. A delegator's body resolves the target at CALL time via
+     `safe_hartos_attr('publish_async')`, and `safe_hartos_attr.py:156` is a plain
+     `getattr(mod, name, None)` on `sys.modules['hart_intelligence']` — so it hands
+     back the **patched** canonical, not the original.
+  3. `_capture_thinking` (`:107`) appends with **no dedupe**.
+  So one call through a delegator runs `_capture_thinking` twice on the same
+  message.
+  **But it does not fire today.** The only delegator call site is
+  `create_recipe.py:573` (`send_message_to_user1`, and only under `_bundled`), and
+  its `chat_payload` (`:555-566`) carries NO `priority` and NO `action` key, while
+  `_capture_thinking` records only when `priority == 49 and action == 'Thinking'`.
+  The payload is skipped, so nothing duplicates.
+  → **Latent trap for whoever touches this next**: add `priority: 49` /
+  `action: 'Thinking'` to a delegator-published payload, or route an existing
+  Thinking bubble through a delegator, and traces silently double. Either dedupe in
+  `_capture_thinking` (cheap, by request_id + identity) or have the delegators call
+  the ORIGINAL canonical rather than the patched attribute. Worth doing as part of
+  the interceptor migration, not before it.
+  *Also recorded from that call site's own comment: a previous
+  `from core.message_bus import publish_async` raised ModuleNotFoundError on EVERY
+  call, so bundled mode silently dropped every intermediate chat message. Third
+  silent-drop in this one function's history — this path has a habit of it.*
+
+  **Where the missing doc reference came from**: the canonical docstring itself
+  names `memory/project_publish_aop_migration.md` as "the right long-term shape".
+  So the plan's author copied a pointer out of a docstring, and the doc was never
+  written. The shape was identified and then lost — which is the thing to fix by
+  writing it, not by treating the reference as authoritative.
+
+  `hart_intelligence_entry.py:3029` is the described bypass, inside
+  `_push_workflow_flowchart`:
+  ```python
+  from core.peer_link.message_bus import chat_topic_for
+  publish_async(chat_topic_for(user_id), json.dumps(crossbar_message))
+  except Exception:
+      logging.getLogger(__name__).exception(
+          "_push_workflow_flowchart: swallowed Exception")
+  ```
+  Note the `except Exception` that SWALLOWS: a push that never arrives is visible
+  only in a log nobody reads, which is the same shape as the rest of tonight's
+  findings. Worth folding the delivery AND the silence together.
+  Still to audit next session: where `publish_async` is DEFINED, the second cited
+  site `:11145-11160`, and whether `message_bus.py:245` monkey-patching
+  `hart_intelligence.publish_async` is a third path that any fold must not break.
+
+  *Caution recorded, and then corrected: my first check used a bash `grep` that
+  hit the 120s timeout, and its partial output showed no matches. I began to read
+  that silence as "the function does not exist" — wrong twice over, because the
+  search had not finished AND the function is real. The task completed later and
+  returned the matches above. A search that was cut off is not a negative result,
+  and the fast Grep tool answers this tree in a second where bash grep does not.*
+
+**FOUR of this plan's premises have now been wrong** (F11's API, F4's "no consent
+type", F7's path, F12's doc). The plan was written from recollection, not from
+reading the tree, so roughly half its specific file references do not survive
+checking. **Verify before executing remains the highest-value rule here**, and a
+fold that "looks trivial" in the plan text is exactly the one to check first.
+- **F13** FCM paths → one — **AUDITED 2026-09-22. One instruction in it would be a
+  PRIVACY REGRESSION; do not execute that part without the owner.**
+
+  Names, for accuracy: the canonical pair is `send_fcm_push(user_id, ...)`
+  (`core/fcm_sync.py:325`) and `send_fcm_push_to_node(node_id, ...)` (`:346`), not
+  `send_push`. Those two are different TARGETS (a user vs a node), so per F12's
+  lesson check they are genuinely duplicated before collapsing them — two callers
+  needing two addressing modes is not the same as two rival implementations.
+
+  **The "self-contradiction to resolve" is already resolved, knowingly.**
+  `local_subscribers.py:165-173` says in so many words: "this is the FCM send the
+  class docstring deferred as 'cloud-only'", and explains why a LOCAL send is
+  right (a personal message unconfirmed after TTL means a backgrounded phone never
+  acked; push via the locally-cached token, no crossbar, no cloud round-trip, no-op
+  without a token so it is safe on every node). What remains is one STALE DOCSTRING
+  LINE at `:43` ("no FCM — that's cloud-only"), which is now false. That is a
+  comment fix, not a defect.
+
+  **"Also fix the hardcoded generic body" — DO NOT, not as written.**
+  `body='You have a new notification'` is DELIBERATE, and the code says why:
+  "Generic body — the content renders in-app on open", and
+  `build_fcm_v1_message` (`:242`) defaults `privacy_tier_skipped=True`, stamping
+  `privacy_notice` so the user is TOLD their message used the central relay. So an
+  FCM push is treated as a privacy-tier escalation. Putting message content in that
+  body would send it through Google's infrastructure and onto a lock screen —
+  weakening privacy, not fixing a bug. Same shape as F4: the plan text asks for
+  something that discards a protection the code deliberately holds.
+  → OWNER CALL if a richer body is wanted. Middle grounds that do not leak content:
+  carry the SENDER's name only; or gate previews behind an explicit opt-in consent
+  (which is what this whole plan is building the machinery for). Either way the
+  `privacy_tier_skipped` notice must keep firing.
+
+  *Fifth premise issue in this plan, and the second where following the text
+  literally would have removed a protection. The pattern is now clear enough to
+  state: this plan's DIAGNOSES are good, its PRESCRIPTIONS are not trustworthy
+  without reading what the code already decided and why.*
 - **F14** four desktop-toast emitters → one (`hart-notify.nix:92-124`,
   `shell_os_apis.py:384`, `tray_handler.py:136-146`, `indicator_window.py:108`).
-- **F15** three SMTP senders → one (`email_campaign.py:643`,
-  `email_adapter.py:264`, `mailing_list.py:286` — the last is a *prober*, keep it
-  separate but say so).
-- **F16** `localStorage` as a push channel (`App.js:56-61`
-  `agent_proactive_message`) → an event.
-- **F17** two divergent public-topic allowlists — SSE `events.py:127-138` vs WAMP
-  `realtime.py:43`; `events.py:113-118` admits the divergence is
-  unmaintained-by-construction. Fold to one list, two projections.
-- **F18** `approval.options` is **dead schema** (`liquid_ui_service.py:633`
-  declares it; `AgentOverlay.jsx:269-305` and the desktop shell both ignore it).
-  Either honour it or delete it — dead schema invites the next parallel path.
+
+  **DONE 2026-09-22 — VERDICT: NOT four emitters, and DO NOT fold. But the audit
+  found a real GATE BYPASS, which is fixed.**
+
+  What the four sites actually are:
+  | site | what it is |
+  |---|---|
+  | `hart-notify.nix:103-127` | `hart-notify-send`: a CONSENT GATE around the native emitter. Asks `core.ai_sensing.query_authority('screen')` FAIL-CLOSED, exit 77 = REFUSED (the same convention as `hart-screencast-gate`), and only then execs libnotify. NixOS appliance only |
+  | `shell_os_apis.py:359-395` | the Flask route `POST /api/shell/notifications/send`: queues an in-app record AND shells out natively |
+  | `tray_handler.py:136-146` | **macOS** `osascript display notification`, inside `MacOSDummyTray` because AppKit threading forbids a real tray |
+  | `indicator_window.py:108` | **not a toast at all.** That line is `return 1920, 1080`, the screen-size fallback in a Tk `RibbonIndicator` (an always-on ribbon saying what the AI is doing) |
+  So: one gate wrapper, one HTTP route, one macOS platform arm, and one
+  mis-cited line. Three platforms and a gate are not four copies of one thing,
+  and there is nothing to merge.
+
+  **The real finding.** The route called plain `notify-send` directly. But
+  `hart-notify.nix` exists precisely so the AI's native toasts are gated on the
+  human's 'screen' consent, and its own comment says foreign apps keep using the
+  ungated `notify-send`. So HARTOS was painting native toasts *as a foreign app*
+  and escaping the single supreme gate built to stop exactly that -- reachable by
+  anything that can POST the route, with caller-supplied title and body.
+  **Fixed:** the route now prefers `hart-notify-send` when it is present
+  (`shutil.which` as a presence check only, so argv keeps the bare name), and
+  treats exit 77 as `suppressed_by_consent` rather than a failed D-Bus leg. The
+  in-shell queue still carries the record, which is the RECOVERY half of the gate
+  (BLOCK + ASK + RECOVERY). Where the gated binary is absent -- every non-NixOS
+  host -- behaviour is byte-identical to before, so nothing regresses.
+  Reuses the existing gate rather than adding a second check, per its own
+  "no new path, no new gate".
+  Evidence: `test_flow_05_events_and_sinks.py` 12/12 (3 new: the gated emitter is
+  used and the ungated one is NOT also fired; a 77 reads as a refusal, not a
+  failure, with the record kept; and with no gate installed the old path and old
+  reporting are unchanged, including that a 77 from plain `notify-send` is NOT
+  dressed up as consent). Red-first: with the gate mutated out, the two gate tests
+  fail and the no-regression test still passes.
+- **F15** SMTP senders → one — **PREMISE FULLY ACCURATE 2026-09-22, all three
+  files AND line numbers correct. Prescription is also right, including its
+  caveat.** One refinement from reading them:
+  | site | what it is |
+  |---|---|
+  | `integrations/channels/email_campaign.py:643` | real sender — `smtplib.SMTP(SMTP_HOST, SMTP_PORT)`, `srv.sendmail(...)` at `:655` |
+  | `integrations/channels/extensions/email_adapter.py:264` | real sender — `aiosmtplib.SMTP(`, with a SYNC `smtplib.SMTP` fallback at `:282` |
+  | `integrations/channels/mailing_list.py:286` | **NOT a sender** — catch-all detection prober: `ehlo` / `mail` / `rcpt` and never `sendmail` |
+  So it is **two senders plus a prober**, not three senders. The adapter's
+  async+sync pair is one sender with two transports (same F12 lesson: variants for a
+  real reason are not duplication), so the fold is 2 -> 1 with the prober documented
+  as deliberately separate. The plan already said to keep the prober separate "but
+  say so", which is exactly right.
+  Care warranted regardless: this path sends to the 77,369-address list, and
+  `mailing_list.py` carries measured knowledge (`PROBE_LIARS`, provider behaviour at
+  RCPT TO) that must not be lost in a refactor.
+
+  **DONE 2026-09-22 — VERDICT: DO NOT FOLD 2 -> 1. The fourth harmful prescription
+  in this plan, after F12, F13 and F17. And my own audit above was ALSO wrong.**
+
+  Correction to my own table: `email_adapter.py:264` is **not a sender**. It is
+  inside `_test_smtp()`, which connects, logs in and quits. Its "sync fallback at
+  `:282`" is that same test's sync arm. The real sender is `_send_smtp` at
+  **`:841`** (async) / **`:859`** (sync), inside `send_message` (declared `:647`).
+  I recorded a line number without reading its enclosing function, which is the
+  exact mistake F18's near-miss taught, one fold earlier.
+
+  Full sweep for real send calls across HARTOS (`.sendmail(` / `smtp.send_message(`):
+  **exactly two sites**, so the picture is now complete rather than assumed:
+  | site | what it is |
+  |---|---|
+  | `email_campaign.py:655` | BULK. One connection per `per_conn` chunk, `delay` between addresses, dated sent-log so the daily cap survives a restart, halt on `MAX_CONSECUTIVE_FAILURES` for sender reputation, PID lock because two runs double-send |
+  | `email_adapter.py:841/859` | ONE conversational message per call, per-instance `email_config`, part of the channel adapter interface (reply_to, attachments, typing). The async/sync pair is one sender with two transports |
+  | `mailing_list.py:297-300` | NOT a sender: ehlo/mail/rcpt, never DATA |
+
+  **Why folding harms.** A shared "open a connection and send this message" helper
+  opens one connection PER ADDRESS, which throws away the batching and pacing the
+  bulk path has specifically for deliverability; pushing the lock, cap and dated log
+  onto a single chat reply is as wrong in the other direction. The only thing the two
+  share is that both call `smtplib` -- the same argument would merge every HTTP
+  caller because they all use `requests`. Nor is the MIME builder shared in substance:
+  one builds a bulk marketing message per campaign, the other a conversational reply
+  with attachments and In-Reply-To.
+
+  **What was done instead**, since the plan's own instruction was "keep the prober
+  separate but say so": each of the three sites now carries a docstring naming the
+  other two and why it differs, so the next reader does not have to redo this audit
+  before deciding not to merge them. Proven safe: all three files are **AST-identical
+  to HEAD once string constants are normalised**, so nothing on a 77,369-address send
+  path changed behaviour. No send was triggered to verify this, by design.
+- **F16** `localStorage` as a push channel → an event. **PREMISE ACCURATE**
+  (2026-09-22), lines are `hevolve/src/App.js:46-48`, not 56-61:
+  `localStorage.setItem('agent_proactive_message', JSON.stringify(data))` with the
+  comment "Store in localStorage so Agent component picks it up". That is exactly
+  the described defect — localStorage used as an inter-component event bus. Safe to
+  execute; the only caution is that `active_agent_id` is set alongside it at `:47`
+  and `:64`, so the fold must keep whatever reads THAT working.
+
+  **DONE 2026-09-22 — and the caution was empty, because there is no reader.**
+  The caller audit found the defect is deeper than "wrong channel":
+  - **Nothing reads either key.** Three `setItem` calls across the whole repo
+    (`:47`, `:48`, `:64`), zero `getItem`. I enumerated every `localStorage.getItem`
+    in `src/` and checked the two dynamic-key reads: `Demopage.js:1356` is
+    `getChatStorageKey(promptId)` (chat history) and the other is in a test. The
+    comment "so Agent component picks it up" describes a reader that was never
+    written; `Agent.js` reads `device_id`, `access_token`, `guest_mode`,
+    `guest_user_id`, `user_id`, `email_address` and nothing else.
+  - **The event IS produced — I got this wrong first and must record it.** I searched
+    HARTOS for a `type: 'agent_message'` emitter, found none, and wrote that the
+    handler had no producer. Wrong root: the producer is in **Nunba**, at
+    `routes/chatbot_routes.py:4297-4306`, where an OWNED agent
+    (`creator_user_id == target_user_id`, so no consent step) delivers straight
+    through `on_notification(target_user_id, {'type': 'agent_message', 'agent_name':
+    ..., 'message': ..., 'reason': ..., 'request_id': ...})`.
+    What caught it: the plan's own F9 entry (`:641`) names
+    `Nunba/routes/chatbot_routes.py` for the sibling `agent_contact_request`. The
+    subscriber I was about to keep and the one I was deleting come from the SAME file,
+    and I had searched only one of the two repos.
+    **And the clobber from F16's deferred defect is exactly what makes this work:**
+    `on_notification` does `{'type': 'notification', **notification_dict}`, so
+    `'agent_message'` overwrites the envelope and becomes the event name
+    `realtimeService.js:178` dispatches on. The handler FIRED. It was live.
+  So the handler was live, the payload carried everything a card needs
+  (`agent_name` + `message`), and it still died — because the localStorage key it
+  wrote has no reader in this repo. **The fold is therefore DELIVERY, not deletion.**
+  `src/components/Agent/AgentMessageToast.js` (new) subscribes and raises a toast via
+  the existing `ToastProvider`, giving that provider its first consumer; App.js renders
+  it INSIDE the provider because `App` renders the provider and so cannot call
+  `useToast` itself. `showToast` is destructured, not held as the context object,
+  because `ToastProvider` passes a fresh `value={{...}}` literal and re-renders on
+  every toast — holding the object would resubscribe each time.
+  - **`:64` LEFT ALONE deliberately.** It writes `active_agent_id` in the
+    accept-contact flow and is followed by `navigate('/')`, so it encodes an intent
+    ("open this agent on landing") that is also unimplemented. Deleting it would erase
+    the breadcrumb without delivering the feature, and it is a different flow from the
+    one this fold names. Recorded rather than silently kept or silently cut.
+  - **What the fold DEFERRED, filed as its own unit:** the canonical channel does not
+    reach the client either. `on_notification` builds
+    `{'type': 'notification', **notification_dict}`, and `to_dict()` always carries
+    `'type'` (the KIND, e.g. `agent_game_sound_review`), so the spread OVERWRITES the
+    envelope and `on('notification')` never fires — the unread badge only moves on the
+    30s poll. `realtimeService.js:147` tries to force the envelope and loses to the same
+    spread order, and the sub-type branch at `:181-187` reads `payload.data?.type` on a
+    flat payload, so it is dead twice. `on('achievement')` works only BY ACCIDENT of
+    this bug. Meanwhile `ToastProvider` wraps the whole app with **zero** `useToast`
+    consumers, so notification content is counted and never shown. That is a separate
+    defect with a client half (safe) and a producer half (a wire-contract change
+    affecting the RN app and the web bell, so an owner decision). Not folded in here.
+  *Lessons, two of them, and the second is about my own error:*
+  *(1) The mirror of F18: there I assumed one reader and found three; here I was told
+  to preserve a reader and found none. Enumerate, do not trust the description — the
+  code's own comment named a reader that was never written.*
+  *(2) **A negative result is scoped to where you looked.** "No producer" was true of
+  HARTOS and false of the system, because this event crosses repos. I even validated
+  my search METHOD against a known-good emitter, which made the negative feel earned —
+  but a correct method on an incomplete corpus still yields a wrong answer, and the
+  validation gave it false authority. Before asserting that nothing produces or reads
+  something, state the set of repos searched: here hevolve + HARTOS + Nunba, and the
+  answer lived in the third. The tell I walked past: the sibling subscriber in the same
+  `useEffect` had a producer I could not find either, and two unexplained absences in
+  one file is a signal about the search, not about the code.*
+- **F17** two public-topic allowlists — **AUDITED 2026-09-22. DO NOT "fold to one
+  list". The divergence is DELIBERATE and folding it is a SECURITY REGRESSION.**
+
+  Correct locations (the plan's path was wrong): SSE allowlist is
+  `core/platform/events.py:127-138` (`_SSE_GLOBAL_PREFIXES`), NOT
+  `integrations/social/events.py` (that file is ICS calendar parsing). WAMP side is
+  `integrations/social/realtime.py:43` (`_PUBLIC_TOPIC_PREFIXES`) as stated.
+
+  **The plan misread the comment.** It says `:113-118` "admits the divergence is
+  unmaintained-by-construction". What `:116-118` actually says:
+  > "(The two lists **intentionally differ** elsewhere: WAMP also lists
+  > per-conversation chat.social/dm. which are authorized per-subscriber, NOT
+  > SSE-global.)"
+  The comment aligns the two lists for the INFRA subset (`system.`, `model.`,
+  `catalog.`) and documents that they differ on purpose everywhere else.
+
+  **Why folding them leaks.** WAMP authorizes PER-SUBSCRIBER, so it can safely list
+  `chat.social.` and `dm.`. SSE broadcasts GLOBALLY with no per-user scoping —
+  `_is_sse_global` returns "safe to broadcast without a user_id". Merge the lists
+  and per-conversation chat becomes an SSE-global broadcast to every connected
+  client, which is exactly the leak this guard was added to stop (`:98`: without it
+  "an emit_event that forgot to include user_id leaks the payload (e.g. a personal
+  pair-code card) to every connected client").
+  → If anything is done here it is to make the SHARED INFRA SUBSET single-sourced
+  (`system.`/`model.`/`catalog.`/`resource.`/`app.`), leaving each transport's
+  transport-specific entries alone. Not "one list, two projections".
+
+  **A real open item the code already identifies correctly** (`:120-126`):
+  agent/goal/memory-scoped topics (`agent.action.completed` ×4882,
+  `action_state.changed`, `inference.completed`, `memory.item_added`) are
+  DELIBERATELY excluded, because a global SSE broadcast would leak cross-user
+  activity metadata on a multi-tenant node. The comment names the right fix — the
+  PUBLISHER stamps the owning user_id so the event routes per-user — and says it is
+  "tracked separately, NOT bypassed by whitelisting here." That is worth its own
+  fold, and it is the opposite of widening a list.
+
+  *SIXTH premise correction, and the THIRD prescription that would have reduced
+  safety if followed literally (F4 discards live grants, F13 leaks message content
+  to lock screens, F17 leaks per-conversation chat to every SSE client). The
+  through-line: this plan's author read COMMENTS and inferred intent, where the
+  comments were in fact recording a deliberate decision. Read the code AND the
+  reason before folding anything it calls duplicate.*
+- **F18** `approval.options` is **dead schema** — **PREMISE VERIFIED 2026-09-22,
+  end to end. The cleanest fold left in this tier.**
+  Path correction: `integrations/agent_engine/liquid_ui_service.py`, not
+  `integrations/social/`.
+  - DECLARED `:633` — `'approval': {'props': [..., 'options']}`
+  - POPULATED `:1593` — `agent_request_approval()` sets
+    `'options': ['Approve', 'Deny', 'Ask me later']` and pushes via `agent_ui_update`
+  - IGNORED — `Nunba/landing-page/src/components/AgentOverlay/AgentOverlay.jsx`:
+    `ApprovalOverlay` (`:270`, dispatched `:761`) renders the card and never reads
+    `data.options`. Only `data.title` and its own buttons.
+  So the field is produced with real values on every approval request and no
+  consumer looks at it. *Near-miss worth recording: `liquid_ui_service.py:4048` has
+  `const options = opts.options || []` and I briefly took it as a consumer — it is
+  `dsSelect`, a generic select primitive, unrelated to `approval.options`. Checking
+  the enclosing function is what separated a consumer from a coincidence.*
+  Prescription ("honour it or delete it") is SAFE and well posed — the first in
+  this tier that needs no warning. Honouring it means the agent controls the button
+  labels; deleting it means the overlay owns them. A design preference, not a risk.
+
+  **DONE + PUSHED 2026-09-22 — HONOURED, and my own audit above was wrong twice.**
+  The caller audit before the fold found what the audit had missed, and it changed
+  the answer from "delete" to "honour":
+  - **Not one consumer, three.** `AgentOverlay.jsx:270` (Nunba), the desktop shell's
+    own JS renderer at `liquid_ui_service.py:7265`, and a server-side HTML fallback at
+    `:7402` that draws **no buttons at all** (so labels do not apply there).
+  - **Not one producer, two.** `core/agent_tools.py:904` sets
+    `'options': ['Keep it', 'Compose another']`. Those are not the three defaults, so
+    the field was never dead — it was a real affordance being dropped. The game-sound
+    card read *"Have a listen: keep it, or say what is wrong and I will compose
+    another"* above buttons saying **Approve** and **Deny**.
+  - **The schema was already tested.** `tests/unit/test_bind_game_sound.py:309` pins
+    `len(component['options']) == 2`. It proved the dict was built, not that anyone
+    could read it — the same shape as the `media` defect its own neighbours record.
+  Contract chosen: `options` labels the three decisions **positionally**
+  `[approve, deny, defer]`; a missing or non-string entry keeps that button's
+  default, so the button SET never shrinks. Two reasons the set must not shrink:
+  an approval card is exempt from the overlay auto-dismiss (`:7328`), so dropping the
+  third button leaves it unclosable; and `/api/agent/approval` (`:7694`) validates
+  `approve|deny|later` and nothing else, so `options` can only ever carry labels.
+  Both existing producers already satisfy this reading, so no producer changed.
+  Escaping: labels are `_esc`'d at the point of use, because the prop pre-escape at
+  the top of `renderAgentOverlay` (`:7063`) walks **string** props only and a LIST
+  prop's entries arrive raw.
+  **Correction to `1c1881098`'s commit message, made minutes later:** it calls the
+  neighbouring list renderer (`:7258-7260`, which interpolates `item.label` into the
+  `<li>` body unescaped) "an injection sink". That overstates it. `_a2ui_has_xss`
+  (`:107-115`) recurses into **lists** as well as dicts, so script-bearing entries are
+  REJECTED server-side before any push — the comment at `:97` says reject-not-escape
+  is deliberate, to avoid double-escaping legitimate content. So the unescaped `<li>`
+  is a defence-in-depth weakness behind a denylist regex, not a live hole, and my
+  `_esc` on the option labels is belt-and-braces rather than the only guard. Worth
+  hardening because a denylist has gaps by construction (`:100` lists six tags; a
+  `<link>`, `<base>` or `<form action>` carries no `on\w+=`), but it is not the
+  emergency the commit message implies. Filed separately, not folded in here.
+  Evidence: `tests/unit/test_shell_custom_render.mjs` drives the REAL renderer on a
+  DOM shim — 25/25 with 12 new assertions; red-first confirmed by restoring one
+  hardcoded label (3 fail). `test_flow_05_events_and_sinks.py` 9/9,
+  `test_shell_custom_render.py` 1/1. The Python AST is identical to HEAD once string
+  constants are normalised, so no Python path moved. HARTOS `1c1881098`.
+  *Lesson for the remaining folds: "declared but nobody reads it" is a claim about
+  EVERY reader and EVERY writer. I had checked one of each. Grep the component type,
+  not just the prop name.*
+
+**PUSH TIER AUDIT COMPLETE — all seven folds checked against the code.**
+With the consent tier already audited, **every fold in this plan now has a verified
+or corrected premise.** Nothing here should be executed off the plan text alone
+again. Premise accuracy across the tier:
+| fold | premise | prescription |
+|---|---|---|
+| F12 | code right, doc reference phantom | **blocked** — needs Nunba's interceptor migrated first or `/chat` loses thinking traces |
+| F13 | paths/names off; "contradiction" already annotated | **half unsafe** — "fix the generic body" leaks content to lock screens |
+| F14 | **fully accurate** (4 files, 2 repos) | cross-repo fold, no trap found |
+| F16 | accurate (line drift 46-48) | safe |
+| F17 | path wrong; comment says the OPPOSITE of the plan | **unsafe** — folding the allowlists leaks per-conversation chat to every SSE client |
+| F18 | **fully accurate**, verified end to end | safe, well posed |
+| F15 | **fully accurate** (3/3 files + lines) | safe, and its caveat is right |
+
+**Verdict for whoever picks this up.** Four of seven premises were accurate (F14,
+F15, F16 with line drift, F18) and three were wrong in ways that matter. Three
+prescriptions would cause harm executed literally (F12 strips `/chat` thinking
+traces, F13 puts message content on lock screens, F17 leaks per-conversation chat to
+every SSE client), and two of those are the plan MISREADING a comment that recorded
+a deliberate decision. **Execute F18 or F16 first** — both safe, both self-contained.
+F15 next (2 senders -> 1, prober left alone). F14 is safe but cross-repo. F12, F13,
+F17 need the owner or a prerequisite, and must not be done as written.
+
+**PUSH TIER CLOSED 2026-09-22. Final tally, and it is worse than the line above
+says: of seven premises, THREE that I had marked accurate were not.**
+- **F18** DONE, honoured. My audit named one consumer; there are three, plus a
+  second producer with different labels. Not dead schema at all (`1c1881098`).
+- **F16** DONE, delivery added. My audit said the event had no producer; it has one,
+  in **Nunba**, because I searched only HARTOS (hevolve `7ec0550`).
+- **F15** DO NOT FOLD. My audit named `email_adapter.py:264` a sender; it is a
+  connection test. Documented at all three sites instead (`45adee977`).
+- **F14** NOT four emitters, and a real **gate bypass** found and fixed: the shell
+  route painted native toasts around the AI's own 'screen' consent gate
+  (`305b7f3a4`).
+- **F12 / F13 / F17** unchanged: must not be done as written; owner or prerequisite.
+So four of seven prescriptions were harmful as written, not three, and the three
+premise errors on top of the original three mean **six of seven entries needed
+correcting**. The pattern in every case: a line number recorded without reading its
+enclosing function, or an absence asserted from one repo. Both are cheap to check
+and neither was checked. **Read the enclosing function; name the repos you searched.**
 
 ---
 
@@ -707,13 +1206,23 @@ deliberate parallel path and leaving it contradicts rule 3.
 - **F8 CLOSED, NOT FOLDED** (`afe51600a`) — different concern, same word; but the
   audit found a real bypass (a private link published its target to anonymous
   callers) and a duplicate-consent bug, both fixed. See F8 above.
-- **F9 IMPLEMENTED, committed local-only** (`077b27332`) — per-agent consents were
-  askable but not grantable. Pushing waits on the hermetic A/B, not on confidence.
-- **F19 OPEN, blocks honest regression claims in this area** — the consent sweep
-  is not hermetic; see below.
+- **F9 DONE + PUSHED** (`077b27332`) — per-agent consents were askable but not
+  grantable. Hermetic A/B (`a34e6489f^` vs mine, fresh pinned DB per arm):
+  **254 passed / 0 failed / 0 errors in BOTH arms**, so zero regression is
+  evidenced rather than asserted. Landed on the remote via the peer sweep before
+  I pushed, which is its own lesson about this checkout.
+- **F19 DONE + PUSHED** (`828562872`), differently from how it was specified.
+  Neither option (a) nor (b): instead `models.py` resolves DB_PATH to a
+  per-process temp FILE when running under pytest with nothing configured. That
+  covers what per-suite pins could not, because several suites import `models`
+  lazily inside a fixture, long after a module-top pin would have run. A temp
+  file rather than `':memory:'` keeps the file-backed NullPool semantics every
+  suite already runs under. Guarded by `tests/unit/test_consent_sweep_is_hermetic.py`,
+  which also asserts the regression risk directly: a process WITHOUT pytest still
+  resolves to `agent_data`, so no real node's database was repointed.
 - **NEXT after F9: F7**, then F4 (unheld). F5 still held by another session's edits.
 
-### F19 — the consent test sweep cannot serve as a control — **OPEN, filed 2026-09-21**
+### F19 — the consent test sweep cannot serve as a control — **DONE + PUSHED 2026-09-22** (header was stale; the fix and its hermetic A/B evidence are recorded further down this section)
 
 Not a consent fold; a defect in the instrument every fold here is measured with,
 found by being burned by it (see F9's third self-correction).
